@@ -19,19 +19,48 @@ macOS 与 Linux 的修饰键在硬件层面**完全一致**，内核也如实上
 2. **`LEFT_CTRL` 槽位被腾空**去安置 Super，导致 GUI 与终端下行为分叉。
 3. **GUI 下的 Ctrl 习惯被破坏。** 在 VSCode + vim 插件中，物理 Ctrl 实际发出 `Super+V`，vim 收不到 `Ctrl+V`。
 
-mackbind 采用相反的模型：**默认透传，查表例外**。`Cmd` 始终保持 `KEY_LEFTMETA`，只有命中映射表的组合才翻译；表外组合原样透传。这同时保住了 Cmd 的系统语义和 Ctrl 的原生行为。
+mackbind 采用的模型：**`Cmd` 即 `Ctrl`，规则表只管例外**。默认把 `Cmd+X` 映射为 `Ctrl+X`（保住 Linux 原生的 Ctrl 行为），仅在目标键与主键不同时才查表——`Cmd+Q` → `Alt+F4`、`Cmd+[` → `Alt+←`。这同时保住了 Ctrl 的原生行为和 macOS 的操作语义。
 
 ## 功能
 
 开箱即用，无需任何配置：
 
 - **CapsLock ↔ 左 Ctrl 位置互换**，两个键在 GUI 与终端下均发真 Ctrl
-- **23 条常用 macOS 快捷键** —— 复制、粘贴、剪切、撤销/重做、全选、保存、打开、查找、查找上/下一个、粗体/斜体/下划线、链接、新建/关闭窗口与标签页、刷新、打印、浏览器前进后退
-- **Cmd 语义保留** —— 表外的 Cmd 组合（如 `Cmd+E`）原样透传，交由桌面环境或应用解释
-- **终端自动排除** —— 12 种常见终端（gnome-terminal、kitty、konsole、alacritty、foot、wezterm 等）内 `Ctrl` 保持原生，`Ctrl+C` 正常中断进程
+- **`Cmd+X` 默认映射为 `Ctrl+X`** —— 不做穷举，长尾组合自动生效（`Cmd+E`、`Cmd+B` 等原表未收录的组合同样可用）
+- **14 条显式规则** —— 目标键与主键不同者：`Cmd+Q` → `Alt+F4`、光标移动、`Cmd+[` `Cmd+]` → `Alt+←` `Alt+→` 等
+- **终端逐键特化** —— 终端内 `Cmd+C` → `Ctrl+Shift+C` 复制，而 `Ctrl+C` 仍是中断。GNOME 系终端的快捷键直接读其 GSettings schema，改过绑定也能跟上
 - **Fn 键优先级** —— 用户态实现 F 键与亮度/媒体键的切换，无需修改内核参数或 root 权限
 
 ## 已知问题
+
+### 未实现的快捷键
+
+|macOS|Linux|状态|
+|---|---|---|
+|`Cmd+空格` Spotlight|GNOME 概览|未实现。GNOME 概览无可绑定的 gsettings 动作，详见 `docs/macos-shortcuts.md`|
+|`Cmd+Tab` / `Cmd+H`|Super 组合|**暂缓**。Super 在 Linux 上是 Windows 键语义，与 macOS Cmd 不等价|
+|显示桌面|`show-desktop`|动作存在但默认未绑定，实现需写入用户账户设置|
+|`Shift+Cmd+Delete` 清倒废纸篓|`gio trash`|未实现|
+
+完整的逐条状态见 `docs/macos-shortcuts.md` 的「实现状态」。
+
+### 依赖 GNOME Shell 扩展
+
+「按应用区分」需要知道当前焦点窗口是谁。Wayland 下 GNOME 不把窗口信息交给客户端，本机实测：
+
+|方案|结果|
+|---|---|
+|`org.gnome.Shell.Eval`|返回 `(false, '')`，GNOME 41+ 限制|
+|`org.gnome.Shell.WindowTracker`|对象路径不存在|
+|`xdotool` / `wmctrl`|Wayland 下不可用|
+
+因此需要扩展 [`focused-window-dbus`](https://extensions.gnome.org/extension/focused-window-dbus/)：
+
+```bash
+gnome-extensions install focused-window-dbus@flexagoon.com
+```
+
+扩展缺失时相关功能退化为默认行为（不视为错误），其余映射照常工作。
 
 ### 输入法漏字母（非本工具缺陷）
 
@@ -156,9 +185,12 @@ $MACKBIND_CONFIG                    环境变量指定（最高优先级）
 |选项|默认|说明|
 |---|---|---|
 |`remap`|CapsLock ↔ 左 Ctrl|修饰键替换/互换|
-|`cmd_map`|23 条常用快捷键|Cmd 组合映射表|
+|`cmd_map`|14 条显式规则|目标键与主键不同者；其余 Cmd 组合走默认的 `Ctrl`|
 |`fn_mode`|`fkeysfirst`|Fn 优先级：`fkeysfirst` / `fkeyslast` / `disabled`|
-|`exclude_terminals`|12 种终端|命中则不做任何映射|
+|`desktop.type`|`gnome`|桌面环境：`gnome` / `kde` / `none`|
+|`ctrl_busy_apps`|`["gvim"]`|终端之外、Ctrl 有非标准含义的应用。**终端无需列举**，按 `.desktop` 的 `Categories=TerminalEmulator` 判定|
+|`terminal_shift_keys`|12 个终端键|在上述应用内映射为 `Ctrl+Shift` 的键|
+|`app_cmd_map`|ptyxis/konsole 复制键|按应用生效的规则覆盖，优先于其他规则|
 
 配置中字段名写错会**直接报错退出**而非静默忽略。
 
@@ -180,9 +212,15 @@ desc = "我的快捷键"
 # 关闭 Fn 优先级
 fn_mode = "disabled"
 
-# 补充终端
-exclude_terminals = ["org.gnome.Terminal", "myterm"]
+# 声明桌面环境
+[desktop]
+type = "gnome"
+
+# 把某个应用也纳入特化（终端已自动判定）
+ctrl_busy_apps = ["gvim", "org.gnome.gedit"]
 ```
+
+更完整的示例见仓库根目录的 `config.example.toml`。
 
 修改后 `systemctl --user restart mackbind` 或重新手动启动生效。
 
@@ -275,10 +313,11 @@ mackbind -v
 
 | | Toshy | mackbind |
 |---|---|---|
-|模型|默认改写 + 逐组合指定输出|默认透传 + 查表例外|
-|Cmd 身份|`LEFT_META` → `RIGHT_CTRL`（全局）|始终 `LEFT_META`|
+|模型|默认改写 + 逐组合指定输出|`Cmd` 即 `Ctrl`，规则表只管例外|
+|Cmd 身份|`LEFT_META` → `RIGHT_CTRL`（全局）|`Cmd` 转为 `Ctrl`，Super 释放|
 |Ctrl 语义|GUI 下被改写|恒为 Ctrl|
-|表外 Cmd 组合|需显式指定|原样透传|
+|表外 Cmd 组合|需显式指定|自动映射为 `Ctrl+X`|
+|终端快捷键来源|配置内逐终端枚举|读终端自身 GSettings schema|
 
 ## 开发
 

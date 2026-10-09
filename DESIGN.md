@@ -55,10 +55,10 @@ Toshy 把 Cmd 的内部槽位命名为 `RIGHT_CTRL`，且文档中 `Super`/`Cmd`
 ## 目标
 
 1. **CapsLock ↔ 左 Ctrl 位置互换**，且两个键在所有环境下均发真 Ctrl，不产生 Super。
-2. **Cmd 保持 `LEFT_META` 身份不变**，仅在命中映射表的组合上翻译为 Ctrl。
+2. **`Cmd+X` 映射为 `Ctrl+X`**，无需穷举——长尾组合默认即正确。
 3. **Ctrl 恒等于 Ctrl**，GUI 与终端一致。终端内 `Ctrl+C` 中断进程、`Ctrl+L` 清屏、`Ctrl+A` 行首等原生行为完全不受影响。
-4. **不修改 Cmd 的 Super 语义**：`Ctrl+Cmd+Space` 这类组合能正确表达为 `LEFT_CTRL + LEFT_META + Space`。
-5. 表外的 Cmd 组合**原样透传**，交由桌面环境或应用自行解释。
+4. **规则表只管例外**：仅目标键与主键不同时才查表。
+5. Super 释放给桌面环境（输入法切换、`Super+Tab` 等），mackbind 默认不产生 Super。
 
 ## 核心模型
 
@@ -66,32 +66,24 @@ Toshy 把 Cmd 的内部槽位命名为 `RIGHT_CTRL`，且文档中 `Super`/`Cmd`
 
 | | Toshy | mackbind |
 |---|---|---|
-|模型|默认改写 + 逐组合指定输出|默认透传 + 查表例外|
-|Cmd 身份|`LEFT_META` → `RIGHT_CTRL`（全局）|始终 `LEFT_META`|
+|模型|默认改写 + 逐组合指定输出|`Cmd` 即 `Ctrl`，规则表只管例外|
+|Cmd 身份|`LEFT_META` → `RIGHT_CTRL`（全局）|`Cmd` 转为 `Ctrl`，Super 释放|
 |修饰键槽位|五个键重排，互相挤占|不动|
-|映射目标|每个组合单独指定|静态表，查表即用|
-|超出表的部分|必须显式指定，漏了就没有|原样透传，天然正确|
+|映射目标|每个组合单独指定|默认值 + 例外表|
+|超出表的部分|必须显式指定，漏了就没有|默认生效|
 
-mackbind 的逻辑可归结为三条规则：
+mackbind 的逻辑可归结为：
 
 ```
 收到 CAPSLOCK          → 发 LEFT_CTRL
 收到 LEFT_CTRL         → 发 CAPSLOCK
-收到 LEFT_META + 键    → 查表命中? 发 Ctrl+键 : 发 Super+键（透传）
+收到 LEFT_META + 键    → 查例外表? 发例外 : 发 Ctrl+键
 收到其他               → 原样透传
 ```
 
 规则之间无冲突，无先后依赖。这与 Toshy 需要处理「五个修饰键的完整重映射矩阵、6 种键盘类型、数千条组合规则、multipurpose 键时序判定」形成数量级上的差距。
 
-## 修订：默认方向应当反转（待实现）
-
-上文的「默认透传、查表例外」模型在实际使用中暴露了一个致命问题：**穷举不完**。
-
-用户的原话：「cmd 组合键太多了，每个应用还不一样！不大可能穷举啊」。
-
-当前实现是内置 23 条 `cmd_map` 白名单。这个数字本身就是设计失败的信号——真实的 Cmd 快捷键是长尾的，任何固定表都覆盖不全。未列入的组合（如 `Cmd+Shift+N`、`Cmd+Alt+P`）会原样透传为 `Super+…`，而在 Linux 上**没有任何应用识别 `Super+字母`**，结果是什么都不发生。
-
-### 关键事实：Linux 桌面上 `Super` 只用于系统级操作
+## 关键事实：Linux 桌面上 `Super` 只用于系统级操作
 
 GNOME 当前 28 个 Super 绑定（`gsettings list-recursively org.gnome.desktop.wm.keybindings` 实测）：
 
@@ -108,50 +100,68 @@ GNOME 当前 28 个 Super 绑定（`gsettings list-recursively org.gnome.desktop
 
 **涉及字母键的仅 `<Super>h` 一项**（锁屏 `Super+l`、`Super+o` 为用户自设）。GNOME 刻意不用 `Super+字母`——字母键留给应用，Super 留给桌面环境管窗口。
 
-这意味着 macOS 的 `Cmd+字母`（复制、保存、查找…）在 Linux 上**对应的从来不是 Super，而是 Ctrl**。「让 Cmd 保持 Super 本意」这个早期设计判断，对绝大多数组合而言只是让按键失效。
+这意味着 macOS 的 `Cmd+字母`（复制、保存、查找…）在 Linux 上**对应的从来不是 Super，而是 Ctrl**。早期「让 Cmd 保持 Super 本意」的设计判断，对绝大多数组合而言只是让按键失效。
 
-### 修正后的模型
+### 曾被误判：保持 Super 更好
+
+最初的设计是「默认透传，查表例外」——`Cmd` 始终保持 `LEFT_META`，只有命中映射表的组合才翻译。这个模型的问题在实测中暴露：**穷举不完**。
+
+当时内置 23 条 `cmd_map` 白名单。这个数字本身就是设计失败的信号——真实的 Cmd 快捷键是长尾的。未列入的组合（如 `Cmd+E`、`Cmd+Shift+N`）透传为 `Super+…`，而在 Linux 上**没有任何应用识别 `Super+字母`**，结果是什么都不发生。
+
+用户反馈印证了这一点：「cmd 组合键太多了，每个应用还不一样！不大可能穷举啊」。
+
+修正后的规则：
 
 ```
 默认       LEFT_META + 键  →  Ctrl + 键
-例外 A     GNOME 已占用的 Super 组合 → 保持 Super   （从 gsettings 实时读取）
-例外 B     终端窗口内        →  Ctrl+Shift + 键
+例外 1     目标键 ≠ 主键    →  查表（Cmd+[ → Alt+←、Cmd+Q → Alt+F4…）
+例外 2     应用内 Ctrl 已被占用且该键有 Ctrl+Shift 绑定 →  Ctrl+Shift + 键
 ```
 
-例外清单很小且可自动推导，因此长尾组合（`Cmd+Shift+N` 等）**默认即正确**，无需枚举。
+例外清单很小且可自动推导，因此长尾组合默认即正确。
 
-| | 当前实现 | 修订后 |
-|---|---|---|
-|默认行为|`Cmd+X` → 透传为 Super（无效）|**`Cmd+X` → `Ctrl+X`**|
-|例外来源|穷举 23 条白名单|GNOME 绑定（自动）+ 终端（窗口类型）|
-|长尾组合|失效|**默认生效**|
-|显式覆盖|`cmd_map` 全部条目|`override`（仅非 Ctrl 目标，如 `Cmd+[` → `Alt+Left`）|
-
-### 例外 B 的依据：终端本就能区分
+## 终端特化：逐键，不是整体
 
 一个曾被误判的问题：担心「`Cmd+C` 翻译为 `Ctrl+C` 会在终端里误触发 SIGINT」。
 
-**这是错的。** macOS Terminal 里 `Cmd+C` 就是 `Ctrl+Shift+C`，Linux 终端同样支持 `Ctrl+Shift+C` 复制。两者一致，终端不需要任何特殊处理：
+**这是错的。** macOS Terminal 里 `Cmd+C` 就是 `Ctrl+Shift+C`，Linux 终端同样支持：
 
 | |Linux 终端|macOS 终端|
 |---|---|---|
 |`Ctrl+C`|SIGINT 中断|SIGINT 中断|
 |`Ctrl+Shift+C`|复制|复制|
 
-因此 `Cmd+C` 在**终端内**的正确输出是 `Ctrl+Shift+C`，而非全局默认的 `Ctrl+C`。这是例外 B 的来源，也是当前实现缺失的一条规则（会导致默认反向后引入回归）。
+但由此得出「终端里把 Cmd 一律变成 Ctrl+Shift」也是错的——那会让 `Cmd+Q` 退化成 `Ctrl+Shift+Q`，一个谁也不认的组合。
 
-### 关于「Cmd 与 Ctrl 无法区分」的代价
+正确做法是**逐键**：只对**终端自身已用 `Ctrl+Shift` 绑定**的键加 Shift。
 
-默认反向后，`Cmd+C` 与物理 `Ctrl+C` 产生**相同输出**（均为 `Ctrl+C`）。是否会误判？
+更进一步，GNOME 系终端用 GSettings 声明全部快捷键，直接读其 schema 而非猜：
+
+```bash
+gsettings list-recursively org.gnome.Ptyxis.Shortcuts
+# new-window      '<ctrl><shift>n'
+# copy-clipboard  '<ctrl><shift>c'
+```
+
+手写白名单曾漏掉 `n`（新窗口）而由用户发现。改用 schema 后，用户改过终端快捷键也能自动跟上。
+
+### 例外：ptyxis / konsole 的复制键
+
+这两个终端在**无选中文本**时会把 `Ctrl+Shift+C` 穿透给子进程当作 SIGINT，使「复制」杀掉正在运行的任务（wezterm、ghostty、gnome-terminal 无此问题）。故改用 `Ctrl+Insert`（X11 传统复制键）。由 `app_cmd_map` 承载，判定依据是**行为差异**而非应用名单。
+
+### 终端判定：按 freedesktop 规范，不枚举
+
+`.desktop` 条目的 `Categories` 含 `TerminalEmulator` 即视为终端。最初的硬编码 WM_CLASS 名单里写的是小写 `ptyxis`，而实际值是 `org.gnome.Ptyxis`，直接漏判——用户反馈「cmd-c 在终端、控制台这几个可以，ptyxis、ghostty 不行」。
+
+焦点窗口经 GNOME Shell 扩展 `focused-window-dbus` 获取，懒查询（收到按键才查，`wm_class` 未变则跳过 `.desktop` 解析）。
+
+## 关于「Cmd 与 Ctrl 无法区分」的代价
+
+`Cmd+C` 与物理 `Ctrl+C` 在普通应用里产生**相同输出**（均为 `Ctrl+C`）。是否会误判？
 
 **不会。** 解释权在应用而非键位：mackbind 只产出事件流，GTK 应用按自身菜单把 `Ctrl+C` 解释为复制，终端按 termios 的 `ISIG` 解释为 SIGINT。同一输出、不同解读，本就是 Linux 桌面的常态。
 
-唯一受影响的场景是某个应用内要求 `Cmd+X` 与 `Ctrl+X` 触发不同动作（如 macOS 的 `Ctrl+Cmd+F` 全屏）。此类组合极少，且可通过 `override` 规则保留原样。
-
-### 待确认
-
-- 终端判定用 WM_CLASS 匹配，还是走 GNOME 扩展的 D-Bus 焦点信息
-- 例外 A 中，GNOME 绑定变化时是否需要重启服务（`gsettings` 订阅 vs 启动时快照）
+唯一受影响的场景是某个应用内要求 `Cmd+X` 与 `Ctrl+X` 触发不同动作。此类组合极少，且可通过例外表保留原样。
 
 ## 故障记录：输入法漏字母
 
@@ -202,7 +212,7 @@ Cmd 作为修饰键，按下同键输出 Ctrl。应用自行解释，无需应�
 
 ```
 Cmd+C / V / X / Z / A      →  Ctrl+C / V / X / Z / A     复制粘贴剪切撤销全选
-Shift+Cmd+Z                →  Ctrl+Y                      重做
+Shift+Cmd+Z                →  Ctrl+Shift+Z                重做
 Cmd+F / G                  →  Ctrl+F / G                  查找 / 查找下一个
 Shift+Cmd+G                →  Ctrl+G                      查找上一个
 Cmd+S / O                  →  Ctrl+S / O                  保存 / 打开
@@ -216,17 +226,18 @@ Cmd+N                      →  Ctrl+N                      新建窗口
 Shift+Cmd+P                →  Ctrl+Shift+P                打印相关
 ```
 
-### L2 — 平台级功能（方案不处理，交由 DE）
+### L2 — 平台级功能（交由 DE 或未实现）
 
-这些是 macOS 特有功能，Linux 上要么有等价物，要么不存在。**不在映射表内，因此原样透传，不会与 GNOME 自身的绑定冲突。**
+这些是 macOS 特有功能，Linux 上要么有等价物，要么不存在。逐条状态见
+`docs/macos-shortcuts.md` 的「实现状态」。
 
 ```
 Shift+Cmd+3 / 4 / 5   截图            → GNOME 自带 PrtSc 体系
-Cmd+Space             Spotlight        → GNOME 无等价物
+Cmd+Space             Spotlight        → GNOME 概览；无可绑定动作，未实现
 Cmd+Del               移到废纸篓        → 依应用而定
 Ctrl+Cmd+Q            锁屏             → Super+L
 Fn 系列               显示台/Dictation → 无等价物
-Ctrl+Up / Down        Mission Control  → GNOME Super+Up/Down
+Cmd+Tab               切换应用         → Super+Tab（分类 B，暂缓）
 ```
 
 ### L3 — Finder 专属（待实测，不在 v1）

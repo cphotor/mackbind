@@ -11,7 +11,7 @@
 | 类 | 含义 | 实现方式 |
 |---|---|---|
 | **A** | 应用内通用操作 | 默认 `Cmd+X` → `Ctrl+X` |
-| **C** | 终端/编辑器特化 | `Cmd+X` → `Ctrl+Shift+X` |
+| **C** | 终端/编辑器特化 | `Cmd+X` → `Ctrl+Shift+X`（**逐键**，非整体） |
 | **D** | macOS 特有键位或功能 | 显式规则表 |
 | **E** | 有等价功能但桌面环境未绑 | mackbind 主动实现（按 DE 适配） |
 | **F** | 概念不存在于目标平台 | 放弃 |
@@ -48,7 +48,14 @@ type = "gnome"      # gnome | kde | none | 自定义
 
 ### 三、特化类应用
 
-此类应用内 `Ctrl` 已被占用，`Cmd` 映射为 `Ctrl+Shift` 以避免冲突。
+此类应用内 `Ctrl` 已被占用，`Cmd` 在其中映射为 `Ctrl+Shift`。**但这是逐键的，不是整体的**——只对应用自身已用 `Ctrl+Shift` 绑定的键加 Shift，其余键仍走默认的 `Ctrl`。理由见「实现状态 → 终端特化的粒度」。
+
+判定依据分两层：
+
+1. `.desktop` 条目的 `Categories` 含 `TerminalEmulator` —— 按 freedesktop 规范判定，自动覆盖新装的终端。硬编码 WM_CLASS 名单曾因写成小写 `ptyxis` 而实际值是 `org.gnome.Ptyxis` 漏判。
+2. `ctrl_busy_apps` 配置项 —— 用于终端之外、Ctrl 有非标准含义的应用（如独立窗口的 gvim）。
+
+焦点窗口信息经 GNOME Shell 扩展 `focused-window-dbus` 获取，采用懒查询（收到按键才查，`wm_class` 未变则跳过解析）。
 
 ---
 
@@ -292,14 +299,80 @@ code  code-url-handler  codium
 
 ---
 
-## 待办
+## 实现状态
 
-- [x] VSCode —— 不做特化处理，`Cmd` 映射为 `Ctrl` 即可
-- [x] GVIM —— 视同终端，纳入特化类
-- [ ] `Cmd+Q` 的 D-Bus 实现方案（需按 DE 适配，KDE 有不同机制）
-- [x] 「显示桌面」的实现方式（见下）
-- [ ] Option 类组合的最终清单
-- [ ] 访达→Nautilus 内部操作的映射策略（应用内处理 vs 全局规则）
+对照本文档逐条核对的结果。**未列出的组合即由默认语义自动覆盖**（`Cmd+X → Ctrl+X`），不需要单独实现。
+
+### 已实现
+
+|项|实现方式|
+|---|---|
+|A 应用内通用操作|默认语义，无需列举|
+|C 终端/GVIM 特化|逐键粒度，见下|
+|`Cmd+Q` → `Alt+F4`|全局显式规则（GNOME `wm.keybindings close`）|
+|D 光标移动 / `Cmd+[` `Cmd+]`|`DEFAULT_CMD_MAP` 中 14 条|
+|Delete → `Ctrl+Delete`|`DEFAULT_CMD_MAP`|
+|`Super+l` 锁屏|用户已自设，mackbind 不介入|
+|Super 相关（分类 B）|**暂缓**，见「暂缓事项」|
+
+### 未实现
+
+|项|阻塞原因|
+|---|---|
+|`Shift+Cmd+Delete` 清倒废纸篓|需执行 `gio trash --empty --force`；可做，未做|
+|`Cmd+空格` → 概览|GNOME 概览无可绑定的 gsettings 动作，见「附：概览」|
+|`Ctrl+↑` 调度中心|同上|
+|「显示桌面」|动作存在但默认未绑定，需写入用户账户设置|
+|Option 类组合最终清单|`A-KEY_LEFT` / `A-KEY_RIGHT` 已做，其余未逐条核对|
+|访达 → Nautilus 内部操作|多数由应用自身处理，无需全局规则|
+
+### 终端特化的粒度（重要）
+
+**不是**「终端里把 `Cmd` 一律变成 `Ctrl+Shift`」。那样做会让 `Cmd+Q` 退化成 `Ctrl+Shift+Q`——一个谁也不认的组合。
+
+实际做法是**逐键**：只对**终端自身已用 `Ctrl+Shift` 绑定**的键加 Shift。
+
+更进一步：GNOME 系终端用 GSettings 声明全部快捷键，mackbind 直接读取其 schema：
+
+```bash
+gsettings list-recursively org.gnome.Ptyxis.Shortcuts
+# new-window      '<ctrl><shift>n'
+# close-window    '<ctrl><shift>q'
+# copy-clipboard  '<ctrl><shift>c'
+```
+
+因此用户改过终端快捷键，mackbind 会自动跟上。手写白名单曾漏掉 `n`（新窗口），这是改用 schema 的直接原因。
+
+不使用 GSettings 的终端（kitty、wezterm 等）查不到 schema，退回内置白名单。
+
+> 注：ptyxis 的 `close-window` 实为 `Ctrl+Shift+Q`，但全局规则 `Cmd+Q → Alt+F4` 优先于终端特化，故实际发出的是 `Alt+F4`。这是有意的——`Alt+F4` 是 GNOME 的通用关闭绑定，跨应用一致。
+
+### 终端的复制键：ptyxis / konsole 特例
+
+这两个终端在**无选中文本**时会把 `Ctrl+Shift+C` 穿透给子进程当作 SIGINT，使「复制」杀掉正在运行的任务。wezterm、ghostty、gnome-terminal 无此问题（无条件吞掉该组合）。
+
+故这两者改用 `Ctrl+Insert`（X11 传统复制键，终端均支持且不会被当作控制字符发送）。由 `app_cmd_map` 配置项承载，判定依据是**行为差异**而非应用名单。
+
+---
+
+## 附：概览（Spotlight）的实现障碍
+
+macOS 的 `Cmd+空格` 对应 GNOME 的活动概览，但本机 GNOME 51 + Wayland 下三条常规路径均不可用：
+
+|方案|实测结果|
+|---|---|
+|`org.gnome.Shell.Eval`|返回 `(false, '')`——GNOME 41+ 限制|
+|`org.gnome.Shell.WindowTracker`|对象路径 `/org/gnome/Shell/WindowTracker` 不存在|
+|`xdotool` / `wmctrl`|Wayland 下不可用|
+|`org.gnome.Shell` 现有接口|仅 Screenshot / Introspect / Brightness 等，无窗口或概览操作|
+
+`org.gnome.desktop.wm.keybindings` 中也没有对应「打开概览」的键（`panel-main-menu` 默认 `@as []`，且那是应用菜单而非概览）。
+
+**剩下的可行路径**：给某个闲置键绑定一个 gsettings 动作，再由 mackbind 发出该键。但这要写入用户的账户设置，属侵入式改动，故暂缓。
+
+注：`Super+space`（切换输入法）在 mackbind 新模型下不会被占用——默认语义不产生 Super。因此若日后实现概览，二者不再冲突，无需「让位」。
+
+---
 
 ## 附：「显示桌面」的实现
 
@@ -310,6 +383,8 @@ gsettings get org.gnome.desktop.wm.keybindings show-desktop   # @as []（未绑�
 ```
 
 对应 macOS 的 `Cmd+调度中心` / `Fn+H` / `Fn+F11`（显示桌面），以及 `Ctrl+↑`（调度中心）。
+
+绑定该动作后可由 mackbind 发出对应键实现，但同样需要写入账户设置，故暂缓。
 
 > 注：设置界面中的条目名因 GNOME 版本而异。GNOME 51（本机）中该动作的
 > schema 键为 `show-desktop`；「隐藏所有普通窗口」可能是其他版本或
