@@ -147,48 +147,68 @@ fn parse_rules(
 
 /// GTK 加速键的主键名 → evdev 键码。
 ///
-/// GTK 用 `plus` / `minus` 指主键盘的 `=` / `-`，与 evdev 不同名。
+/// 见 [`crate::keys::parse_external_key`]。accel.rs 解析 DE 绑定时用的是
+/// 同一个函数——曾在此另写一份，两份之间 `"space"` 一项的差异即由此而来。
 fn accel_key(name: &str) -> Option<KeyCode> {
-    use std::str::FromStr;
-    let evdev = match name {
-        "plus" => "KEY_EQUAL",
-        "minus" => "KEY_MINUS",
-        other => {
-            // GSettings 里 F1 这类写作 `F1`，evdev 是 `KEY_F1`
-            if let Some(rest) = other.strip_prefix('F') {
-                if rest.chars().all(|c| c.is_ascii_digit()) {
-                    return Some(KeyCode::from_str(&format!("KEY_F{rest}")).ok()?);
-                }
-            }
-            // 其余多为已是 evdev 形式的小写名（w、Page_Down…）
-            if other.chars().any(|c| c.is_ascii_uppercase()) {
-                return Some(KeyCode::from_str(other).ok()?);
-            }
-            return KeyCode::from_str(&format!("KEY_{}", other.to_ascii_uppercase())).ok();
-        }
-    };
-    KeyCode::from_str(evdev).ok()
+    crate::keys::parse_external_key(name)
 }
 
-/// GNOME 概览对应的规则：`Cmd+空格` 应发出哪组键。
+/// 「功能名 → DE 中对应动作」的查找表。
 ///
-/// 返回 `(输入主键, 输出修饰键, 输出主键)`。DE 不提供该动作时返回
+/// 新增一个 DE 功能只需在此加一行，**不必改任何分支逻辑**：
+///
+/// ```text
+/// (功能标识, 该 DE 下的 GSettings schema, 动作键名)
+/// ```
+///
+/// 这类映射此前是写成 `match DesktopType { Gnome => ...; _ => None }` 的
+/// 硬编码分支——每加一个 DE 功能就要动一次代码分支，也没法让用户在
+/// 配置文件里追加。改为查表后，DE 只出现在这张表里。
+///
+/// 查不到（DE 未提供该动作、schema 不存在、动作未绑定）一律返回
 /// `None`——**不视为错误**，其余规则照常生效。
-fn de_overview_rule(dt: &DesktopType) -> Option<(KeyCode, Vec<KeyCode>, KeyCode)> {
-    match dt {
-        DesktopType::Gnome => {
-            let accel = crate::accel::action_accel(
-                "org.gnome.shell.keybindings",
-                "toggle-overview",
-            )?;
-            let (mods, kc) = crate::accel::parse_accel(&accel)?;
-            let out_mods: Vec<KeyCode> = mods.into_iter().map(KeyCode::new).collect();
-            Some((KeyCode::KEY_SPACE, out_mods, kc))
-        }
-        // KDE 与裸 WM 的概览机制不同，暂未实现。
+fn de_action_lookup(
+    dt: &DesktopType,
+    feature: &str,
+) -> Option<(String, String)> {
+    // 不用 `use DesktopType::*`：其中有 `None` 变体，会遮蔽 `Option::None`
+    use DesktopType::Gnome;
+    // schema 只在匹配到具体 DE 时才构造，避免为无关 DE 做无谓查询
+    let (schema, key): (&str, &str) = match (dt, feature) {
+        // 概览：GNOME 放在 shell 层 schema，不在 wm.keybindings 里
+        (Gnome, "overview") => ("org.gnome.shell.keybindings", "toggle-overview"),
+        // 显示桌面：动作存在但默认未绑定，需用户自行绑定后此条才生效
+        (Gnome, "show-desktop") => ("org.gnome.desktop.wm.keybindings", "show-desktop"),
+        // KDE 与裸 WM 的对应机制不同，暂未实现。
         // 「不可查」不等于「不存在」——见 docs/macos-shortcuts.md。
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some((schema.to_string(), key.to_string()))
+}
+
+/// 把某个 DE 功能解析为一条 Cmd 规则。
+///
+/// 步骤统一为：查表拿 schema 与动作键名 → 读该动作的现有加速键 →
+/// 解析成修饰键与主键。因此**读 DE 现有绑定**这一行为由函数本身保证，
+/// 不必由每个调用点各自实现。
+///
+/// 返回 `(输入主键, 输出修饰键, 输出主键)`，可直接插入 `cmd_map`。
+fn de_feature_rule(
+    dt: &DesktopType,
+    feature: &str,
+) -> Option<(CmdMapKey, Vec<KeyCode>, KeyCode)> {
+    // 功能标识 → 触发该功能的 macOS 按键。当前仅 Cmd+空格（Spotlight）。
+    let trigger: KeyCode = match feature {
+        "overview" => KeyCode::KEY_SPACE,
+        "show-desktop" => KeyCode::KEY_SPACE,
+        _ => return None,
+    };
+
+    let (schema, action) = de_action_lookup(dt, feature)?;
+    let accel = crate::accel::action_accel(&schema, &action)?;
+    let (mods, key) = crate::accel::parse_accel(&accel)?;
+    let out_mods = mods.into_iter().map(KeyCode::new).collect();
+    Some(((trigger, Vec::new()), out_mods, key))
 }
 
 impl Mapper {
@@ -211,17 +231,14 @@ impl Mapper {
         // 直接发出同样的键即可，无需在用户配置里留下任何记录——
         // 也不会覆盖用户自己对该键的设置。
         if cfg.desktop.spotlight {
-            match de_overview_rule(&cfg.desktop.r#type) {
-                Some((key, mods, kc)) => {
-                    cmd_map.insert((key, Vec::new()), (mods.clone(), kc));
-                    if verbose {
-                        eprintln!("[de] Cmd+空格 → 概览（{mods:?} + {kc:?}）");
-                    }
+            // 按功能标识查表，不按 DE 分支——新增 DE 功能只改表不改逻辑
+            if let Some((trigger, mods, key)) = de_feature_rule(&cfg.desktop.r#type, "overview") {
+                cmd_map.insert(trigger, (mods.clone(), key));
+                if verbose {
+                    eprintln!("[de] Cmd+空格 → 概览（{mods:?} + {key:?}）");
                 }
-                None if verbose => {
-                    eprintln!("[de] 未找到概览绑定，Cmd+空格 不做映射");
-                }
-                None => {}
+            } else if verbose {
+                eprintln!("[de] 未找到概览绑定，Cmd+空格 不做映射");
             }
         }
 
@@ -696,7 +713,7 @@ mod tests {
     /// 该组合在 macOS 中是 `Cmd+Ctrl+空格`（切换输入法），语义亦相符。
     #[test]
     fn cmd_space_maps_to_gnome_overview() {
-        let Some(rule) = de_overview_rule(&DesktopType::Gnome) else {
+        let Some(rule) = de_feature_rule(&DesktopType::Gnome, "overview") else {
             // 本机未装 GNOME 或动作未绑定，跳过而非误判
             return;
         };
@@ -721,10 +738,31 @@ mod tests {
     }
 
     /// KDE / 裸 WM 暂无对应实现，但不应 panic。
+    ///
+    /// 「不可查」不等于「不存在」——DE 只出现在 `de_action_lookup` 的表里，
+    /// 新增支持只需加一行，不必改任何分支逻辑。
     #[test]
     fn unknown_desktop_skips_overview_gracefully() {
-        assert!(de_overview_rule(&DesktopType::Kde).is_none());
-        assert!(de_overview_rule(&DesktopType::None).is_none());
+        assert!(de_action_lookup(&DesktopType::Kde, "overview").is_none());
+        assert!(de_action_lookup(&DesktopType::None, "overview").is_none());
+    }
+
+    /// 动态数据（DE 绑定、终端 schema）里的键名解析必须与配置用同一套规则。
+    ///
+    /// 此前 mapper 与 accel 各写一份 `plus`/`minus` 映射，已产生过分歧——
+    /// 一份有 `"space"` 特例而另一份没有，只因 `KEY_SPACE` 恰能被兜底
+    /// 分支解析出来才没暴露。
+    #[test]
+    fn external_key_parsing_is_consistent() {
+        use crate::keys::parse_external_key as p;
+        assert_eq!(p("plus"), Some(KeyCode::KEY_EQUAL));
+        assert_eq!(p("space"), Some(KeyCode::KEY_SPACE));
+        assert_eq!(p("Page_Down"), Some(KeyCode::KEY_PAGEDOWN));
+        assert_eq!(p("F4"), Some(KeyCode::KEY_F4));
+        assert_eq!(p("w"), Some(KeyCode::KEY_W));
+        assert_eq!(p("KEY_A"), Some(KeyCode::KEY_A));
+        assert_eq!(p(""), None);
+        assert_eq!(p("NotAKey"), None);
     }
 
     /// ptyxis 的新窗口/关窗口键由它自己的 GSettings 决定，不靠猜。

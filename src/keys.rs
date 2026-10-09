@@ -73,6 +73,12 @@ const ALIASES: &[(&str, &str)] = &[
     (";", "KEY_SEMICOLON"),
     ("'", "KEY_APOSTROPHE"),
     ("`", "KEY_GRAVE"),
+    // GTK 加速键 / X11 键符号名。与上表合并而非另写一张——
+    // 曾因两处各写一份 `plus`/`minus` 而产生分歧。
+    ("plus", "KEY_EQUAL"),
+    ("Return", "KEY_ENTER"),
+    ("Page_Up", "KEY_PAGEUP"),
+    ("Page_Down", "KEY_PAGEDOWN"),
 ];
 
 /// 解析单个键名。
@@ -105,6 +111,57 @@ pub fn parse_key(name: &str) -> Result<KeyCode, KeyError> {
     }
 
     Err(KeyError::UnknownKey(name.to_string()))
+}
+
+/// 解析**来自动态数据**（GSettings、终端 schema）的键名。
+///
+/// 与 [`parse_key`] 的区别是这些名字不受本工具控制，大小写与拼写都只能
+/// 按实际见到的处理：GTK 写 `<Shift><Control>space`、`F1`、`Page_Down`、
+/// `plus`，形式比配置文件里可能出现的更杂。
+///
+/// 策略：
+/// 1. 查别名表（大小写不敏感）
+/// 2. 已是 evdev 形式（`KEY_A`、`Page_Down`）直接试
+/// 3. 单字符或 `F<n>`，补 `KEY_` 前缀后试
+///
+/// 解析失败返回 `None`——调用方据此跳过该条规则，而非让整个程序失败。
+/// 动态数据随时可能变，一个不认识的名字不该拖垮映射。
+pub fn parse_external_key(name: &str) -> Option<KeyCode> {
+    let t = name.trim();
+    if t.is_empty() {
+        return None;
+    }
+
+    // 1) 别名表（大小写不敏感——GTK 的 `Page_Down` 与 evdev 的
+    //    `KEY_PAGEDOWN` 都要能命中，而表内两种大小写都出现过）
+    let lower = t.to_lowercase();
+    if let Some((_, real)) = ALIASES
+        .iter()
+        .find(|(a, _)| a.to_lowercase() == lower)
+    {
+        return KeyCode::from_str(real).ok();
+    }
+
+    // 2) 已是 evdev 或 X11 形式（含大写者，如 Page_Down、KEY_A）
+    if let Ok(k) = KeyCode::from_str(t) {
+        return Some(k);
+    }
+
+    // 3) 小写单字符 / F 数字，补 KEY_ 前缀
+    let upper = t.to_ascii_uppercase();
+    let prefixed = if upper.chars().count() == 1 || is_function_key(&upper) {
+        format!("KEY_{upper}")
+    } else {
+        upper
+    };
+    KeyCode::from_str(&prefixed).ok()
+}
+
+/// 是否为 `F1`…`F24` 这类功能键写法。
+fn is_function_key(upper: &str) -> bool {
+    upper.starts_with('F')
+        && upper.len() > 1
+        && upper[1..].chars().all(|c| c.is_ascii_digit())
 }
 
 /// 解析组合表达式，按 `-` 分隔。返回 (修饰键列表, 主键)。

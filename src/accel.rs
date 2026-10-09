@@ -122,27 +122,11 @@ pub fn parse_accel(accel: &str) -> Option<(Vec<u16>, KeyCode)> {
 }
 
 /// GTK 加速键的主键名 → evdev 键码。
+///
+/// 复用 [`crate::keys::parse_external_key`]——与 mapper 侧读取终端
+/// schema 时用的是同一套解析规则。此前两处各写一份，已因此产生过分歧。
 fn key_to_keycode(name: &str) -> Option<KeyCode> {
-    use std::str::FromStr;
-    let evdev = match name {
-        "plus" => "KEY_EQUAL",
-        "minus" => "KEY_MINUS",
-        "space" => "KEY_SPACE",
-        other => {
-            // GSettings 写 F1，evdev 是 KEY_F1
-            if let Some(rest) = other.strip_prefix('F') {
-                if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
-                    return KeyCode::from_str(&format!("KEY_F{rest}")).ok();
-                }
-            }
-            // 含大写的多为 evdev 形式（Page_Down、Return）
-            if other.chars().any(|c| c.is_ascii_uppercase()) {
-                return KeyCode::from_str(other).ok();
-            }
-            return KeyCode::from_str(&format!("KEY_{}", other.to_ascii_uppercase())).ok();
-        }
-    };
-    KeyCode::from_str(evdev).ok()
+    crate::keys::parse_external_key(name)
 }
 
 /// 终端的快捷键 schema 名候选。
