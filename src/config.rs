@@ -89,6 +89,22 @@ pub enum DesktopType {
 pub struct DesktopConfig {
     /// 桌面环境类型，决定 DE 相关规则的查表来源
     pub r#type: DesktopType,
+    /// 是否把 macOS 的 `Cmd+空格`（Spotlight）映射为桌面环境的概览。
+    ///
+    /// 默认开启。实现方式是**读取** DE 现有的绑定并发出同样的键，
+    /// 而不是改写绑定——因此不会在用户配置里留下任何记录，
+    /// 也不影响用户自己对该键的设置。
+    ///
+    /// 查不到对应动作时（如 DE 未提供概览）自动跳过，不视为错误。
+    #[serde(default = "default_true")]
+    pub spotlight: bool,
+}
+
+/// `#[serde(default)]` 用的真值常量——多数布尔配置项默认开启。
+///
+/// 不能用 `true` 字面量：`Deserialize` 的 `default` 要求可调用。
+fn default_true() -> bool {
+    true
 }
 
 /// Fn 键优先级模式。
@@ -244,7 +260,10 @@ impl Config {
                 })
                 .collect(),
             fn_mode: Some(FnMode::Fkeysfirst),
-            desktop: DesktopConfig::default(),
+            desktop: DesktopConfig {
+                spotlight: true,
+                ..DesktopConfig::default()
+            },
             ctrl_busy_apps: DEFAULT_CTRL_BUSY_APPS
                 .iter()
                 .map(|s| (*s).to_string())

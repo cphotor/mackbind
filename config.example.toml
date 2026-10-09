@@ -53,8 +53,25 @@
 # kde   = KDE Plasma
 # none  = Sway、Hyprland、i3 等，或其他无法查表的环境
 #
+# DE 相关行为按此查表。当前 GNOME 系支持最完整；KDE / 裸 WM 下
+# 不支持的规则会**跳过**，而非报错。
+#
 # [desktop]
 # type = "gnome"
+
+# `Cmd+空格`（macOS 的 Spotlight）是否映射为桌面环境的概览。
+#
+# 实现方式是**读取** DE 现有的绑定并发出同样的键，而不是改写绑定——
+# 因此不会在你的配置里留下任何记录，也不影响你对该键的设置。
+#
+# GNOME 的概览动作是 `toggle-overview`（本机默认 `Ctrl+Shift+空格`），
+# 该组合在 macOS 中是「切换输入法」，语义亦相符。
+# 查不到对应动作时自动跳过，不视为错误。
+#
+# spotlight = true
+
+# 需扩展提供焦点窗口信息，用于按应用区分（终端特化）：
+# https://extensions.gnome.org/extension/focused-window-dbus/
 
 # ─────────────────────────────────────────────────────────────
 # Ctrl 已被占用的应用

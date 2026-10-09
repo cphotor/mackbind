@@ -21,7 +21,7 @@
 //!
 //! 因此按下时记录「这个键被翻译成了什么」，释放时按记录还原。
 
-use crate::config::{Config, FnMode};
+use crate::config::{Config, DesktopType, FnMode};
 use crate::keys::parse_combo;
 use evdev::{EventType, InputEvent, KeyCode};
 use std::collections::{HashMap, HashSet};
@@ -170,6 +170,27 @@ fn accel_key(name: &str) -> Option<KeyCode> {
     KeyCode::from_str(evdev).ok()
 }
 
+/// GNOME 概览对应的规则：`Cmd+空格` 应发出哪组键。
+///
+/// 返回 `(输入主键, 输出修饰键, 输出主键)`。DE 不提供该动作时返回
+/// `None`——**不视为错误**，其余规则照常生效。
+fn de_overview_rule(dt: &DesktopType) -> Option<(KeyCode, Vec<KeyCode>, KeyCode)> {
+    match dt {
+        DesktopType::Gnome => {
+            let accel = crate::accel::action_accel(
+                "org.gnome.shell.keybindings",
+                "toggle-overview",
+            )?;
+            let (mods, kc) = crate::accel::parse_accel(&accel)?;
+            let out_mods: Vec<KeyCode> = mods.into_iter().map(KeyCode::new).collect();
+            Some((KeyCode::KEY_SPACE, out_mods, kc))
+        }
+        // KDE 与裸 WM 的概览机制不同，暂未实现。
+        // 「不可查」不等于「不存在」——见 docs/macos-shortcuts.md。
+        _ => None,
+    }
+}
+
 impl Mapper {
     /// 从配置构建。键名解析失败会立即返回错误——配置写错时
     /// 必须大声失败，不能静默忽略。
@@ -181,7 +202,28 @@ impl Mapper {
             remap.insert(from, to);
         }
 
-        let cmd_map = parse_rules(&cfg.cmd_map)?;
+        let mut cmd_map = parse_rules(&cfg.cmd_map)?;
+
+        // DE 相关规则：读取 DE 现有的绑定，不改写绑定。
+        //
+        // macOS 的 `Cmd+空格`（Spotlight）在 GNOME 对应概览，而 GNOME
+        // 已把该动作绑在 `toggle-overview` 上（本机为 `Ctrl+Shift+空格`）。
+        // 直接发出同样的键即可，无需在用户配置里留下任何记录——
+        // 也不会覆盖用户自己对该键的设置。
+        if cfg.desktop.spotlight {
+            match de_overview_rule(&cfg.desktop.r#type) {
+                Some((key, mods, kc)) => {
+                    cmd_map.insert((key, Vec::new()), (mods.clone(), kc));
+                    if verbose {
+                        eprintln!("[de] Cmd+空格 → 概览（{mods:?} + {kc:?}）");
+                    }
+                }
+                None if verbose => {
+                    eprintln!("[de] 未找到概览绑定，Cmd+空格 不做映射");
+                }
+                None => {}
+            }
+        }
 
         let app_cmd_map = cfg
             .app_cmd_map
@@ -643,6 +685,46 @@ mod tests {
                 "终端里 Cmd+{key:?}（{why}）应为 Ctrl+Shift+{key:?}，实际 {out:?}"
             );
         }
+    }
+
+    /// `Cmd+空格` 映射为 GNOME 已有的概览绑定（默认 `Ctrl+Shift+空格`）。
+    ///
+    /// 实现方式是**读取** GNOME 对 `toggle-overview` 的现有绑定再发出
+    /// 同样的键，而非改写绑定——因此不在用户配置里留下记录，也不影响
+    /// 用户自己对该键的设置。
+    ///
+    /// 该组合在 macOS 中是 `Cmd+Ctrl+空格`（切换输入法），语义亦相符。
+    #[test]
+    fn cmd_space_maps_to_gnome_overview() {
+        let Some(rule) = de_overview_rule(&DesktopType::Gnome) else {
+            // 本机未装 GNOME 或动作未绑定，跳过而非误判
+            return;
+        };
+        let (_in_key, out_mods, out_key) = rule;
+        assert!(
+            out_mods.contains(&KeyCode::KEY_LEFTCTRL)
+                && out_mods.contains(&KeyCode::KEY_LEFTSHIFT),
+            "概览应发出 DE 现有的 Ctrl+Shift 组合，实际 {out_mods:?}"
+        );
+        assert_eq!(out_key, KeyCode::KEY_SPACE, "本机 GNOME 的 toggle-overview 绑在空格上");
+
+        // 端到端：Cmd+空格 应产生那组键
+        let mut m = default_mapper();
+        m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
+        let out = desc(&m.translate(&k(KeyCode::KEY_SPACE.0, 1)));
+        assert!(
+            out.contains(&(KeyCode::KEY_LEFTCTRL.0, 1))
+                && out.contains(&(KeyCode::KEY_LEFTSHIFT.0, 1))
+                && out.contains(&(KeyCode::KEY_SPACE.0, 1)),
+            "Cmd+空格 应发出 Ctrl+Shift+空格，实际 {out:?}"
+        );
+    }
+
+    /// KDE / 裸 WM 暂无对应实现，但不应 panic。
+    #[test]
+    fn unknown_desktop_skips_overview_gracefully() {
+        assert!(de_overview_rule(&DesktopType::Kde).is_none());
+        assert!(de_overview_rule(&DesktopType::None).is_none());
     }
 
     /// ptyxis 的新窗口/关窗口键由它自己的 GSettings 决定，不靠猜。

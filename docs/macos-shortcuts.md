@@ -310,6 +310,7 @@ code  code-url-handler  codium
 |A 应用内通用操作|默认语义，无需列举|
 |C 终端/GVIM 特化|逐键粒度，见下|
 |`Cmd+Q` → `Alt+F4`|全局显式规则（GNOME `wm.keybindings close`）|
+|`Cmd+空格` → 概览|读取 GNOME 的 `toggle-overview` 现有绑定并发出同样的键|
 |D 光标移动 / `Cmd+[` `Cmd+]`|`DEFAULT_CMD_MAP` 中 14 条|
 |Delete → `Ctrl+Delete`|`DEFAULT_CMD_MAP`|
 |`Super+l` 锁屏|用户已自设，mackbind 不介入|
@@ -320,9 +321,8 @@ code  code-url-handler  codium
 |项|阻塞原因|
 |---|---|
 |`Shift+Cmd+Delete` 清倒废纸篓|需执行 `gio trash --empty --force`；可做，未做|
-|`Cmd+空格` → 概览|GNOME 概览无可绑定的 gsettings 动作，见「附：概览」|
-|`Ctrl+↑` 调度中心|同上|
-|「显示桌面」|动作存在但默认未绑定，需写入用户账户设置|
+|`Ctrl+↑` 调度中心|与概览同键，GNOME 未提供独立的「调度中心」动作|
+|「显示桌面」|动作存在（`show-desktop`）但默认未绑定，需写入用户账户设置|
 |Option 类组合最终清单|`A-KEY_LEFT` / `A-KEY_RIGHT` 已做，其余未逐条核对|
 |访达 → Nautilus 内部操作|多数由应用自身处理，无需全局规则|
 
@@ -355,22 +355,42 @@ gsettings list-recursively org.gnome.Ptyxis.Shortcuts
 
 ---
 
-## 附：概览（Spotlight）的实现障碍
+## 附：概览（Spotlight）的实现
 
-macOS 的 `Cmd+空格` 对应 GNOME 的活动概览，但本机 GNOME 51 + Wayland 下三条常规路径均不可用：
+macOS 的 `Cmd+空格` 对应 GNOME 的活动概览。GNOME 为此提供了可绑定动作：
 
-|方案|实测结果|
+```bash
+gsettings get org.gnome.shell.keybindings toggle-overview
+# ['<Shift><Control>space']
+```
+
+mackbind 的做法是**读取这个现有绑定并发出同样的键**，而非改写绑定。因此：
+
+- 不在用户配置（dconf）里留下任何记录
+- 不影响用户自己对该键的设置
+- 用户改了绑定，mackbind 自动跟上
+
+该组合在 macOS 中是 `Cmd+Ctrl+空格`（切换输入法），语义亦相符。
+
+注：`Super+space`（GNOME 的输入法切换）在 mackbind 模型下不会被占用——默认语义不产生 Super。二者不再冲突，无需「让位」。
+
+### 一度误判为不可行
+
+初查时只看了 `org.gnome.desktop.wm.keybindings`，其中确实没有概览动作，遂判定需「写入用户账户设置」才能实现，属侵入式改动而暂缓。
+
+这个结论是错的——概览动作在**另一个 schema**（`org.gnome.shell.keybindings`）下。教训与此前「默认方向反转」同源：**在断言某能力不存在之前，应先确认是否找对了地方**。
+
+真正不可用的是以下路径（实测记录，以免重复尝试）：
+
+|方案|结果|
 |---|---|
-|`org.gnome.Shell.Eval`|返回 `(false, '')`——GNOME 41+ 限制|
+|`org.gnome.Shell.Eval`|返回 `(false, '')`，GNOME 41+ 限制|
 |`org.gnome.Shell.WindowTracker`|对象路径 `/org/gnome/Shell/WindowTracker` 不存在|
 |`xdotool` / `wmctrl`|Wayland 下不可用|
-|`org.gnome.Shell` 现有接口|仅 Screenshot / Introspect / Brightness 等，无窗口或概览操作|
 
-`org.gnome.desktop.wm.keybindings` 中也没有对应「打开概览」的键（`panel-main-menu` 默认 `@as []`，且那是应用菜单而非概览）。
+### 键盘类型差异
 
-**剩下的可行路径**：给某个闲置键绑定一个 gsettings 动作，再由 mackbind 发出该键。但这要写入用户的账户设置，属侵入式改动，故暂缓。
-
-注：`Super+space`（切换输入法）在 mackbind 新模型下不会被占用——默认语义不产生 Super。因此若日后实现概览，二者不再冲突，无需「让位」。
+macOS 的 `Cmd+调度中心` 在 MacBook 上对应 `Fn+F11`，在带独立功能键的外接键盘上则无对应键。GNOME 侧同样无独立的「调度中心」动作（`Ctrl+↑` 语义上接近，但 GNOME 未提供该绑定）。
 
 ---
 

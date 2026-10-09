@@ -28,6 +28,7 @@ mackbind 采用的模型：**`Cmd` 即 `Ctrl`，规则表只管例外**。默认
 - **CapsLock ↔ 左 Ctrl 位置互换**，两个键在 GUI 与终端下均发真 Ctrl
 - **`Cmd+X` 默认映射为 `Ctrl+X`** —— 不做穷举，长尾组合自动生效（`Cmd+E`、`Cmd+B` 等原表未收录的组合同样可用）
 - **14 条显式规则** —— 目标键与主键不同者：`Cmd+Q` → `Alt+F4`、光标移动、`Cmd+[` `Cmd+]` → `Alt+←` `Alt+→` 等
+- **`Cmd+空格` → 概览** —— 读取桌面环境现有的绑定并发出同样的键，不改写你的设置
 - **终端逐键特化** —— 终端内 `Cmd+C` → `Ctrl+Shift+C` 复制，而 `Ctrl+C` 仍是中断。GNOME 系终端的快捷键直接读其 GSettings schema，改过绑定也能跟上
 - **Fn 键优先级** —— 用户态实现 F 键与亮度/媒体键的切换，无需修改内核参数或 root 权限
 
@@ -37,7 +38,7 @@ mackbind 采用的模型：**`Cmd` 即 `Ctrl`，规则表只管例外**。默认
 
 |macOS|Linux|状态|
 |---|---|---|
-|`Cmd+空格` Spotlight|GNOME 概览|未实现。GNOME 概览无可绑定的 gsettings 动作，详见 `docs/macos-shortcuts.md`|
+|`Cmd+空格` Spotlight|GNOME 概览|✅ 读取 GNOME 现有绑定后发出同样的键|
 |`Cmd+Tab` / `Cmd+H`|Super 组合|**暂缓**。Super 在 Linux 上是 Windows 键语义，与 macOS Cmd 不等价|
 |显示桌面|`show-desktop`|动作存在但默认未绑定，实现需写入用户账户设置|
 |`Shift+Cmd+Delete` 清倒废纸篓|`gio trash`|未实现|
@@ -188,6 +189,7 @@ $MACKBIND_CONFIG                    环境变量指定（最高优先级）
 |`cmd_map`|14 条显式规则|目标键与主键不同者；其余 Cmd 组合走默认的 `Ctrl`|
 |`fn_mode`|`fkeysfirst`|Fn 优先级：`fkeysfirst` / `fkeyslast` / `disabled`|
 |`desktop.type`|`gnome`|桌面环境：`gnome` / `kde` / `none`|
+|`desktop.spotlight`|`true`|`Cmd+空格` 是否映射为概览（读取 DE 现有绑定，不改写）|
 |`ctrl_busy_apps`|`["gvim"]`|终端之外、Ctrl 有非标准含义的应用。**终端无需列举**，按 `.desktop` 的 `Categories=TerminalEmulator` 判定|
 |`terminal_shift_keys`|12 个终端键|在上述应用内映射为 `Ctrl+Shift` 的键|
 |`app_cmd_map`|ptyxis/konsole 复制键|按应用生效的规则覆盖，优先于其他规则|

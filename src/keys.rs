@@ -11,7 +11,7 @@ use evdev::KeyCode;
 use std::str::FromStr;
 
 /// 修饰键缩写 → 键码。
-fn modifier_from_abbrev(s: &str) -> Option<KeyCode> {
+pub fn modifier_from_abbrev(s: &str) -> Option<KeyCode> {
     match s {
         "C" => Some(KeyCode::KEY_LEFTCTRL),
         "A" => Some(KeyCode::KEY_LEFTALT),

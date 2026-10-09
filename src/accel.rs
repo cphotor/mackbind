@@ -22,6 +22,8 @@
 //! - 剩下的是键名，与 evdev 的 `KEY_*` 名大体一致，个别有别名
 //!   （`plus`/`minus`/`equal`）
 
+use crate::keys::modifier_from_abbrev;
+use evdev::KeyCode;
 use std::process::Command;
 
 /// 判断加速键是否为 `<Ctrl><Shift>+主键` 形式。
@@ -33,11 +35,8 @@ use std::process::Command;
 /// GTK 的 `<primary>` 是 Ctrl 的别名，此处一并视为 Ctrl。
 pub fn is_ctrl_shift(accel: &str) -> bool {
     let (mods, _key) = split(accel);
-    let has = |want: &[&str]| {
-        mods.iter()
-            .any(|m| want.iter().any(|w| m == *w))
-    };
-    has(&["ctrl", "primary"]) && has(&["shift"])
+    let has = |want: &[&str]| mods.iter().any(|m| want.iter().any(|w| m == *w));
+    has(&["ctrl", "control", "primary"]) && has(&["shift"])
 }
 
 /// 取出加速键的主键名（如 `n`、`plus`、`F4`）。
@@ -64,6 +63,86 @@ fn split(accel: &str) -> (Vec<String>, &str) {
         }
     }
     (mods, rest)
+}
+
+/// 查询某个 GSettings 动作当前绑定的加速键。
+///
+/// 用于把 macOS 快捷键接到**桌面环境已有的绑定**上，而不去改写绑定。
+/// 例如 GNOME 的概览绑在 `toggle-overview`（默认 `Ctrl+Shift+空格`），
+/// mackbind 只要发出这组键即可，无需在用户配置里留下任何记录。
+///
+/// 动作未绑定时返回 `None`。
+pub fn action_accel(schema: &str, key: &str) -> Option<String> {
+    let out = Command::new("gsettings")
+        .args(["get", schema, key])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // 未绑定时返回 @as [] 或 ''，都不是有效加速键
+    if text.is_empty() || text.starts_with("@as") || text == "''" {
+        return None;
+    }
+    // 形如 "['<ctrl><shift>space']"，取第一个；多绑定时取首个即可
+    let inner = text.split('\'').nth(1)?;
+    Some(inner.to_string())
+}
+
+/// 把加速键表达式转为「修饰键 + 主键」。
+///
+/// 用于 mackbind 的输出端——它只认自己的 `C-x` 简写，不认 GTK 的
+/// `<ctrl><shift>space`。
+pub fn parse_accel(accel: &str) -> Option<(Vec<u16>, KeyCode)> {
+    let (mods, key) = split(accel);
+    let mut out: Vec<u16> = Vec::new();
+    for m in mods {
+        // GTK 的修饰键名（ctrl/primary/shalt…）→ 本工具的缩写（C/A/S/M），
+        // 复用键名解析器的表，避免两处映射不一致
+        let abbrev = match m.as_str() {
+            // GTK 的实际拼写是 `<Control>` / `<Shift>` / `<Alt>` / `<Super>`，
+            // 全小写形式（`<ctrl>`）在部分 schema 里也会出现，一并接受。
+            // 另有 `<Primary>` 表示 Ctrl、`<Mod4>` 表示 Super。
+            "ctrl" | "control" | "primary" => "C",
+            "shift" => "S",
+            "alt" => "A",
+            "super" | "meta" | "mod4" => "M",
+            // hyper、lock 等本工具不产生，跳过
+            _ => continue,
+        };
+        if let Some(kc) = modifier_from_abbrev(abbrev) {
+            if !out.contains(&kc.0) {
+                out.push(kc.0);
+            }
+        }
+    }
+    let kc = key_to_keycode(key)?;
+    Some((out, kc))
+}
+
+/// GTK 加速键的主键名 → evdev 键码。
+fn key_to_keycode(name: &str) -> Option<KeyCode> {
+    use std::str::FromStr;
+    let evdev = match name {
+        "plus" => "KEY_EQUAL",
+        "minus" => "KEY_MINUS",
+        "space" => "KEY_SPACE",
+        other => {
+            // GSettings 写 F1，evdev 是 KEY_F1
+            if let Some(rest) = other.strip_prefix('F') {
+                if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+                    return KeyCode::from_str(&format!("KEY_F{rest}")).ok();
+                }
+            }
+            // 含大写的多为 evdev 形式（Page_Down、Return）
+            if other.chars().any(|c| c.is_ascii_uppercase()) {
+                return KeyCode::from_str(other).ok();
+            }
+            return KeyCode::from_str(&format!("KEY_{}", other.to_ascii_uppercase())).ok();
+        }
+    };
+    KeyCode::from_str(evdev).ok()
 }
 
 /// 终端的快捷键 schema 名候选。
@@ -138,6 +217,8 @@ mod tests {
         assert!(is_ctrl_shift("<ctrl><shift>n"));
         assert!(is_ctrl_shift("<Shift><Ctrl>c"), "大小写不敏感");
         assert!(is_ctrl_shift("<primary><shift>t"), "primary 即 Ctrl");
+        // GNOME 实际写出的拼法（本机 toggle-overview 即此形式）
+        assert!(is_ctrl_shift("<Shift><Control>space"));
     }
 
     #[test]
@@ -154,6 +235,21 @@ mod tests {
         assert_eq!(main_key("<ctrl>plus"), Some("plus"));
         assert_eq!(main_key("<Primary>F4"), Some("F4"));
         assert_eq!(main_key(""), None, "空串无主键");
+    }
+
+    #[test]
+    fn parses_real_gnome_accel() {
+        // 本机 GNOME 对 toggle-overview 的实际绑定
+        let (mods, key) = parse_accel("<Shift><Control>space").unwrap();
+        assert_eq!(key, KeyCode::KEY_SPACE);
+        assert!(mods.contains(&KeyCode::KEY_LEFTCTRL.0), "{mods:?}");
+        assert!(mods.contains(&KeyCode::KEY_LEFTSHIFT.0), "{mods:?}");
+    }
+
+    #[test]
+    fn parses_plus_and_function_keys() {
+        assert_eq!(parse_accel("<Control>plus").unwrap().1, KeyCode::KEY_EQUAL);
+        assert_eq!(parse_accel("<Control>F4").unwrap().1, KeyCode::KEY_F4);
     }
 
     #[test]
