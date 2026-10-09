@@ -145,6 +145,31 @@ fn parse_rules(
     Ok(map)
 }
 
+/// GTK 加速键的主键名 → evdev 键码。
+///
+/// GTK 用 `plus` / `minus` 指主键盘的 `=` / `-`，与 evdev 不同名。
+fn accel_key(name: &str) -> Option<KeyCode> {
+    use std::str::FromStr;
+    let evdev = match name {
+        "plus" => "KEY_EQUAL",
+        "minus" => "KEY_MINUS",
+        other => {
+            // GSettings 里 F1 这类写作 `F1`，evdev 是 `KEY_F1`
+            if let Some(rest) = other.strip_prefix('F') {
+                if rest.chars().all(|c| c.is_ascii_digit()) {
+                    return Some(KeyCode::from_str(&format!("KEY_F{rest}")).ok()?);
+                }
+            }
+            // 其余多为已是 evdev 形式的小写名（w、Page_Down…）
+            if other.chars().any(|c| c.is_ascii_uppercase()) {
+                return Some(KeyCode::from_str(other).ok()?);
+            }
+            return KeyCode::from_str(&format!("KEY_{}", other.to_ascii_uppercase())).ok();
+        }
+    };
+    KeyCode::from_str(evdev).ok()
+}
+
 impl Mapper {
     /// 从配置构建。键名解析失败会立即返回错误——配置写错时
     /// 必须大声失败，不能静默忽略。
@@ -206,9 +231,28 @@ impl Mapper {
         let is_term = crate::desktop::is_terminal(id);
         let in_list = self.ctrl_busy_apps.iter().any(|t| id.contains(t));
         self.ctrl_busy_window = is_term || in_list;
+
+        if is_term {
+            // 优先问终端自己：它用 Ctrl+Shift 绑定了哪些键。
+            //
+            // 手写白名单漏过 `n`（新窗口），也误判过 close-window 的
+            // 绑定键。凡是走 GSettings 声明快捷键的终端（GNOME 系），
+            // 直接读它的 schema——用户改过绑定也能自动跟上。
+            let queried = crate::accel::ctrl_shift_keys(id);
+            if !queried.is_empty() {
+                let parsed: Vec<KeyCode> = queried.iter().filter_map(|k| accel_key(k)).collect();
+                if !parsed.is_empty() {
+                    self.terminal_bindings = parsed;
+                }
+            }
+        }
+
         if self.verbose && self.ctrl_busy_window {
             let via = if is_term { "TerminalEmulator" } else { "配置名单" };
-            eprintln!("[mapper] 命中 Ctrl 占用应用: {id}（{via}）→ Cmd 映射为 Ctrl+Shift");
+            let n = self.terminal_bindings.len();
+            eprintln!(
+                "[mapper] 命中 Ctrl 占用应用: {id}（{via}）→ {n} 个键映射为 Ctrl+Shift"
+            );
         }
     }
 
@@ -599,6 +643,41 @@ mod tests {
                 "终端里 Cmd+{key:?}（{why}）应为 Ctrl+Shift+{key:?}，实际 {out:?}"
             );
         }
+    }
+
+    /// ptyxis 的新窗口/关窗口键由它自己的 GSettings 决定，不靠猜。
+    ///
+    /// ptyxis 声明 `new-window = Ctrl+Shift+N`。手写白名单曾漏掉 `n`，
+    /// 导致 `Cmd+N` 退化为 `Ctrl+N`（readline 的「下一行」），开不了
+    /// 新窗口。此处直接读它的 schema，用户改过绑定也能跟上。
+    #[test]
+    fn ptyxis_new_window_comes_from_its_own_schema() {
+        let mut m = default_mapper();
+        m.set_window_id("org.gnome.Ptyxis");
+        m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
+        let out = desc(&m.translate(&k(KeyCode::KEY_N.0, 1)));
+        assert!(
+            out.contains(&(KeyCode::KEY_LEFTCTRL.0, 1))
+                && out.contains(&(KeyCode::KEY_LEFTSHIFT.0, 1))
+                && out.contains(&(KeyCode::KEY_N.0, 1)),
+            "ptyxis 的 Cmd+N 应为 Ctrl+Shift+N（新窗口），实际 {out:?}"
+        );
+    }
+
+    /// ptyxis 的关窗口键是 Ctrl+Shift+Q（其 schema 所声明），
+    /// 但全局规则 Cmd+Q → Alt+F4 优先——Alt+F4 是 GNOME 的 close
+    /// 绑定，跨应用一致，不该被终端特化吞掉。
+    #[test]
+    fn cmd_q_stays_alt_f4_in_ptyxis() {
+        let mut m = default_mapper();
+        m.set_window_id("org.gnome.Ptyxis");
+        m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
+        let out = desc(&m.translate(&k(KeyCode::KEY_Q.0, 1)));
+        assert!(
+            out.contains(&(KeyCode::KEY_LEFTALT.0, 1))
+                && out.contains(&(KeyCode::KEY_F4.0, 1)),
+            "ptyxis 的 Cmd+Q 应为 Alt+F4，实际 {out:?}"
+        );
     }
 
     /// ptyxis / konsole 的复制键改走 Ctrl+Insert。

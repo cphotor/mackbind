@@ -20,6 +20,7 @@
 //! - 任何退出路径（正常结束、Ctrl+C、SIGTERM、panic）都释放 grab
 //! - 退出前释放所有按下的键，避免修饰键残留在按下状态
 
+mod accel;
 mod config;
 mod desktop;
 mod focus;
