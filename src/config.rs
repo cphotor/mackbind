@@ -52,6 +52,25 @@ pub struct CmdMap {
     pub desc: Option<String>,
 }
 
+/// 针对特定应用的 Cmd 规则覆盖。
+///
+/// 用于**同一按键在不同应用里需要不同输出**的情形。最典型的例子：
+/// 终端的复制键。Linux 终端系普遍用 `Ctrl+Shift+C`，但 ptyxis 与
+/// konsole 在无选中文本时会把它穿透给进程，当作 SIGINT ——于是
+/// 「复制」会杀掉正在跑的任务。这两个应用必须改用 `Ctrl+Insert`
+///（X11 传统复制键，不会误触发信号）。
+///
+/// Toshy 把这条写死在配置里（`term_sigint_preventer_lst`），此处改为
+/// 数据驱动：判定依据是行为差异，不是应用名单。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppCmdMap {
+    /// 适用的应用 WM_CLASS / app_id，匹配方式为子串包含
+    pub apps: Vec<String>,
+    /// 仅对这些应用生效的规则。优先于全局 `cmd_map`
+    pub rules: Vec<CmdMap>,
+}
+
 /// 桌面环境类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -106,6 +125,23 @@ pub struct Config {
     ///
     /// 此项用于终端之外、Ctrl 有非标准含义的应用，如独立窗口的 gvim。
     pub ctrl_busy_apps: Vec<String>,
+    /// 在「Ctrl 已被占用」的应用内，Cmd 需映射为 Ctrl+Shift 的键。
+    ///
+    /// 只列**这些应用自身已用 Ctrl+Shift 绑定**的键：终端的复制
+    /// （Ctrl+Shift+C）、关标签页（Ctrl+Shift+W）、新标签页
+    /// （Ctrl+Shift+T）等。加 Shift 正是为了命中它们。
+    ///
+    /// 之所以逐键列举而非整体换语义：若终端里把 Cmd 一律变成
+    /// Ctrl+Shift，`Cmd+Q` 就会变成 `Ctrl+Shift+Q`——一个谁也不认的
+    /// 组合。而 `Cmd+Q`（退出）对应的 Linux 键是 `Alt+F4`，属跨应用的
+    /// 全局规则，不该被终端特化吞掉。
+    pub terminal_shift_keys: Vec<String>,
+    /// 按应用生效的 Cmd 规则覆盖，优先于全局 `cmd_map` 与终端特化。
+    ///
+    /// 默认为 ptyxis / konsole 的复制键改用 `Ctrl+Insert`——这两个
+    /// 终端在无选中文本时会把 `Ctrl+Shift+C` 穿透给进程当作 SIGINT，
+    /// 使「复制」杀掉正在运行的任务。
+    pub app_cmd_map: Vec<AppCmdMap>,
 }
 
 /// macOS 特有组合的显式映射表（目标键与主键不同者）。
@@ -129,6 +165,11 @@ const DEFAULT_CMD_MAP: &[(&str, &str, &str)] = &[
     ("KEY_RIGHTBRACE", "A-Right", "下一文件夹 (Cmd+])"),
     // ── 删除 ──
     ("KEY_DELETE", "C-KEY_DELETE", "删左字符 (Ctrl+D)"),
+    // ── 窗口管理 ──
+    // 跨应用的全局规则，故不受终端特化影响。
+    // macOS 的 Cmd+Q 是「退出应用」，Linux 侧最接近的通用绑定是
+    // Alt+F4（GNOME 的 wm.keybindings close）。Toshy 用的是同一条。
+    ("KEY_Q", "A-KEY_F4", "退出应用 (Cmd+Q → Alt+F4)"),
 ];
 
 /// 「Ctrl 已被占用」的应用：终端与编辑器。
@@ -147,6 +188,36 @@ const DEFAULT_CTRL_BUSY_APPS: &[&str] = &[
     // 此处针对独立窗口的 gvim。
     "gvim",
 ];
+
+/// 终端自己用 Ctrl+Shift 绑定的键。
+///
+/// 依据 Toshy 的终端段配置（`default-toshy-config/toshy_config.py`），
+/// 以及 GNOME 终端系（ptyxis / gnome-terminal / Console）的常用绑定。
+/// 这些键在 macOS 是 Cmd 组合，在 Linux 终端里对应 Ctrl+Shift。
+const DEFAULT_TERMINAL_SHIFT_KEYS: &[&str] = &[
+    "KEY_C",          // 复制
+    "KEY_V",          // 粘贴
+    "KEY_X",          // 剪切
+    "KEY_T",          // 新标签页
+    "KEY_W",          // 关标签页
+    "KEY_D",          // 水平分屏（部分终端）
+    "KEY_F",          // 查找（部分终端）
+    "KEY_S",          // 保存（部分终端）
+    "KEY_EQUAL",      // 放大字号
+    "KEY_MINUS",      // 缩小字号
+    "KEY_LEFTBRACE",  // 上一个标签页
+    "KEY_RIGHTBRACE", // 下一个标签页
+];
+
+/// 复制键会漏发 SIGINT 的终端。
+///
+/// ptyxis 与 konsole 在**无选中文本**时会把 `Ctrl+Shift+C` 穿透给
+/// 子进程，当作 SIGINT ——复制会杀掉正在跑的任务。wezterm、ghostty、
+/// gnome-terminal（VTE 系）无此问题：它们无条件吞掉该组合。
+///
+/// 改用 `Ctrl+Insert`（X11 传统复制键）：终端无一例外支持，且不会被
+/// 误当作控制字符发送给进程。
+const SIGINT_LEAKY_TERMINALS: &[&str] = &["org.gnome.Ptyxis", "org.kde.konsole", "konsole"];
 
 impl Config {
     /// 内置默认配置。用户配置在此基础上叠加。
@@ -178,6 +249,22 @@ impl Config {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            terminal_shift_keys: DEFAULT_TERMINAL_SHIFT_KEYS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            app_cmd_map: vec![AppCmdMap {
+                apps: SIGINT_LEAKY_TERMINALS.iter().map(|s| (*s).to_string()).collect(),
+                rules: vec![CmdMap {
+                    keys: vec!["KEY_C".into()],
+                    emit: "C-KEY_INSERT".into(),
+                    desc: Some(
+                        "改用 Ctrl+Insert 复制：ptyxis/konsole 在无选中文本时会把 \
+                         Ctrl+Shift+C 当作 SIGINT 漏给进程"
+                            .into(),
+                    ),
+                }],
+            }],
         }
     }
 }
@@ -224,6 +311,8 @@ impl Config {
         self.remap.extend(other.remap);
         self.cmd_map.extend(other.cmd_map);
         self.ctrl_busy_apps.extend(other.ctrl_busy_apps);
+        self.terminal_shift_keys.extend(other.terminal_shift_keys);
+        self.app_cmd_map.extend(other.app_cmd_map);
         if other.fn_mode.is_some() {
             self.fn_mode = other.fn_mode;
         }

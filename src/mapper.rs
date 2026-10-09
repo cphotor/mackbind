@@ -46,6 +46,16 @@ pub fn is_modifier(code: KeyCode) -> bool {
     )
 }
 
+// 特化的键集**不排除任何键**，见下方注释。
+//
+// 曾错误地把 Q/W/N/T 排除在外，理由是「终端没有退出/关窗口的 Ctrl
+// 绑定」。这是错的：空闲的是 Ctrl+W，而 Ctrl+Shift+W 并不空闲——它
+// 正是 Linux 终端关闭标签页的键，也正是 macOS Cmd+W 的对应物。
+// Toshy 的配置同样是 `C("RC-W"): C("C-Shift-W")`。
+//
+// 特化的目的是「把 Cmd 翻译到应用认得的组合」，不是「躲开所有冲突」。
+// 逐键判断某个组合是否空闲，反而会漏掉这类对应关系。
+
 /// 已被 remap 替换的修饰键集合。
 ///
 /// 这些键按下时进入 `pending` 而非直接透传，因为它们的下游行为
@@ -90,8 +100,49 @@ pub struct Mapper {
     ctrl_busy_window: bool,
     /// Ctrl 占用应用列表（WM_CLASS / app_id）
     ctrl_busy_apps: Vec<String>,
+    /// 「Ctrl 已被占用」的应用里，这些键需映射为 Ctrl+Shift。
+    ///
+    /// 只包含这些应用**自身用 Ctrl+Shift 绑定**的键（终端的复制、
+    /// 关标签页等）。未列出的键仍走默认的 Ctrl——因为加 Shift 是为了
+    /// 命中它们已有的绑定，而非笼统地「躲冲突」。
+    terminal_bindings: Vec<KeyCode>,
+    /// 按应用生效的规则：(应用匹配串列表, 规则表)
+    ///
+    /// 优先于全局 cmd_map 与终端特化。用于「同一按键在不同应用里需要
+    /// 不同输出」——典型是复制键：ptyxis/konsole 会把 Ctrl+Shift+C
+    /// 漏发成 SIGINT，必须改走 Ctrl+Insert。
+    app_cmd_map: Vec<(Vec<String>, HashMap<CmdMapKey, (Vec<KeyCode>, KeyCode)>)>,
+    /// 当前焦点窗口的 wm_class，用于匹配 app_cmd_map
+    wm_class: String,
     /// 是否输出调试日志
     verbose: bool,
+}
+
+/// 把规则列表编译成查找表。
+///
+/// `keys` 是键名列表，可能带修饰前缀（如 `"S-z"` 表示 Shift+Z）。
+/// 取最后一段作为主键，前缀作为输入侧修饰键。前缀修饰键排序后参与
+/// 索引，使 `(z,[])` 与 `(z,[Shift])` 成为不同的条目而不互相覆盖。
+fn parse_rules(
+    rules: &[crate::config::CmdMap],
+) -> Result<HashMap<CmdMapKey, (Vec<KeyCode>, KeyCode)>, crate::keys::KeyError> {
+    let mut map = HashMap::new();
+    for m in rules {
+        let mut in_mods: Vec<KeyCode> = Vec::new();
+        let mut key: Option<KeyCode> = None;
+        for k in &m.keys {
+            let (mods, kc) = parse_combo(k)?;
+            in_mods.extend(mods);
+            key = Some(kc);
+        }
+        let key = key.ok_or_else(|| {
+            crate::keys::KeyError::BadCombo(m.emit.clone(), "keys 为空".into())
+        })?;
+        let (out_mods, out_key) = parse_combo(&m.emit)?;
+        in_mods.sort();
+        map.insert((key, in_mods), (out_mods, out_key));
+    }
+    Ok(map)
 }
 
 impl Mapper {
@@ -105,30 +156,18 @@ impl Mapper {
             remap.insert(from, to);
         }
 
-        let mut cmd_map = HashMap::new();
-        for m in &cfg.cmd_map {
-            // keys 是键名列表，可能带修饰前缀（如 "S-z" 表示 Shift+Z）。
-            // 取最后一段作为主键，前缀作为输入侧修饰键。
-            let mut in_mods: Vec<KeyCode> = Vec::new();
-            let mut key: Option<KeyCode> = None;
-            for k in &m.keys {
-                let (mods, kc) = parse_combo(k)?;
-                in_mods.extend(mods);
-                key = Some(kc);
-            }
-            let key = key.ok_or_else(|| {
-                crate::keys::KeyError::BadCombo(m.emit.clone(), "keys 为空".into())
-            })?;
-            let (out_mods, out_key) = parse_combo(&m.emit)?;
-            // 修饰键集合排序，保证 (z,[]) 与 (z,[S]) 是不同的 key，
-            // 且查找时用同一顺序构造 key。
-            in_mods.sort();
-            cmd_map.insert((key, in_mods), (out_mods, out_key));
-        }
+        let cmd_map = parse_rules(&cfg.cmd_map)?;
+
+        let app_cmd_map = cfg
+            .app_cmd_map
+            .iter()
+            .map(|a| Ok((a.apps.clone(), parse_rules(&a.rules)?)))
+            .collect::<Result<Vec<_>, crate::keys::KeyError>>()?;
 
         Ok(Mapper {
             remap,
             cmd_map,
+            app_cmd_map,
             held: Vec::new(),
             suppressed: HashSet::new(),
             output_down: Vec::new(),
@@ -139,6 +178,12 @@ impl Mapper {
             fkey_media: build_fkey_media_table(),
             ctrl_busy_window: false,
             ctrl_busy_apps: cfg.ctrl_busy_apps.clone(),
+            terminal_bindings: cfg
+                .terminal_shift_keys
+                .iter()
+                .map(|k| crate::keys::parse_key(k))
+                .collect::<Result<Vec<_>, _>>()?,
+            wm_class: String::new(),
             verbose,
         })
     }
@@ -157,6 +202,7 @@ impl Mapper {
     /// 命中时 Cmd 映射为 Ctrl+Shift，避开这些应用内 Ctrl 的既定含义
     /// （终端 Ctrl+C 中断、GVIM Ctrl+V 块选择）。
     pub fn set_window_id(&mut self, id: &str) {
+        self.wm_class = id.to_string();
         let is_term = crate::desktop::is_terminal(id);
         let in_list = self.ctrl_busy_apps.iter().any(|t| id.contains(t));
         self.ctrl_busy_window = is_term || in_list;
@@ -300,11 +346,42 @@ impl Mapper {
                 .collect();
             cur_mods.sort();
 
-            // 优先匹配显式规则（目标键与主键不同者，如 Cmd+[ → Alt+←）
-            let explicit = self.cmd_map.get(&(code, cur_mods.clone())).cloned();
+            // 按应用生效的规则最优先。
+            //
+            // 例：ptyxis/konsole 的复制键改走 Ctrl+Insert——这两个终端
+            // 在无选中文本时会把 Ctrl+Shift+C 漏给进程当 SIGINT，
+            // 使「复制」杀掉正在跑的任务。放在终端特化之前，才能
+            // 覆盖掉「Cmd+C → Ctrl+Shift+C」的结果。
+            let app_specific = self
+                .app_cmd_map
+                .iter()
+                .find(|(apps, _)| apps.iter().any(|a| self.wm_class.contains(a)))
+                .and_then(|(_, rules)| rules.get(&(code, cur_mods.clone())).cloned());
+
+            // 其次是全局显式规则（目标键与主键不同者，如 Cmd+[ → Alt+←）
+            let explicit = app_specific
+                .or_else(|| self.cmd_map.get(&(code, cur_mods.clone())).cloned());
 
             let (out_mods, out_key) = match explicit {
                 Some(v) => v,
+                None if self.ctrl_busy_window && self.terminal_bindings.contains(&code) => {
+                    // 终端里，**终端自身已绑定**的键：Cmd+X → Ctrl+Shift+X。
+                    //
+                    // 这类键加 Shift 正是为了命中终端的 Ctrl+Shift 绑定
+                    // （Ctrl+Shift+C 复制、Ctrl+Shift+W 关标签页…）。
+                    //
+                    // 关键在于这是**逐键白名单**，而非「终端里把整个 Cmd
+                    // 语义换成 Ctrl+Shift」。后者会让 Cmd+Q 变成
+                    // Ctrl+Shift+Q——一个谁也不认的组合；而 macOS 的
+                    // Cmd+Q（退出）对应的 Linux 键是 Alt+F4，属全局规则，
+                    // 不应被终端特化吞掉。
+                    let mut mods = cur_mods.clone();
+                    mods.push(KeyCode::KEY_LEFTCTRL);
+                    mods.push(KeyCode::KEY_LEFTSHIFT);
+                    mods.sort();
+                    mods.dedup();
+                    (mods, code)
+                }
                 None => {
                     // 默认语义：Cmd+X → Ctrl+X。
                     //
@@ -313,17 +390,10 @@ impl Mapper {
                     // Super+字母 基本空闲——保留 Super 会让绝大多数组合
                     // 什么也不发生。
                     //
-                    // Ctrl 已被占用的应用（终端、GVIM）改映射为 Ctrl+Shift，
-                    // 避开 Ctrl+C（中断/退出）、Ctrl+V（粘贴/块选择）等。
                     // 用户正按住的修饰键（如 Cmd+Shift+Z 的 Shift）需保留，
                     // 否则翻译时松开的修饰键不会再按下，组合就散了。
                     let mut mods = cur_mods.clone();
-                    if self.ctrl_busy_window {
-                        mods.push(KeyCode::KEY_LEFTCTRL);
-                        mods.push(KeyCode::KEY_LEFTSHIFT);
-                    } else {
-                        mods.push(KeyCode::KEY_LEFTCTRL);
-                    }
+                    mods.push(KeyCode::KEY_LEFTCTRL);
                     mods.sort();
                     mods.dedup();
                     (mods, code)
@@ -485,6 +555,146 @@ mod tests {
     fn default_mapper() -> Mapper {
         let cfg = Config::with_defaults();
         Mapper::new(&cfg, false).unwrap()
+    }
+
+    fn terminal_mapper() -> Mapper {
+        let mut m = default_mapper();
+        // 用不会漏发 SIGINT 的终端作代表（ptyxis 有单独的规则，见下）
+        m.set_window_id("com.mitchellh.ghostty");
+        m
+    }
+
+    /// 终端里 Cmd 组合映射为 Ctrl+Shift，避开 Ctrl+C 中断等既有含义。
+    #[test]
+    fn terminal_cmd_becomes_ctrl_shift() {
+        let mut m = terminal_mapper();
+        m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
+        let out = desc(&m.translate(&k(KeyCode::KEY_C.0, 1)));
+        assert!(
+            out.contains(&(KeyCode::KEY_LEFTCTRL.0, 1))
+                && out.contains(&(KeyCode::KEY_LEFTSHIFT.0, 1))
+                && out.contains(&(KeyCode::KEY_C.0, 1)),
+            "终端里 Cmd+C 应为 Ctrl+Shift+C（复制），实际 {out:?}"
+        );
+    }
+
+    /// 终端里 Cmd+W → Ctrl+Shift+W（关标签页），Cmd+T → Ctrl+Shift+T。
+    ///
+    /// 这不是「躲冲突」而是「找对应」：空闲的是 Ctrl+W，而
+    /// Ctrl+Shift+W 恰是 Linux 终端关闭标签页的键。Toshy 的配置
+    /// 同为 `C("RC-W"): C("C-Shift-W")`。
+    #[test]
+    fn terminal_cmd_w_closes_tab() {
+        for (key, why) in [
+            (KeyCode::KEY_W, "关标签页"),
+            (KeyCode::KEY_T, "新标签页"),
+        ] {
+            let mut m = terminal_mapper();
+            m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
+            let out = desc(&m.translate(&k(key.0, 1)));
+            assert!(
+                out.contains(&(KeyCode::KEY_LEFTCTRL.0, 1))
+                    && out.contains(&(KeyCode::KEY_LEFTSHIFT.0, 1))
+                    && out.contains(&(key.0, 1)),
+                "终端里 Cmd+{key:?}（{why}）应为 Ctrl+Shift+{key:?}，实际 {out:?}"
+            );
+        }
+    }
+
+    /// ptyxis / konsole 的复制键改走 Ctrl+Insert。
+    ///
+    /// 这两个终端在**无选中文本**时会把 `Ctrl+Shift+C` 穿透给子进程
+    /// 当作 SIGINT ——「复制」会杀掉正在跑的任务。`Ctrl+Insert` 是
+    /// X11 传统复制键，终端都支持且不会被当作控制字符发送。
+    ///
+    /// 而 wezterm / ghostty / gnome-terminal 无此问题（无条件吞掉该
+    /// 组合），故不受影响。
+    #[test]
+    fn sigint_leaky_terminals_use_ctrl_insert() {
+        for wm in ["org.gnome.Ptyxis", "org.kde.konsole"] {
+            let mut m = default_mapper();
+            m.set_window_id(wm);
+            m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
+            let out = desc(&m.translate(&k(KeyCode::KEY_C.0, 1)));
+            assert!(
+                out.contains(&(KeyCode::KEY_LEFTCTRL.0, 1))
+                    && out.contains(&(KeyCode::KEY_INSERT.0, 1)),
+                "{wm} 的 Cmd+C 应为 Ctrl+Insert（避免 SIGINT），实际 {out:?}"
+            );
+            assert!(
+                !out.iter().any(|(c, _)| *c == KeyCode::KEY_LEFTSHIFT.0),
+                "{wm} 的 Cmd+C 不应带 Shift: {out:?}"
+            );
+        }
+    }
+
+    /// 不漏发 SIGINT 的终端仍走普通终端路径（Ctrl+Shift+C）。
+    ///
+    /// 若一律改用 Ctrl+Insert，会让这些终端失去标准复制键——所以
+    /// 该规则必须按应用区分，不能全局套用。
+    #[test]
+    fn safe_terminals_keep_ctrl_shift_c() {
+        let mut m = terminal_mapper();
+        m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
+        let out = desc(&m.translate(&k(KeyCode::KEY_C.0, 1)));
+        assert!(out.contains(&(KeyCode::KEY_LEFTSHIFT.0, 1)), "{out:?}");
+        assert!(out.contains(&(KeyCode::KEY_C.0, 1)), "{out:?}");
+    }
+
+    /// 普通应用里 Cmd+C 不受该规则影响，仍是 Ctrl+C。
+    #[test]
+    fn normal_app_cmd_c_is_plain_ctrl() {
+        let mut m = default_mapper();
+        m.set_window_id("org.gnome.Nautilus");
+        m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
+        let out = desc(&m.translate(&k(KeyCode::KEY_C.0, 1)));
+        assert!(out.contains(&(KeyCode::KEY_LEFTCTRL.0, 1)), "{out:?}");
+        assert!(
+            !out.iter().any(|(c, _)| *c == KeyCode::KEY_LEFTSHIFT.0),
+            "{out:?}"
+        );
+    }
+
+    /// Cmd+Q → Alt+F4，且**终端与普通应用一致**。
+    ///
+    /// 这是「逐键白名单」相对「整体换语义」的关键区别：macOS 的
+    /// Cmd+Q（退出应用）对应 Linux 的 Alt+F4（GNOME 的
+    /// wm.keybindings close），这是跨应用的通用绑定。若终端里把 Cmd
+    /// 一律变成 Ctrl+Shift，Cmd+Q 会退化成谁也不认的 Ctrl+Shift+Q。
+    #[test]
+    fn cmd_q_is_alt_f4_everywhere() {
+        for (wm, label) in [
+            ("org.gnome.Nautilus", "普通应用"),
+            ("org.gnome.Ptyxis", "终端"),
+            ("com.mitchellh.ghostty", "终端"),
+        ] {
+            let mut m = default_mapper();
+            m.set_window_id(wm);
+            m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
+            let out = desc(&m.translate(&k(KeyCode::KEY_Q.0, 1)));
+            assert!(
+                out.contains(&(KeyCode::KEY_LEFTALT.0, 1))
+                    && out.contains(&(KeyCode::KEY_F4.0, 1)),
+                "{label}（{wm}）Cmd+Q 应为 Alt+F4，实际 {out:?}"
+            );
+        }
+    }
+
+    /// 终端里未列入白名单的键仍走默认语义（Ctrl），不被特化。
+    ///
+    /// 例如 Cmd+N：终端的 Ctrl+N 通常空闲，无需变成 Ctrl+Shift+N。
+    /// 笼统地「终端里一律加 Shift」会毁掉这类键。
+    #[test]
+    fn terminal_unlisted_key_stays_plain_ctrl() {
+        let mut m = terminal_mapper();
+        m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
+        let out = desc(&m.translate(&k(KeyCode::KEY_N.0, 1)));
+        assert!(out.contains(&(KeyCode::KEY_LEFTCTRL.0, 1)), "{out:?}");
+        assert!(out.contains(&(KeyCode::KEY_N.0, 1)), "{out:?}");
+        assert!(
+            !out.iter().any(|(c, v)| *c == KeyCode::KEY_LEFTSHIFT.0 && *v == 1),
+            "白名单外的键不应加 Shift: {out:?}"
+        );
     }
 
     #[test]
