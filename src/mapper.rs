@@ -2737,6 +2737,91 @@ mod trash_scoped_to_nautilus {
     }
 }
 
+/// `exec` 的确认判定本身。
+///
+/// 回归测试：`needs_confirm` 曾写成 `confirm || risk == Destructive`，
+/// 使 `confirm: false` 完全失效——弹窗照弹，而单元测试只检查规则表
+/// 里 `confirm` 字段的值，从不真正调用 `run()`，故漏过。
+///
+/// 这里直接验证判定逻辑：免确认 + 限定应用 → 不弹；
+/// 免确认 + 全局 → 拒绝执行。
+#[cfg(test)]
+mod exec_confirm_logic {
+    use super::*;
+    use crate::config::Config;
+
+    /// 从规则表取清倒废纸篓规则，构造 ExecRequest
+    fn trash_request(confirm: bool) -> crate::exec::ExecRequest<'static> {
+        let cfg = Config::with_defaults();
+        let rules = compile_table(&cfg.rules).expect("应能编译");
+        let r = rules
+            .iter()
+            .find(|r| {
+                matches!(&r.act, CompiledAction::Exec { program, .. } if program == "gio")
+                    && r.desc.as_deref().unwrap_or("").contains("Option")
+            })
+            .expect("应有 Option 版清倒废纸篓规则");
+
+        let (program, args, c) = match &r.act {
+            CompiledAction::Exec {
+                program,
+                args,
+                confirm,
+                ..
+            } => (program.clone(), args.clone(), *confirm),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            c, confirm,
+            "规则表的 confirm 应为 {confirm}——测试前提不成立"
+        );
+
+        let args: &'static [String] = Box::leak(args.into_boxed_slice());
+        crate::exec::ExecRequest {
+            program: Box::leak(program.into_boxed_str()),
+            args,
+            label: Some("测试"),
+            confirm,
+            prompt: Some("测试".into()),
+            ok_label: Some("测试".into()),
+            confirm_key: Some("Cmd+Shift+⌫"),
+            scoped: !matches!(r.app, AppMatch::Any),
+        }
+    }
+
+    /// `gio trash --empty` 必须被判为破坏性
+    #[test]
+    fn gio_trash_empty_is_flagged_destructive() {
+        let args = vec!["trash".to_string(), "--empty".to_string()];
+        assert!(crate::exec::is_destructive("gio", &args));
+    }
+
+    /// 免确认 + 限定应用 → 允许执行（不弹框、不拒绝）
+    #[test]
+    fn scoped_no_confirm_is_allowed() {
+        let req = trash_request(false);
+        assert!(
+            !crate::exec::should_confirm(&req),
+            "免确认规则不应弹框——此前 `confirm || risk==Destructive` 会让它恒真"
+        );
+        assert!(
+            !crate::exec::refuse(&req),
+            "限定应用的免确认不应被拒绝"
+        );
+    }
+
+    /// 免确认 + 全局 → 必须拒绝执行
+    #[test]
+    fn global_no_confirm_is_refused() {
+        let mut req = trash_request(false);
+        req.scoped = false;
+        assert!(
+            crate::exec::refuse(&req),
+            "全局破坏性命令免确认必须被拒绝"
+        );
+    }
+}
+
 /// 裸 Shift 仍须正常输出按下与释放（fcitx5 依赖）
 #[test]
 fn bare_shift_still_works() {

@@ -43,6 +43,24 @@ enum Risk {
     Destructive,
 }
 
+/// 供测试与调用方判断：某命令是否属破坏性。
+pub fn is_destructive(program: &str, args: &[String]) -> bool {
+    classify(program, args) == Risk::Destructive
+}
+
+/// 该请求是否需要弹确认框。
+///
+/// 只看规则自己的 `confirm` 设置——安全性由 [`refuse`] 的作用域守卫
+/// 兜底，不在这里二次强制。
+pub fn should_confirm(req: &ExecRequest<'_>) -> bool {
+    req.confirm
+}
+
+/// 该请求是否应被直接拒绝（破坏性 + 免确认 + 未限定应用）。
+pub fn refuse(req: &ExecRequest<'_>) -> bool {
+    is_destructive(req.program, req.args) && !req.confirm && !req.scoped
+}
+
 fn classify(program: &str, args: &[String]) -> Risk {
     match program {
         // `gio trash --empty` 清空整个废纸篓，文件永久消失
@@ -164,25 +182,32 @@ pub struct ExecRequest<'a> {
 }
 
 pub fn run(req: ExecRequest<'_>) {
+    // 先做两项判定（需要完整的请求），再解构执行
+    let refused = refuse(&req);
+    let needs_confirm = should_confirm(&req);
+
     let ExecRequest {
         program,
         args,
         label,
-        confirm,
         prompt: custom_prompt,
         ok_label,
         confirm_key,
-        scoped,
+        ..
     } = req;
-    let risk = classify(program, args);
     let label = label.unwrap_or(program);
 
-    if risk == Risk::Destructive && !confirm && !scoped {
+    if refused {
         eprintln!("[exec] 全局破坏性命令须显式确认，已拒绝：{label}");
         return;
     }
 
-    let needs_confirm = confirm || risk == Risk::Destructive;
+    // 是否弹确认框，**只看规则自己的设置**。
+    //
+    // 此前写成 `confirm || risk == Destructive`，导致 `confirm: false`
+    // 完全不起作用——`risk` 一项让条件恒真，弹窗照弹。
+    // 安全性由上面的作用域守卫保证：破坏性命令免确认时必须限定应用，
+    // 否则直接拒绝执行，不该在这里再强制弹框。
 
     if needs_confirm {
         let prompt = custom_prompt.map(|s| s.to_string()).unwrap_or_else(|| {
