@@ -263,6 +263,39 @@ fn default_rules() -> Vec<Rule> {
         desc: Some("Cmd+空格 → 概览（读 DE 现有绑定）".into()),
     });
 
+    // ── Ctrl+Cmd 组合：macOS 上有独立含义，不可由默认语义推导 ──
+    //
+    // 前提是「Cmd 映射为 Ctrl」。用户已按住 Ctrl 时，Cmd 再变 Ctrl 就是
+    // Ctrl+Ctrl ——同一槽位，组合退化，故此类组合**不能**转换。
+    // 但也不能当 Cmd+X 处理（见 `default_semantics` 的说明）。
+    // 表里有的按表走，没有的原样放行。
+    //
+    // 放在全局规则之后、`*` 通配之前：优先级高于终端特化。
+    //
+    // Ctrl+Cmd+Q 锁屏：读 GNOME 现有的 screensaver 绑定（本机 Super+l），
+    // 与 Cmd+空格 → 概览同一路子——不改写用户配置。
+    v.push(Rule {
+        apps: vec![],
+        keys: vec!["C-KEY_Q".into()],
+        act: Action::DeAccel {
+            feature: "lock-screen".into(),
+        },
+        desc: Some("锁屏（Ctrl+Cmd+Q，读 DE 现有绑定）".into()),
+    });
+
+    // Ctrl+Cmd+F 全屏：应用级全屏的标准键。
+    // GNOME 的 toggle-fullscreen 动作存在但默认未绑定（@as []），
+    // 故直接发 F11，无需改写用户设置。
+    v.push(Rule {
+        apps: vec![],
+        keys: vec!["C-KEY_F".into()],
+        act: Action::Emit {
+            mods: vec![],
+            key: "KEY_F11".into(),
+        },
+        desc: Some("全屏 (Ctrl+Cmd+F → F11)".into()),
+    });
+
     // ── 会漏发 SIGINT 的终端：复制键改走 Ctrl+Insert ──
     // 必须放在终端特化**之前**——查找取首个命中者，若在其后，
     // 通用终端规则会先命中，本条永不生效。

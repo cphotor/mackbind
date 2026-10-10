@@ -239,6 +239,12 @@ def parse_rules() -> set[str]:
         apps, combo = m.group(1), m.group(2).strip()
         if combo:
             out.add(combo)
+    # `keys: vec!["…"]` 形式的规则（de_accel、terminal_ctrl_shift 等）
+    for m in re.finditer(r'keys:\s*vec!\[([^\]]*)\]', text, re.S):
+        for k in re.findall(r'"([^"]+)"', m.group(1)):
+            k = k.strip()
+            if k and k != "*":
+                out.add(k)
     return out
 
 

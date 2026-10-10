@@ -168,6 +168,8 @@ pub struct Mapper {
     terminal_bindings: Vec<KeyCode>,
     /// 当前焦点窗口的 wm_class，用于匹配表的应用列
     wm_class: String,
+    /// 桌面环境类型，决定 `de_accel` 动作去哪张 schema 查
+    desktop_type: DesktopType,
     /// 是否输出调试日志
     verbose: bool,
 }
@@ -281,6 +283,15 @@ fn de_action_lookup(
     let (schema, key): (&str, &str) = match (dt, feature) {
         // 概览：GNOME 放在 shell 层 schema，不在 wm.keybindings 里
         (Gnome, "overview") => ("org.gnome.shell.keybindings", "toggle-overview"),
+        // 锁屏：在 media-keys 的 `screensaver`，**不在** wm.keybindings。
+        //
+        // 曾因只 grep wm.keybindings 而断言「GNOME 无锁屏绑定」——
+        // 与「概览在另一个 schema」「D-Bus dest 写错」同源的第三次误判。
+        // 断言某能力不存在前，先在整个 GNOME 域内搜一遍。
+        (Gnome, "lock-screen") => (
+            "org.gnome.settings-daemon.plugins.media-keys",
+            "screensaver",
+        ),
         // 显示桌面：动作存在但默认未绑定，需用户自行绑定后此条才生效
         (Gnome, "show-desktop") => ("org.gnome.desktop.wm.keybindings", "show-desktop"),
         // KDE 与裸 WM 的对应机制不同，暂未实现。
@@ -290,45 +301,80 @@ fn de_action_lookup(
     Some((schema.to_string(), key.to_string()))
 }
 
-/// 把某个 DE 功能解析为一条 Cmd 规则。
+/// 把某个 DE 功能解析为要发出的组合。
 ///
 /// 步骤统一为：查表拿 schema 与动作键名 → 读该动作的现有加速键 →
 /// 解析成修饰键与主键。因此**读 DE 现有绑定**这一行为由函数本身保证，
 /// 不必由每个调用点各自实现。
 ///
-/// 返回 `(输入主键, 输出修饰键, 输出主键)`，可直接插入 `cmd_map`。
-fn de_feature_rule(
+/// 输入侧（哪个 macOS 组合触发它）由规则表的 `keys` 列决定，
+/// 不在此硬编码——否则 `Ctrl+Cmd+Q` 锁屏这类非空格触发就无从表达。
+///
+/// 返回 `(输出修饰键, 输出主键)`。
+fn de_feature_accel(
     dt: &DesktopType,
     feature: &str,
-) -> Option<(RuleKey, Vec<KeyCode>, KeyCode)> {
-    // 功能标识 → 触发该功能的 macOS 按键。当前仅 Cmd+空格（Spotlight）。
-    let trigger: KeyCode = match feature {
-        "overview" => KeyCode::KEY_SPACE,
-        "show-desktop" => KeyCode::KEY_SPACE,
-        _ => return None,
-    };
-
+) -> Option<(Vec<KeyCode>, KeyCode)> {
     let (schema, action) = de_action_lookup(dt, feature)?;
     let accel = crate::accel::action_accel(&schema, &action)?;
     let (mods, key) = crate::accel::parse_accel(&accel)?;
-    let out_mods = mods.into_iter().map(KeyCode::new).collect();
-    Some(((trigger, Vec::new()), out_mods, key))
+    Some((mods.into_iter().map(KeyCode::new).collect(), key))
 }
 
-    /// 默认语义：`Cmd+X` → `Ctrl+X`。
+/// DE 功能是否可用。启动时据此剔除表中的 `de_accel` 行，
+/// 避免运行时反复查询。
+fn de_feature_ready(dt: &DesktopType, feature: &str) -> bool {
+    de_feature_accel(dt, feature).is_some()
+}
+
+/// 默认语义的结果：要么转换，要么放行。
+enum Default {
+    /// `Cmd+X` → `Ctrl+X`
+    Convert(Vec<KeyCode>, KeyCode),
+    /// 无从转换，原样放行
+    Passthrough,
+}
+
+/// 默认语义：`Cmd+X` → `Ctrl+X`。
+///
+/// **仅在查表落空后适用**——表里有规则的一律以表为准。
 ///
 /// 不做穷举：macOS 的 Cmd 组合是长尾的，固定表覆盖不全。实测 GNOME 的
 /// 28 个 Super 绑定中仅 `Super+h` 涉及字母，`Super+字母` 基本空闲——
 /// 保留 Super 会让绝大多数组合什么也不发生。
 ///
-/// 用户正按住的修饰键（如 Cmd+Shift+Z 的 Shift）需保留，否则翻译时
-/// 松开的修饰键不会再按下，组合就散了。
-fn default_semantics(cur_mods: &[KeyCode], code: KeyCode) -> (Vec<KeyCode>, KeyCode) {
+/// # 何时放行而非转换
+///
+/// 前提是「Cmd 映射为 Ctrl」。若用户已按住 Ctrl，Cmd 再变 Ctrl 就成了
+/// `Ctrl+Ctrl+X`——同一个槽位，组合退化。故此时不能转换。
+///
+/// 但也不能把它当 `Cmd+X` 处理：`Ctrl+Cmd+X` 在 macOS 上是**另一个
+/// 组合键**（`Ctrl+Cmd+Q` 锁屏、`Ctrl+Cmd+F` 全屏），有自己的含义。
+/// 表里没有它，只说明我们没配，不等于它等于 `Cmd+X`。
+///
+/// 故放行：把用户按的原样交给应用，由应用自己解释。这比替它编一个
+/// `Ctrl+X` 可预测——表里有就按表走，没有就透传。
+///
+/// 注意物理 Ctrl 经 remap 后是 CapsLock（见 `handle_press`），
+/// 故冲突判定须把 CapsLock 一并计入。
+fn default_semantics(cur_mods: &[KeyCode], code: KeyCode) -> Default {
+    let ctrl_taken = cur_mods.iter().any(|m| {
+        matches!(
+            *m,
+            KeyCode::KEY_LEFTCTRL | KeyCode::KEY_RIGHTCTRL | KeyCode::KEY_CAPSLOCK
+        )
+    });
+    if ctrl_taken {
+        return Default::Passthrough;
+    }
+
+    // 其余修饰键（Shift/Alt）保留后追加 Ctrl：
+    // `Shift+Cmd+X` → `Shift+Ctrl+X`
     let mut mods = cur_mods.to_vec();
     mods.push(KeyCode::KEY_LEFTCTRL);
     mods.sort();
     mods.dedup();
-    (mods, code)
+    Default::Convert(mods, code)
 }
 
 impl Mapper {
@@ -353,24 +399,33 @@ impl Mapper {
         //
         // 表里已有一条 `DeAccel{overview}` 行，此处只做可用性检查：
         // 查得到则该行生效，查不到则整条规则无动作可做。
-        let de_ready = cfg.desktop.spotlight
-            && de_feature_rule(&cfg.desktop.r#type, "overview").is_some();
-        if verbose {
-            if cfg.desktop.spotlight && de_ready {
-                eprintln!("[de] Cmd+空格 → 概览（读 DE 现有绑定）");
-            } else if cfg.desktop.spotlight {
-                eprintln!("[de] 未找到概览绑定，Cmd+空格 不做映射");
-            }
-        }
-
-        // 无 DE 支持时剔除该行，避免运行时反复查询
+        // 表中所有 `de_accel` 行逐个检查可用性。
+        //
+        // `overview` 受 `spotlight` 开关控制；锁屏等其余功能无条件启用。
+        // 查不到的行在此剔除，避免运行时反复查询失败的功能。
+        let mut de_report: Vec<(String, bool)> = Vec::new();
         let rules = rules
             .into_iter()
             .filter(|r| match &r.act {
-                CompiledAction::DeAccel(_) => de_ready,
+                CompiledAction::DeAccel(feature) => {
+                    let ok = de_feature_ready(&cfg.desktop.r#type, feature)
+                        && (feature != "overview" || cfg.desktop.spotlight);
+                    de_report.push((feature.clone(), ok));
+                    ok
+                }
                 _ => true,
             })
             .collect();
+
+        if verbose {
+            for (feature, ok) in &de_report {
+                if *ok {
+                    eprintln!("[de] {feature}：读 DE 现有绑定后发出");
+                } else {
+                    eprintln!("[de] {feature}：DE 未提供或已关闭，跳过");
+                }
+            }
+        }
 
         Ok(Mapper {
             remap,
@@ -391,6 +446,7 @@ impl Mapper {
                 .map(|k| crate::keys::parse_key(k))
                 .collect::<Result<Vec<_>, _>>()?,
             wm_class: String::new(),
+            desktop_type: cfg.desktop.r#type,
             verbose,
         })
     }
@@ -601,11 +657,11 @@ impl Mapper {
                 CompiledAction::Emit(mods, key) => return Some((mods.clone(), *key)),
                 CompiledAction::DeAccel(feature) => {
                     // 读 DE 现有的绑定，发出同样的键。不改写用户配置，
-                    // 用户改了绑定则自动跟上。查不到则跳过该行继续找。
-                    if let Some((trigger, mods, key)) =
-                        de_feature_rule(&crate::config::DesktopType::Gnome, feature)
+                    // 用户改了绑定则自动跟上。启动时已剔除不可用的行，
+                    // 此处仍以 `if let` 兜底——DE 绑定可能在运行中改变。
+                    if let Some((mods, key)) =
+                        de_feature_accel(&self.desktop_type, feature)
                     {
-                        let _ = trigger;
                         return Some((mods, key));
                     }
                     continue;
@@ -655,17 +711,60 @@ impl Mapper {
                 .iter()
                 .copied()
                 .filter(|m| *m != KeyCode::KEY_LEFTMETA && *m != KeyCode::KEY_RIGHTMETA)
+                // 物理 Ctrl 经 remap 变成 CapsLock，但**语义上仍是 Ctrl**。
+                // 规则表里写 `C-`（= KEY_LEFTCTRL），故查表前归一化，
+                // 否则 `Ctrl+Cmd+Q` 这类规则永远匹配不上。
+                .map(|m| match m {
+                    KeyCode::KEY_CAPSLOCK | KeyCode::KEY_RIGHTCTRL => KeyCode::KEY_LEFTCTRL,
+                    other => other,
+                })
                 .collect();
             cur_mods.sort();
+            cur_mods.dedup();
 
             // 查表：按声明顺序线性扫描，首个命中者生效。
             //
             // 「声明顺序即优先级」是这张表的核心性质——原先散落在
             // `app_cmd_map > cmd_map > 终端特化` 三处的优先级关系，
             // 现在只由规则在表中的位置决定。
-            let (out_mods, out_key) = self
-                .lookup(code, &cur_mods)
-                .unwrap_or_else(|| default_semantics(&cur_mods, code));
+            // 查表优先；表里没有才轮到默认语义。
+            let decision = match self.lookup(code, &cur_mods) {
+                Some((m, k)) => Default::Convert(m, k),
+                None => default_semantics(&cur_mods, code),
+            };
+
+            // 放行：把用户按的原样交给应用。
+            //
+            // Cmd 此前被抑制（未输出），故这里需显式补上——
+            // 它从未进入 output_down，不在此处补就会丢失，
+            // 发出一个缺 Cmd 的残缺组合。
+            if let Default::Passthrough = decision {
+                let mut out = Vec::new();
+                for h in self.output_down.drain(..).collect::<Vec<_>>() {
+                    out.extend(self.emit_key(h, 0));
+                }
+                for m in &cur_mods {
+                    out.extend(self.emit_key(*m, 1));
+                    self.output_down.push(*m);
+                }
+                // Cmd 以真实 Super 身份发出
+                out.extend(self.emit_key(KeyCode::KEY_LEFTMETA, 1));
+                self.output_down.push(KeyCode::KEY_LEFTMETA);
+                out.extend(self.emit_key(code, 1));
+                self.output_down.push(code);
+                self.pressed.insert(physical, code);
+                if self.verbose {
+                    eprintln!(
+                        "[mapper] Cmd+{:?}{:?} 无规则且无法转换 → 放行",
+                        code, cur_mods
+                    );
+                }
+                return out;
+            }
+
+            let Default::Convert(out_mods, out_key) = decision else {
+                unreachable!("Passthrough 已在上面返回")
+            };
 
             if self.verbose {
                 eprintln!(
@@ -873,11 +972,10 @@ mod tests {
     /// 该组合在 macOS 中是 `Cmd+Ctrl+空格`（切换输入法），语义亦相符。
     #[test]
     fn cmd_space_maps_to_gnome_overview() {
-        let Some(rule) = de_feature_rule(&DesktopType::Gnome, "overview") else {
+        let Some((out_mods, out_key)) = de_feature_accel(&DesktopType::Gnome, "overview") else {
             // 本机未装 GNOME 或动作未绑定，跳过而非误判
             return;
         };
-        let (_in_key, out_mods, out_key) = rule;
         assert!(
             out_mods.contains(&KeyCode::KEY_LEFTCTRL)
                 && out_mods.contains(&KeyCode::KEY_LEFTSHIFT),
@@ -1631,12 +1729,14 @@ mod release_symmetry {
         assert!(out.is_empty(), "Shift 已被翻译时松开，不应再有输出: {:?}", codes(&out));
     }
 
-    /// `Ctrl+Cmd+Q` 不等同于 `Cmd+Q`：remap 已把物理 Ctrl 变成 CapsLock，
-    /// 查表落空后走默认语义，产出的是 `Ctrl+Q`（CapsLock 对应用无意义）。
+    /// `Ctrl+Cmd+Q` 必须区别于 `Cmd+Q`——这是本项目修过的一个真实缺陷。
     ///
-    /// 记录此行为是因为它容易被误读成「Ctrl 被忽略了」——实机观感相同
-    /// （两者都关窗口），但发出的组合不同：`Cmd+Q` 给 Alt+F4，本组合给
-    /// Ctrl+Q。后者只在恰好绑了 Ctrl+Q 的应用里有效。
+    /// 曾因 remap 把物理 Ctrl 变成 CapsLock，查表匹配不上 `Cmd+Q` 规则，
+    /// 于是落进默认语义发出 `Ctrl+Q`。实机观感与 `Cmd+Q` 相同（都关窗口），
+    /// 但语义完全错：`Ctrl+Cmd+Q` 在 macOS 上是**锁屏**。
+    ///
+    /// 现表中有锁屏规则，且查表前把 CapsLock 归一化为 Ctrl
+    /// （物理 Ctrl 经 remap 后是 CapsLock，但语义上仍是 Ctrl）。
     #[test]
     fn ctrl_cmd_q_is_not_same_as_cmd_q() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
@@ -1645,23 +1745,141 @@ mod release_symmetry {
         let out = m.translate(&k(KeyCode::KEY_Q.0, 1));
         let codes = codes(&out);
 
-        // 未发出 Alt+F4——若命中 Cmd+Q 规则则应出现 KEY_F4
         assert!(
             !codes.contains(&KeyCode::KEY_F4.0),
-            "Ctrl+Cmd+Q 不应命中 Cmd+Q 规则（remap 使 Ctrl 变 CapsLock）: {:?}",
+            "Ctrl+Cmd+Q 不应命中 Cmd+Q 的 Alt+F4: {:?}",
             codes
         );
-                // 实际发出 Q，且物理 Ctrl 经 remap 后表现为 CapsLock
         assert!(
-            codes.contains(&KeyCode::KEY_Q.0),
-            "应落到默认语义发出 Q: {:?}",
+            !codes.contains(&KeyCode::KEY_Q.0),
+            "Ctrl+Cmd+Q 不应退化成裸 Ctrl+Q: {:?}",
             codes
         );
     }
 
-    /// 裸 Shift 仍须正常输出按下与释放（fcitx5 依赖）
+    /// `Ctrl+Cmd+X` 的处理：能转换则转换，不能则放行。
+///
+/// 背景：默认语义把 Cmd 变 Ctrl。若用户已按住 Ctrl，Cmd 再变 Ctrl 就是
+/// `Ctrl+Ctrl` ——同一槽位，组合退化，故不能转换。但也**不能**当 `Cmd+X`
+/// 处理：`Ctrl+Cmd+X` 在 macOS 上是另一个组合键，有自己的含义。
+/// 表里有规则就按表走，没有的原样放行。
+#[cfg(test)]
+mod ctrl_cmd_semantics {
+    use super::*;
+
+    fn k(c: u16, v: i32) -> InputEvent {
+        InputEvent::new(EventType::KEY.0, c, v)
+    }
+
+    fn codes(evs: &[InputEvent]) -> Vec<u16> {
+        evs.iter().map(|e| e.code()).collect()
+    }
+
+    fn press(m: &mut Mapper, seq: &[KeyCode]) -> Vec<u16> {
+        let mut out = vec![];
+        for c in seq {
+            out.extend(m.translate(&k(c.0, 1)));
+        }
+        codes(&out)
+    }
+
+    /// `Ctrl+Cmd+Q` 命中表里的锁屏规则 → 发 DE 现有的 Super+L
     #[test]
-    fn bare_shift_still_works() {
+    fn ctrl_cmd_q_locks_screen() {
+        let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
+        let out = press(
+            &mut m,
+            &[
+                KeyCode::KEY_LEFTCTRL,
+                KeyCode::KEY_LEFTMETA,
+                KeyCode::KEY_Q,
+            ],
+        );
+        assert!(
+            out.contains(&KeyCode::KEY_LEFTMETA.0) && out.contains(&KeyCode::KEY_L.0),
+            "Ctrl+Cmd+Q 应发 Super+L（读 DE 的 screensaver 绑定），实际 {:?}",
+            out
+        );
+        assert!(
+            !out.contains(&KeyCode::KEY_F4.0),
+            "不应退回 Cmd+Q 的 Alt+F4：{:?}",
+            out
+        );
+    }
+
+    /// `Ctrl+Cmd+F` 全屏 → F11
+    #[test]
+    fn ctrl_cmd_f_fullscreen() {
+        let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
+        let out = press(
+            &mut m,
+            &[
+                KeyCode::KEY_LEFTCTRL,
+                KeyCode::KEY_LEFTMETA,
+                KeyCode::KEY_F,
+            ],
+        );
+        assert!(
+            out.contains(&KeyCode::KEY_F11.0),
+            "Ctrl+Cmd+F 应为 F11（全屏），实际 {:?}",
+            out
+        );
+        assert!(
+            !out.contains(&KeyCode::KEY_F.0),
+            "不应退回查找 Ctrl+F：{:?}",
+            out
+        );
+    }
+
+    /// 表里没有的 `Ctrl+Cmd+W` → 原样放行，不得编造 `Ctrl+W`
+    #[test]
+    fn unmapped_ctrl_cmd_passes_through() {
+        let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
+        let out = press(
+            &mut m,
+            &[
+                KeyCode::KEY_LEFTCTRL,
+                KeyCode::KEY_LEFTMETA,
+                KeyCode::KEY_W,
+            ],
+        );
+        assert!(
+            out.contains(&KeyCode::KEY_LEFTMETA.0),
+            "放行时须发出真实的 Meta，否则应用收到残缺组合：{:?}",
+            out
+        );
+        assert!(
+            out.contains(&KeyCode::KEY_W.0),
+            "放行时主键须原样发出：{:?}",
+            out
+        );
+    }
+
+    /// `Shift+Cmd+X` 仍走默认语义 → `Shift+Ctrl+X`（不冲突，可转换）
+    #[test]
+    fn shift_cmd_still_converts() {
+        let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
+        let out = press(
+            &mut m,
+            &[
+                KeyCode::KEY_LEFTSHIFT,
+                KeyCode::KEY_LEFTMETA,
+                KeyCode::KEY_Z,
+            ],
+        );
+        assert!(
+            out.contains(&KeyCode::KEY_LEFTCTRL.0)
+                && out.contains(&KeyCode::KEY_LEFTSHIFT.0)
+                && out.contains(&KeyCode::KEY_Z.0),
+            "Shift+Cmd+Z 应为 Shift+Ctrl+Z，实际 {:?}",
+            out
+        );
+    }
+}
+
+/// 裸 Shift 仍须正常输出按下与释放（fcitx5 依赖）
+#[test]
+fn bare_shift_still_works() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
         let d = m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 1));
         assert_eq!(codes(&d), vec![KeyCode::KEY_LEFTSHIFT.0]);
