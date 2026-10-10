@@ -409,7 +409,9 @@ Fn 按住   + F1 →  发 KEY_BRIGHTNESSDOWN (224)
 
 - L3 Finder 映射逐条核对
 - 配置热重载
-- 开机自启
+
+> 开机自启已落地：`~/.config/systemd/user/mackbind.service`，
+> `WantedBy=default.target`。此前列为待办是疏漏——实际早已配置好。
 
 ## 风险
 

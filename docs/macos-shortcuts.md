@@ -83,7 +83,7 @@ macOS 的 `Cmd+Tab`（切换应用）、`Cmd+H`（隐藏）、`Cmd+↑/↓`（�
 |`Cmd+C` 复制|`Ctrl+C`|A|
 |`Cmd+V` 粘贴|`Ctrl+V`|A|
 |`Cmd+Z` 撤销|`Ctrl+Z`|A|
-|`Shift+Cmd+Z` 重做|`Ctrl+Y`|A|
+|`Shift+Cmd+Z` 重做|`Ctrl+Shift+Z`|A|
 |`Cmd+A` 全选|`Ctrl+A`|A|
 |`Cmd+F` 查找|`Ctrl+F`|A|
 |`Cmd+G` 查找下一个|`Ctrl+G`|A|
