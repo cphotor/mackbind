@@ -705,15 +705,28 @@ impl Mapper {
             .any(|m| *m == KeyCode::KEY_LEFTMETA || *m == KeyCode::KEY_RIGHTMETA);
 
         if cmd_held {
-            // 当前除 Cmd 外还按住的修饰键（排序后作为规则匹配的一部分）
-            let mut cur_mods: Vec<KeyCode> = self
+            // 当前除 Cmd 外还按住的修饰键。
+            //
+            // 两份，用途不同，**不可混用**：
+            // - `held_mods`：**真实**按下的键，用于发事件与释放配平
+            // - `cur_mods`：**归一化**后的键，仅用于查表
+            //
+            // 归一化的原因：物理 Ctrl 经 remap 变成 CapsLock，但语义上仍是
+            // Ctrl，而规则表里写 `C-`（= KEY_LEFTCTRL）。不归一化则
+            // `Ctrl+Cmd+Q` 这类规则永远匹配不上。
+            //
+            // 但**发事件必须用真实的**：用归一化值发，输出侧按下的是
+            // LeftCtrl，而释放路径按 pressed 表还原的是 CapsLock——
+            // 两者对不上，LeftCtrl 永久卡在按下态。
+            let held_mods: Vec<KeyCode> = self
                 .held
                 .iter()
                 .copied()
                 .filter(|m| *m != KeyCode::KEY_LEFTMETA && *m != KeyCode::KEY_RIGHTMETA)
-                // 物理 Ctrl 经 remap 变成 CapsLock，但**语义上仍是 Ctrl**。
-                // 规则表里写 `C-`（= KEY_LEFTCTRL），故查表前归一化，
-                // 否则 `Ctrl+Cmd+Q` 这类规则永远匹配不上。
+                .collect();
+            let mut cur_mods = held_mods.clone();
+            cur_mods = cur_mods
+                .into_iter()
                 .map(|m| match m {
                     KeyCode::KEY_CAPSLOCK | KeyCode::KEY_RIGHTCTRL => KeyCode::KEY_LEFTCTRL,
                     other => other,
@@ -743,11 +756,20 @@ impl Mapper {
                 for h in self.output_down.drain(..).collect::<Vec<_>>() {
                     out.extend(self.emit_key(h, 0));
                 }
-                for m in &cur_mods {
+                for m in &held_mods {
                     out.extend(self.emit_key(*m, 1));
                     self.output_down.push(*m);
                 }
-                // Cmd 以真实 Super 身份发出
+                // Cmd 以真实 Super 身份发出。
+                //
+                // 必须同时把它从 `suppressed` 移除：Meta 按下时已被抑制，
+                // 从未进入 output_down。若不移除，释放路径会走
+                // `suppressed.remove()` 分支直接返回、不发释放——
+                // 于是这个注入的 Super 永久卡在按下态。
+                //
+                // 后果是实机级的：锁屏后输密码，每个键都带着 Super，
+                // 数字 9 等输入不进去，只能硬关机。
+                self.suppressed.remove(&KeyCode::KEY_LEFTMETA);
                 out.extend(self.emit_key(KeyCode::KEY_LEFTMETA, 1));
                 self.output_down.push(KeyCode::KEY_LEFTMETA);
                 out.extend(self.emit_key(code, 1));
@@ -1873,6 +1895,117 @@ mod ctrl_cmd_semantics {
                 && out.contains(&KeyCode::KEY_Z.0),
             "Shift+Cmd+Z 应为 Shift+Ctrl+Z，实际 {:?}",
             out
+        );
+    }
+}
+
+/// 防呆：任何键序列走完后，输出侧不得残留按住的修饰键。
+///
+/// 这条不变量的破坏后果极重：曾因放行路径发出 Meta 却未把它从
+/// `suppressed` 移除，释放被吞掉，Super 永久卡在按下态。实机表现是
+/// **锁屏后输密码时每个键都带 Super，数字 9 输不进去，只能硬关机**。
+///
+/// 与其逐个组合测，不如断言不变量本身——任何路径违反都会被抓到。
+#[cfg(test)]
+mod no_stuck_modifiers {
+    use super::*;
+    use crate::config::Config;
+
+    fn k(c: u16, v: i32) -> InputEvent {
+        InputEvent::new(EventType::KEY.0, c, v)
+    }
+
+    const MODS: &[KeyCode] = &[
+        KeyCode::KEY_LEFTMETA,
+        KeyCode::KEY_RIGHTMETA,
+        KeyCode::KEY_LEFTCTRL,
+        KeyCode::KEY_LEFTSHIFT,
+        KeyCode::KEY_LEFTALT,
+        KeyCode::KEY_CAPSLOCK,
+    ];
+
+    /// 跑完一串事件后，输出侧不应有任何修饰键仍处于按下态。
+    fn assert_clean(seq: &[(KeyCode, i32)], label: &str) {
+        let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
+        let mut out = vec![];
+        for (c, v) in seq {
+            out.extend(m.translate(&k(c.0, *v)));
+        }
+        // 逐键核对按下/释放配平
+        for mod_key in MODS {
+            let downs = out
+                .iter()
+                .filter(|e| e.code() == mod_key.0 && e.value() == 1)
+                .count();
+            let ups = out
+                .iter()
+                .filter(|e| e.code() == mod_key.0 && e.value() == 0)
+                .count();
+            assert_eq!(
+                downs,
+                ups,
+                "{label}: {:?} 事件不配平（{downs} 次按下 / {ups} 次释放）",
+                mod_key
+            );
+        }
+    }
+
+    #[test]
+    fn passthrough_releases_meta() {
+        // 放行路径曾漏发 Meta 释放，导致 Super 卡住
+        assert_clean(
+            &[
+                (KeyCode::KEY_LEFTCTRL, 1),
+                (KeyCode::KEY_LEFTMETA, 1),
+                (KeyCode::KEY_W, 1),
+                (KeyCode::KEY_W, 0),
+                (KeyCode::KEY_LEFTMETA, 0),
+                (KeyCode::KEY_LEFTCTRL, 0),
+            ],
+            "放行 Ctrl+Cmd+W",
+        );
+    }
+
+    #[test]
+    fn converted_combo_releases_everything() {
+        assert_clean(
+            &[
+                (KeyCode::KEY_LEFTMETA, 1),
+                (KeyCode::KEY_Q, 1),
+                (KeyCode::KEY_Q, 0),
+                (KeyCode::KEY_LEFTMETA, 0),
+            ],
+            "Cmd+Q → Alt+F4",
+        );
+    }
+
+    #[test]
+    fn ctrl_cmd_q_lockscreen_releases_everything() {
+        assert_clean(
+            &[
+                (KeyCode::KEY_LEFTCTRL, 1),
+                (KeyCode::KEY_LEFTMETA, 1),
+                (KeyCode::KEY_Q, 1),
+                (KeyCode::KEY_Q, 0),
+                (KeyCode::KEY_LEFTMETA, 0),
+                (KeyCode::KEY_LEFTCTRL, 0),
+            ],
+            "Ctrl+Cmd+Q 锁屏",
+        );
+    }
+
+    #[test]
+    fn shift_cmd_conversion_releases_everything() {
+        assert_clean(
+            &[
+                (KeyCode::KEY_LEFTSHIFT, 1),
+                (KeyCode::KEY_LEFTMETA, 1),
+                (KeyCode::KEY_Z, 1),
+                (KeyCode::KEY_Z, 0),
+                (KeyCode::KEY_LEFTMETA, 0),
+                (KeyCode::KEY_LEFTSHIFT, 0),
+            ],
+            "Shift+Cmd+Z",
         );
     }
 }
