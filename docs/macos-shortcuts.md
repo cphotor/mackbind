@@ -336,7 +336,7 @@ code  code-url-handler  codium
 |macOS|目标|GNOME 现状|处理|
 |---|---|---|---|
 |`Cmd+空格` Spotlight|活动概览|`Super+space` = 切换输入法|让位|
-|`Ctrl+Cmd+Q` 锁屏|`Super+l`|用户已自设|无冲突|
+|`Ctrl+Cmd+Q` 锁屏|`Super+l`|media-keys 的 `screensaver`（已绑定）|已实现|
 |`Cmd+Tab` 切换应用|`Super+Tab`|已绑定|无冲突|
 |`Cmd+↑/↓`|`Super+↑/↓`|已绑定|无冲突|
 |`Shift+Cmd+3/4/5` 截图|`Print` / `Shift+Print`|已绑定|无冲突|
@@ -445,6 +445,31 @@ gsettings list-recursively org.gnome.Ptyxis.Shortcuts
 故这两者改用 `Ctrl+Insert`（X11 传统复制键，终端均支持且不会被当作控制字符发送）。由 `app_cmd_map` 配置项承载，判定依据是**行为差异**而非应用名单。
 
 ---
+
+## 电源键组合（Apple 文档有，但不做）
+
+Apple 快捷键表里列了四条与电源键的组合：
+
+|组合|效果|
+|---|---|
+|`Ctrl+Shift+电源`|显示器睡眠|
+|`Ctrl+电源`|弹重启/睡眠/关机对话框|
+|`Ctrl+Cmd+电源`|**强制重启**|
+|`Ctrl+Option+Cmd+电源`|退出所有 App 后关机|
+
+**本工具一律不做（F）**，理由：
+
+1. **GNOME 无对应可绑定动作** —— 前两条在 GNOME 侧不存在；后两条
+   只能靠 `systemctl reboot` / `loginctl terminate-user` 这类命令实现
+2. **后两条是全局的一键毁掉所有工作** —— 强制重启会丢弃全部未保存
+   内容。不设防的全局热键等于定时炸弹
+3. **实际按不出来** —— 需同时按住电源键加最多四个修饰键
+
+裸电源键**不需要管**：GNOME 的 `power-button-action` 默认就是 `suspend`，
+按电源键直接睡眠，与 macOS 一致。
+
+> 注：Apple 文档给这四条标注的条件是「在没有配备触控 ID 的内建键盘上」。
+> 不同批次的同型号机器配置不同，请以自己键盘的实际行为为准。
 
 ## 附：概览（Spotlight）的实现
 
