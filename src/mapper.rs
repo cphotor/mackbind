@@ -2497,28 +2497,34 @@ mod cmd_required {
         assert_eq!(out, vec![KeyCode::KEY_A.0], "裸 A 应原样输出");
     }
 
-    /// 不含 Cmd 的规则仍须生效：`Option+Delete` → `Ctrl+Delete`
+    /// 不含 Cmd 的规则仍须生效：`Option+Delete` → `Ctrl+Backspace`
+    ///
+    /// 本机（MacBook 键盘）的「Delete」键在 evdev 里是 KEY_BACKSPACE，
+    /// 两个键码都要覆盖。
     #[test]
     fn non_cmd_rule_still_works() {
-        let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
-        m.translate(&k(KeyCode::KEY_LEFTALT.0, 1));
-        let evs = m.translate(&k(KeyCode::KEY_DELETE.0, 1));
-        let c = codes(&evs);
-        assert!(
-            c.contains(&KeyCode::KEY_LEFTCTRL.0) && c.contains(&KeyCode::KEY_DELETE.0),
-            "Option+Delete 应为 Ctrl+Delete，实际 {:?}",
-            c
-        );
-        // Alt 只能被**释放**（转换时排空 output_down），不得再按下
-        assert!(
-            !evs
-                .iter()
-                .any(|e| e.code() == KeyCode::KEY_LEFTALT.0 && e.value() == 1),
-            "Alt 不应被再次按下: {:?}",
-            evs.iter()
-                .map(|e| format!("{:?}{}", e.code(), e.value()))
-                .collect::<Vec<_>>()
-        );
+        for del_key in [KeyCode::KEY_BACKSPACE, KeyCode::KEY_DELETE] {
+            let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
+            m.translate(&k(KeyCode::KEY_LEFTALT.0, 1));
+            let evs = m.translate(&k(del_key.0, 1));
+            let c = codes(&evs);
+            assert!(
+                c.contains(&KeyCode::KEY_LEFTCTRL.0)
+                    && c.contains(&KeyCode::KEY_BACKSPACE.0),
+                "Option+{del_key:?} 应为 Ctrl+Backspace，实际 {:?}",
+                c
+            );
+            // Alt 只能被**释放**（转换时排空 output_down），不得再按下
+            assert!(
+                !evs
+                    .iter()
+                    .any(|e| e.code() == KeyCode::KEY_LEFTALT.0 && e.value() == 1),
+                "Alt 不应被再次按下: {:?}",
+                evs.iter()
+                    .map(|e| format!("{:?}{}", e.code(), e.value()))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 }
 
@@ -2625,7 +2631,9 @@ mod exec_action {
             .iter()
             .filter(|r| matches!(&r.act, CompiledAction::Exec { program, .. } if program == "gio"))
             .collect();
-        assert_eq!(trash.len(), 2, "应有两条清倒废纸篓规则");
+        // 4 条：Shift+Cmd+Delete 与 Option+Shift+Cmd+Delete，
+        // 各覆盖 KEY_BACKSPACE（本机）与 KEY_DELETE（外接键盘）
+        assert_eq!(trash.len(), 4, "应有四条清倒废纸篓规则");
         for r in trash {
             if let CompiledAction::Exec { confirm, .. } = &r.act {
                 assert!(

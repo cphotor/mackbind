@@ -274,7 +274,6 @@ fn default_rules() -> Vec<Rule> {
     push_emit(&[], "KEY_LEFTBRACE", "A", "Left", "上一文件夹 (Cmd+[)");
     push_emit(&[], "KEY_RIGHTBRACE", "A", "Right", "下一文件夹 (Cmd+])");
     // ── 删除 ──
-    push_emit(&[], "KEY_DELETE", "C", "KEY_DELETE", "移到废纸篓 (Cmd+Delete → Ctrl+Delete)");
     // ── 窗口管理 ──
     // 跨应用的全局规则，故不受终端特化影响。
     // macOS 的 Cmd+Q 是「退出应用」，Linux 侧最接近的通用绑定是
@@ -326,25 +325,6 @@ fn default_rules() -> Vec<Rule> {
             key: "KEY_F11".into(),
         },
         desc: Some("全屏 (Ctrl+Cmd+F → F11)".into()),
-    });
-
-    // ── 不含 Cmd 的组合 ──
-    //
-    // 查表对所有组合生效，不只 Cmd 组合——早期版本把查表放在
-    // `if cmd_held` 分支内，这类规则写了也永远不会被查询到。
-    //
-    // `Option+Delete` 在 macOS 上是「删除左边字词」，Linux 对应
-    // `Ctrl+Delete`。默认语义对非 Cmd 组合是原样透传，故需显式声明。
-    v.push(Rule {
-        apps: vec![],
-        keys: vec!["A-KEY_DELETE".into()],
-        // 唯一一条不含 Cmd 的规则
-        cmd: false,
-        act: Action::Emit {
-            mods: vec!["C".into()],
-            key: "KEY_DELETE".into(),
-        },
-        desc: Some("删除左边字词 (Option+Delete → Ctrl+Delete)".into()),
     });
 
     // ── 截图：对应 macOS 的 Cmd+Shift+3/4/5 ──
@@ -415,33 +395,76 @@ fn default_rules() -> Vec<Rule> {
         desc: Some("退出登录 (Shift+Cmd+Q，读 DE 现有绑定)".into()),
     });
 
-    // ── 清倒废纸篓：本质是命令，不是组合键 ──
+    // ── 删除类：macOS 的 "Delete" 键 = 其他键盘的 Backspace(⌫) ──
     //
-    // macOS 上分两个：Shift+Cmd+Delete 有确认，Option+Shift+Cmd+Delete
-    // 免确认。GNOME 侧对应 `gio trash --empty --force`。
+    // macOS 把退格键叫 Delete，把向前删除键（MacBook 上不存在）叫
+    // Forward Delete。日常说的「Cmd+Delete 移到废纸篓」按的就是 ⌫。
     //
-    // **两者都要确认。** 与 macOS 的免确认版不同——那是全局热键，
-    // 不限应用、不限焦点，误按一次就是永久删除。gio 自己带 --force
-    // 会跳过它的确认，所以这道确认必须由 exec 层保证。
-    for (keys, desc) in [
-        (vec!["S-KEY_DELETE"], "清倒废纸篓 (Shift+Cmd+Delete)"),
+    // evdev 里 ⌫ 是 `KEY_BACKSPACE`、向前删除是 `KEY_DELETE`——两者
+    // 不同键。本机（MacBook 键盘）只产生前者，外接键盘才有后者。
+    // 故每个组合都写两条规则，否则在本机上完全失效
+    //（曾因只写 KEY_DELETE 导致全部删除类规则形同虚设）。
+
+/// 需要同时覆盖的两个删除键。
+const DELETE_KEYS: &[&str] = &["KEY_BACKSPACE", "KEY_DELETE"];
+
+for key in DELETE_KEYS {
+    // Cmd+Delete → 移到废纸篓
+    //
+    // 发 `KEY_DELETE` 而非 `KEY_BACKSPACE`：GNOME 的文件管理器里
+    // 「移到回收站」绑的是 Delete（⌦），Ctrl+Delete 在 GTK 文本控件里
+    // 是「删下一个词」。虚拟键盘能发出本机不存在的键码，故可行。
+    v.push(Rule {
+        apps: vec![],
+        keys: vec![(*key).to_string()],
+        cmd: true,
+        act: Action::Emit {
+            mods: vec!["C".into()],
+            key: "KEY_DELETE".into(),
+        },
+        desc: Some(format!(
+            "移到废纸篓 (Cmd+Delete → Ctrl+Delete，key={key})"
+        )),
+    });
+
+    // Option+Delete → 删除左边字词
+    //
+    // 用 Ctrl+Backspace 而非透传 Alt+Backspace：前者是 X11/GNOME 惯例，
+    // 在编辑器、终端、地址栏里都一致生效。
+    v.push(Rule {
+        apps: vec![],
+        keys: vec![format!("A-{key}")],
+        cmd: false,
+        act: Action::Emit {
+            mods: vec!["C".into()],
+            key: "KEY_BACKSPACE".into(),
+        },
+        desc: Some(format!(
+            "删除左边字词 (Option+Delete → Ctrl+Backspace，key={key})"
+        )),
+    });
+
+    // Shift+Cmd+Delete / Option+Shift+Cmd+Delete → 清倒废纸篓
+    for (mods, desc) in [
+        (vec!["S".to_string()], "清倒废纸篓 (Shift+Cmd+Delete)"),
         (
-            vec!["A-S-KEY_DELETE"],
+            vec!["A".to_string(), "S".to_string()],
             "清倒废纸篓 (Option+Shift+Cmd+Delete)",
         ),
     ] {
         v.push(Rule {
             apps: vec![],
-            keys: keys.into_iter().map(String::from).collect(),
+            keys: vec![format!("{}-{}", mods.join("-"), key)],
             cmd: true,
             act: Action::Exec {
                 program: "gio".into(),
                 args: vec!["trash".into(), "--empty".into(), "--force".into()],
                 confirm: true,
             },
-            desc: Some(desc.into()),
+            desc: Some(format!("{desc}，key={key}")),
         });
     }
+}
 
     // ── 会漏发 SIGINT 的终端：复制键改走 Ctrl+Insert ──
     // 必须放在终端特化**之前**——查找取首个命中者，若在其后，

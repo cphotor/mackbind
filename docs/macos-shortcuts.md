@@ -136,7 +136,7 @@ macOS 的 `Cmd+Tab`（切换应用）、`Cmd+H`（隐藏）、`Cmd+↑/↓`（�
 |`Cmd+I` 显示简介|`Ctrl+I`|A|
 |`Cmd+[` 上一个文件夹|`Alt+←`|D|
 |`Cmd+]` 下一个文件夹|`Alt+→`|D|
-|`Cmd+Delete` 移到废纸篓|`Ctrl+Delete`|D|
+|`Cmd+Delete` 移到废纸篓|`Ctrl+Delete`|D（已实现，见下）|
 |`Shift+Cmd+Delete` 清倒废纸篓|`gio trash --empty --force`|E（已实现，强制确认）|
 |`Option+Shift+Cmd+Delete` 不确认清倒废纸篓|`gio trash --empty --force`|E（已实现，仍强制确认）|
 |`Cmd+1/2/3/4` 图标/列表/分栏/画廊视图|Nautilus 内部|应用处理|
@@ -512,3 +512,32 @@ macOS 则是 `Cmd+Shift+3` 直接截全屏、`Cmd+Shift+4/5` 进选择模式。
 `screenshot` 与 `screenshot-window` 实测都表现为直接截全屏，
 无法据此把选区与窗口区分开。二者统一走截图界面，
 选区/窗口仍能在界面里选到。
+
+### 「Delete」键的键码陷阱（本机踩过）
+
+macOS 把退格键（⌫）叫 **Delete**，向前删除键（MacBook 上不存在）才叫
+Forward Delete。日常说的「Cmd+Delete 移到废纸篓」按的就是 ⌫。
+
+但 evdev 里这两个是不同的键码：
+
+|macOS 叫法|物理键|evdev 键码|本机是否产生|
+|---|---|---|---|
+|Delete|⌫ 退格|`KEY_BACKSPACE`|✓ MacBook 键盘只有它|
+|Forward Delete|⌦ 向前删除|`KEY_DELETE`|✗ 本机无此键|
+
+早期规则全部按 `KEY_DELETE` 写，导致**所有删除类规则在本机形同虚设**
+——`Cmd+Delete`、`Option+Delete`、`Shift+Cmd+Delete` 全部落空，
+且因为落到了默认语义，看起来只是「变成了 Ctrl+退格」，不易察觉。
+
+现对两个键码都写规则：本机走 `KEY_BACKSPACE`，外接键盘走 `KEY_DELETE`。
+
+|组合|映射|本机按键|
+|---|---|---|
+|`Cmd+Delete`|移到废纸篓 → `Ctrl+Delete`|Cmd+⌫|
+|`Option+Delete`|删除左边字词 → `Ctrl+Backspace`|Option+⌫|
+|`Shift+Cmd+Delete`|清倒废纸篓 → `gio trash`|Shift+Cmd+⌫|
+|`Option+Shift+Cmd+Delete`|同上|Option+Shift+Cmd+⌫|
+
+> 注：`Option+Delete` 映射到 **`Ctrl+Backspace`** 而非 `Ctrl+Delete`。
+> `Ctrl+Delete` 在 GTK 文本控件里是「删下一个词」，与「删除左边字词」
+> 方向相反。
