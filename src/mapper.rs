@@ -331,8 +331,10 @@ fn de_feature_ready(dt: &DesktopType, feature: &str) -> bool {
 enum Default {
     /// `Cmd+X` → `Ctrl+X`
     Convert(Vec<KeyCode>, KeyCode),
-    /// 无从转换，原样放行
+    /// Cmd 组合但无从转换，原样放行（须补发被抑制的 Meta）
     Passthrough,
+    /// 非 Cmd 组合且表里无规则，原样透传（无 Meta 可补）
+    PassthroughPlain,
 }
 
 /// 默认语义：`Cmd+X` → `Ctrl+X`。
@@ -704,7 +706,7 @@ impl Mapper {
             .iter()
             .any(|m| *m == KeyCode::KEY_LEFTMETA || *m == KeyCode::KEY_RIGHTMETA);
 
-        if cmd_held {
+        {
             // 当前除 Cmd 外还按住的修饰键。
             //
             // 两份，用途不同，**不可混用**：
@@ -735,15 +737,18 @@ impl Mapper {
             cur_mods.sort();
             cur_mods.dedup();
 
-            // 查表：按声明顺序线性扫描，首个命中者生效。
+            // 查表：**对所有组合**生效，不只 Cmd 组合。
             //
-            // 「声明顺序即优先级」是这张表的核心性质——原先散落在
-            // `app_cmd_map > cmd_map > 终端特化` 三处的优先级关系，
-            // 现在只由规则在表中的位置决定。
-            // 查表优先；表里没有才轮到默认语义。
+            // 早期版本把查表放在 `if cmd_held` 分支内，于是不含 Cmd 的
+            // 组合（如 macOS 的 `Option+Delete`）永远查不到规则——
+            // 表里写了也没用。现已提到分支外。
+            //
+            // 查表优先；表里没有才轮到默认语义（非 Cmd 组合则原样透传）。
             let decision = match self.lookup(code, &cur_mods) {
                 Some((m, k)) => Default::Convert(m, k),
-                None => default_semantics(&cur_mods, code),
+                None if cmd_held => default_semantics(&cur_mods, code),
+                // 非 Cmd 组合且表里没有：原样透传
+                None => Default::PassthroughPlain,
             };
 
             // 放行：把用户按的原样交给应用。
@@ -751,16 +756,32 @@ impl Mapper {
             // Cmd 此前被抑制（未输出），故这里需显式补上——
             // 它从未进入 output_down，不在此处补就会丢失，
             // 发出一个缺 Cmd 的残缺组合。
-            if let Default::Passthrough = decision {
-                let mut out = Vec::new();
-                for h in self.output_down.drain(..).collect::<Vec<_>>() {
-                    out.extend(self.emit_key(h, 0));
+            let converted = match decision {
+                Default::PassthroughPlain => {
+                    // 非 Cmd 组合且表里无规则：原样透传。
+                    //
+                    // 修饰键（Shift/Alt/Ctrl）按下时已透传过，此处**不得**
+                    // 重新按下或松开它们——否则每按一个键都会产生
+                    // 「松开 Shift 再按下 Shift」的抖动，
+                    // fcitx5 之类的输入法会因此漏字母。
+                    self.output_down.push(code);
+                    self.pressed.insert(physical, code);
+                    if self.verbose {
+                        eprintln!("[mapper] {:?}+{:?} 表中无规则 → 透传", cur_mods, code);
+                    }
+                    return self.emit_key(code, 1);
                 }
-                for m in &held_mods {
-                    out.extend(self.emit_key(*m, 1));
-                    self.output_down.push(*m);
-                }
-                // Cmd 以真实 Super 身份发出。
+                Default::Passthrough => {
+                    // Cmd 组合但无从转换：把用户按的原样交给应用。
+                    let mut out = Vec::new();
+                    for h in self.output_down.drain(..).collect::<Vec<_>>() {
+                        out.extend(self.emit_key(h, 0));
+                    }
+                    for m in &held_mods {
+                        out.extend(self.emit_key(*m, 1));
+                        self.output_down.push(*m);
+                    }
+                    // Cmd 以真实 Super 身份发出。
                 //
                 // 必须同时把它从 `suppressed` 移除：Meta 按下时已被抑制，
                 // 从未进入 output_down。若不移除，释放路径会走
@@ -781,12 +802,11 @@ impl Mapper {
                         code, cur_mods
                     );
                 }
-                return out;
-            }
-
-            let Default::Convert(out_mods, out_key) = decision else {
-                unreachable!("Passthrough 已在上面返回")
+                    return out;
+                }
+                Default::Convert(out_mods, out_key) => (out_mods, out_key),
             };
+            let (out_mods, out_key) = converted;
 
             if self.verbose {
                 eprintln!(
@@ -815,13 +835,8 @@ impl Mapper {
             self.output_down.push(out_key);
             self.injected_mods.extend(out_mods.iter().copied());
             self.pressed.insert(physical, out_key);
-            return out;
+            out
         }
-
-        // 表外：原样透传
-        self.output_down.push(code);
-        self.pressed.insert(physical, code);
-        self.emit_key(code, 1)
     }
 
     /// 释放处理。按下时做了翻译，这里必须还原。

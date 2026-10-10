@@ -296,6 +296,23 @@ fn default_rules() -> Vec<Rule> {
         desc: Some("全屏 (Ctrl+Cmd+F → F11)".into()),
     });
 
+    // ── 不含 Cmd 的组合 ──
+    //
+    // 查表对所有组合生效，不只 Cmd 组合——早期版本把查表放在
+    // `if cmd_held` 分支内，这类规则写了也永远不会被查询到。
+    //
+    // `Option+Delete` 在 macOS 上是「删除左边字词」，Linux 对应
+    // `Ctrl+Delete`。默认语义对非 Cmd 组合是原样透传，故需显式声明。
+    v.push(Rule {
+        apps: vec![],
+        keys: vec!["A-KEY_DELETE".into()],
+        act: Action::Emit {
+            mods: vec!["C".into()],
+            key: "KEY_DELETE".into(),
+        },
+        desc: Some("删除左边字词 (Option+Delete → Ctrl+Delete)".into()),
+    });
+
     // ── 会漏发 SIGINT 的终端：复制键改走 Ctrl+Insert ──
     // 必须放在终端特化**之前**——查找取首个命中者，若在其后，
     // 通用终端规则会先命中，本条永不生效。

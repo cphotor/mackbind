@@ -196,7 +196,7 @@ macOS 的 `Cmd+Tab`（切换应用）、`Cmd+H`（隐藏）、`Cmd+↑/↓`（�
 
 |macOS|Linux 目标|类|
 |---|---|---|
-|`Option+Delete` 删除左边字词|`Ctrl+Delete`|D|
+|`Option+Delete` 删除左边字词|`Ctrl+Delete`|A（已实现）|
 |`Ctrl+H` 删除左边字符|`Backspace`|A|
 |`Ctrl+D` 删除右边字符|`Ctrl+Delete`|A|
 |`Fn+Delete` 向前删除|`Ctrl+Delete`|D|
