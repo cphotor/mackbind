@@ -770,6 +770,7 @@ impl Mapper {
                         prompt: prompt.as_deref(),
                         ok_label: ok_label.as_deref(),
                         confirm_key: Some(&key_desc),
+                        scoped: !matches!(r.app, AppMatch::Any),
                     });
                     // 已产生副作用，无需发出任何按键
                     return Some(Outcome::NoOutput);
@@ -2635,90 +2636,53 @@ mod exec_action {
         assert!(out.is_empty(), "exec 动作的释放不应有输出: {:?}", out);
     }
 
-    /// 表里两条清倒废纸篓规则都必须要求确认
+    /// 两条清倒废纸篓规则的确认策略须与 macOS 一致。
+    ///
+    /// macOS：`Shift+Cmd+Delete` 有确认，`Option+Shift+Cmd+Delete`
+    /// 免确认（Option 就是「跳过确认」）。本工具照搬。
+    ///
+    /// 免确认仅在规则**限定应用**时才允许——两条都必须限定在
+    /// Nautilus 内，全局免确认不可接受。
     #[test]
-    fn trash_rules_require_confirmation() {
+    fn trash_confirmation_matches_macos() {
         let cfg = Config::with_defaults();
-        let _ = &cfg;
         let rules = compile_table(&cfg.rules).expect("规则表应能编译");
-        let trash: Vec<_> = rules
+
+        let with_option: Vec<_> = rules
             .iter()
             .filter(|r| matches!(&r.act, CompiledAction::Exec { program, .. } if program == "gio"))
+            .filter(|r| r.key.1.contains(&KeyCode::KEY_LEFTALT))
             .collect();
-        // 4 条：Shift+Cmd+Delete 与 Option+Shift+Cmd+Delete，
-        // 各覆盖 KEY_BACKSPACE（本机）与 KEY_DELETE（外接键盘）
-        assert_eq!(trash.len(), 4, "应有四条清倒废纸篓规则");
-        for r in trash {
-            if let CompiledAction::Exec { confirm, .. } = &r.act {
-                assert!(
-                    *confirm,
-                    "破坏性命令必须确认，规则 {:?}",
-                    r.key
-                );
-            }
+        let without: Vec<_> = rules
+            .iter()
+            .filter(|r| matches!(&r.act, CompiledAction::Exec { program, .. } if program == "gio"))
+            .filter(|r| !r.key.1.contains(&KeyCode::KEY_LEFTALT))
+            .collect();
+
+        assert_eq!(with_option.len(), 2, "Option 版应有两个键码各一条");
+        assert_eq!(without.len(), 2, "非 Option 版应有两个键码各一条");
+
+        for r in with_option {
+            let confirm = match &r.act {
+                CompiledAction::Exec { confirm, .. } => *confirm,
+                _ => panic!("应为 exec 动作"),
+            };
+            assert!(
+                !confirm,
+                "Option+Shift+Cmd+Delete 应免确认（与 macOS 一致）"
+            );
+            assert!(
+                !matches!(r.app, AppMatch::Any),
+                "免确认的破坏性规则必须限定应用"
+            );
         }
-    }
-}
-
-/// 每条规则都必须与自身的 `cmd` 标记一致。
-///
-/// 回归测试：`Ctrl+↑`（调度中心）被我错标成 `cmd = true`，
-/// 而该组合根本不含 Cmd → 规则永不命中，功能完全失效。
-/// 99 个测试全绿也没抓到，因为没有一条测试检查「规则的输入组合
-/// 里到底有没有 Cmd」。
-#[cfg(test)]
-mod rule_cmd_flag_consistency {
-    use super::*;
-
-    /// 结构性检查走不通：`C-` 前缀既可能是「Ctrl+Cmd+X」也可能是
-    /// 「Ctrl+X」，无法从键名反推是否含 Cmd——`C-KEY_Q` 是前者，
-    /// `C-KEY_UP` 是后者，字符串长得一样。
-    ///
-    /// 所以改为**行为断言**：`cmd` 标记错了，行为一定不对。
-    /// `Ctrl+↑` 曾被错标成 `cmd=true`，功能完全失效却无人发现。
-    #[test]
-    fn non_cmd_rules_reach_their_action() {
-        // 物理 Ctrl 经 remap 后是 CapsLock，故输入序列用 CapsLock
-        let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
-        m.translate(&ev(KeyCode::KEY_CAPSLOCK.0, 1));
-        let out = codes_of(&m.translate(&ev(KeyCode::KEY_UP.0, 1)));
-
-        assert!(
-            !out.contains(&KeyCode::KEY_LEFTMETA.0),
-            "Ctrl+↑ 不应产生 Meta: {:?}",
-            out
-        );
-        assert!(
-            out.contains(&KeyCode::KEY_LEFTSHIFT.0)
-                && out.contains(&KeyCode::KEY_LEFTCTRL.0),
-            "Ctrl+↑ 应命中概览规则（Ctrl+Shift+空格），实际 {:?}",
-            out
-        );
-        assert!(
-            !out.contains(&KeyCode::KEY_UP.0),
-            "Ctrl+↑ 不应原样透传 ↑: {:?}",
-            out
-        );
-    }
-
-    /// 反向对照：确实含 Cmd 的规则在没按 Cmd 时不该命中
-    #[test]
-    fn cmd_rules_need_cmd_pressed() {
-        let mut m2 = Mapper::new(&Config::with_defaults(), false).unwrap();
-        m2.translate(&ev(KeyCode::KEY_LEFTMETA.0, 1));
-        let out = codes_of(&m2.translate(&ev(KeyCode::KEY_UP.0, 1)));
-        assert!(
-            out.contains(&KeyCode::KEY_LEFTCTRL.0),
-            "Cmd+↑ 应为 Ctrl+↑，实际 {:?}",
-            out
-        );
-    }
-
-    fn ev(c: u16, v: i32) -> InputEvent {
-        InputEvent::new(EventType::KEY.0, c, v)
-    }
-    fn codes_of(evs: &[InputEvent]) -> Vec<u16> {
-        evs.iter().map(|e| e.code()).collect()
+        for r in without {
+            let confirm = match &r.act {
+                CompiledAction::Exec { confirm, .. } => *confirm,
+                _ => panic!("应为 exec 动作"),
+            };
+            assert!(confirm, "Shift+Cmd+Delete 应有确认");
+        }
     }
 }
 

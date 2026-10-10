@@ -156,6 +156,11 @@ pub struct ExecRequest<'a> {
     pub ok_label: Option<&'a str>,
     /// 用于「再按一次同一组合」的描述
     pub confirm_key: Option<&'a str>,
+    /// 规则是否限定了应用。
+    ///
+    /// 破坏性命令**免确认**只在限定应用时允许：全局绑定误按一次就是
+    /// 永久删除，而 macOS 对应的操作本就只在自己的文件管理器里有效。
+    pub scoped: bool,
 }
 
 pub fn run(req: ExecRequest<'_>) {
@@ -167,12 +172,13 @@ pub fn run(req: ExecRequest<'_>) {
         prompt: custom_prompt,
         ok_label,
         confirm_key,
+        scoped,
     } = req;
     let risk = classify(program, args);
     let label = label.unwrap_or(program);
 
-    if risk == Risk::Destructive && !confirm {
-        eprintln!("[exec] 破坏性命令须显式确认，已拒绝：{label}");
+    if risk == Risk::Destructive && !confirm && !scoped {
+        eprintln!("[exec] 全局破坏性命令须显式确认，已拒绝：{label}");
         return;
     }
 

@@ -138,7 +138,7 @@ macOS 的 `Cmd+Tab`（切换应用）、`Cmd+H`（隐藏）、`Cmd+↑/↓`（�
 |`Cmd+]` 下一个文件夹|`Alt+→`|D|
 |`Cmd+Delete` 移到废纸篓|`Delete`（不带 Ctrl）|D（已实现，见下）|
 |`Shift+Cmd+Delete` 清倒废纸篓|`gio trash --empty --force`|E（已实现，强制确认）|
-|`Option+Shift+Cmd+Delete` 不确认清倒废纸篓|`gio trash --empty --force`|E（已实现，仍强制确认）|
+|`Option+Shift+Cmd+Delete` 不确认清倒废纸篓|`gio trash --empty --force`|E（已实现，免确认）|
 |`Cmd+1/2/3/4` 图标/列表/分栏/画廊视图|Nautilus 内部|应用处理|
 |`Shift+Cmd+H` 个人文件夹|Nautilus 内部|应用处理|
 |`Option+Cmd+L` 下载文件夹|Nautilus 内部|应用处理|
@@ -393,11 +393,14 @@ cycle-panels                ['<Control><Alt>Escape']
 ### 清倒废纸篓：与 macOS 的差异（有意为之）
 
 macOS 上 `Shift+Cmd+Delete` 清倒废纸篓（有确认），
-`Option+Shift+Cmd+Delete` 免确认。两者都已实现，但**本工具强制要求确认**。
+`Option+Shift+Cmd+Delete` 免确认（Option 即「跳过确认」）。
+本工具**照搬这一差异**：前者弹确认框，后者直接执行。
 
-原因：`gio trash --empty --force` 会跳过 gio 自己的确认（`--force`），
-而本工具的映射是**全局**的——不限应用、不限焦点窗口，
-不设防的话误按一次就是永久删除，没有回收站可捞。
+免确认之所以可行，是因为规则**限定在 Nautilus 内**。
+全局免确认绝不可接受：`gio trash --empty --force` 会跳过 gio 自己的
+确认（`--force`），而全局绑定不限应用、不限焦点窗口，
+误按一次就是永久删除，没有回收站可捞。
+exec 层据此加了守卫：破坏性命令免确认时，规则必须限定应用。
 
 **限定在 Nautilus 内**（macOS 上这两个是 Finder 的菜单项，桌面也归
 Finder 管，并非系统级快捷键）。全局绑定有两个实际风险：终端恰恰是

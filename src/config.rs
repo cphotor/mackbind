@@ -460,11 +460,18 @@ for key in DELETE_KEYS {
     //
     // 全局绑定有两个实际风险：终端恰恰是删除操作最容易出事的场景，
     // 而写密码时误按会直接弹确认框。限定后误按在那些地方毫无反应。
-    for (mods, desc) in [
-        (vec!["S".to_string()], "清倒废纸篓 (Shift+Cmd+Delete)"),
+    // 两个键在 macOS 上语义不同，本工具照搬：
+    //   Shift+Cmd+Delete        清倒废纸篓，**有确认**
+    //   Option+Shift+Cmd+Delete 清倒废纸篓，**免确认**（Option 即跳过确认）
+    //
+    // 免确认之所以敢做，是因为规则已限定在 Nautilus 内——
+    // 全局绑定时绝不能免确认（误按即永久删除），限定后风险可控。
+    for (mods, desc, confirm) in [
+        (vec!["S".to_string()], "清倒废纸篓 (Shift+Cmd+Delete)", true),
         (
             vec!["A".to_string(), "S".to_string()],
-            "清倒废纸篓 (Option+Shift+Cmd+Delete)",
+            "清倒废纸篓 (Option+Shift+Cmd+Delete，免确认)",
+            false,
         ),
     ] {
         v.push(Rule {
@@ -474,7 +481,7 @@ for key in DELETE_KEYS {
             act: Action::Exec {
                 program: "gio".into(),
                 args: vec!["trash".into(), "--empty".into(), "--force".into()],
-                confirm: true,
+                confirm,
                 prompt: Some("确定要永久抹掉回收站中的项目吗？".into()),
                 ok_label: Some("清倒回收站".into()),
             },
