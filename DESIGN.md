@@ -305,7 +305,15 @@ mackbind 走第二条路，与 Toshy 相同的技术栈，但逻辑远为简单�
 
 **终端排除只需窗口类型。** 这是唯一需要应用上下文的地方，且只需判断「是不是终端」，不需要「绑定了哪些键」。映射目标是静态表决定的，应用只需要收到正确的 `Ctrl+X`，会自行正确解释。
 
-GNOME Wayland 下需 Shell 扩展提供焦点窗口信息。本机已安装 `focused-window-dbus@flexagoon.com`，但实测其 bus name 当前返回 `ServiceUnknown`，**需在实现阶段确认可用性**。若不可用，降级方案：读取 `GNOME_APPLICATION`/`XDG_ACTIVATION_TOKEN` 等替代来源，或接受无应用区分。
+GNOME Wayland 下需 Shell 扩展提供焦点窗口信息。本机已安装 `focused-window-dbus@flexagoon.com`（version 11），**实测可用**，接口为：
+
+```text
+dest:   org.gnome.Shell
+object: /org/gnome/shell/extensions/FocusedWindow
+method: org.gnome.shell.extensions.FocusedWindow.Get
+```
+
+该扩展由 GNOME Shell 进程直接导出对象，**不经独立的 bus name 激活**，因此 `--dest` 必须是 `org.gnome.Shell` 本身。若误用 `org.gnome.Shell.Extensions.Dbus` 会得到 `ServiceUnknown: The name is not activatable` —— 这不表示扩展未启用，而是地址写错了。判据：向 `org.gnome.Shell` 查询时能正常返回 JSON，而扩展目录下的 `metadata.json` 存在且 `enabled-extensions` 含该 uuid。
 
 ## 实现选型
 

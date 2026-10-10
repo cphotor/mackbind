@@ -12,7 +12,8 @@
 //! |`xdotool` / `wmctrl`|Wayland 下不可用|
 //!
 //! 因此需要 GNOME Shell 扩展导出焦点窗口信息。本模块使用
-//! `focused-window-dbus@flexagoon.com`，其 D-Bus 接口为：
+//! `focused-window-dbus@flexagoon.com`（本机实测 version 11 可用），
+//! 其 D-Bus 接口为：
 //!
 //! ```text
 //! dest:   org.gnome.Shell
@@ -21,6 +22,10 @@
 //! ```
 //!
 //! 返回 JSON，其中 `wm_class` 即应用标识。
+//!
+//! 注意 `dest` 是 `org.gnome.Shell` 本身：扩展由 GNOME Shell 进程直接
+//! 导出对象，不占用独立的 bus name。用 `org.gnome.Shell.Extensions.Dbus`
+//! 查询会得到 `ServiceUnknown`，那是地址写错，不代表扩展未启用。
 //!
 //! # 降级行为
 //!

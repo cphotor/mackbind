@@ -63,6 +63,16 @@ gnome-extensions install focused-window-dbus@flexagoon.com
 
 扩展缺失时相关功能退化为默认行为（不视为错误），其余映射照常工作。
 
+验证扩展是否真的可用：
+
+```bash
+gdbus call --session --dest org.gnome.Shell \
+  --object-path /org/gnome/shell/extensions/FocusedWindow \
+  --method org.gnome.shell.extensions.FocusedWindow.Get
+```
+
+应返回含 `wm_class` 的 JSON。注意 `--dest` 必须是 `org.gnome.Shell`：该扩展由 Shell 进程直接导出对象，不占独立 bus name，写成 `org.gnome.Shell.Extensions.Dbus` 会得到 `ServiceUnknown`，那是地址写错、**不是**扩展没启用。
+
 ### 输入法漏字母（非本工具缺陷）
 
 若使用触控板且开启了「轻触即点击」，打字时手掌误触会被识别为鼠标点击，导致该位置的按键丢失，输入法无法合成拼音音节（表现为只输出英文字母）。
