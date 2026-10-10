@@ -94,12 +94,12 @@ macOS 的 `Cmd+Tab`（切换应用）、`Cmd+H`（隐藏）、`Cmd+↑/↓`（�
 |`Cmd+S` 存储|`Ctrl+S`|A|
 |`Cmd+T` 新标签页|`Ctrl+T`|A|
 |`Cmd+W` 关闭窗口|`Ctrl+W`|A|
-|`Option+Cmd+W` 关闭 App 全部窗口|待实现|E|
+|`Option+Cmd+W` 关闭 App 全部窗口|`Ctrl+Alt+W`|应用处理|
 |`Cmd+H` 隐藏窗口|`Super+h`|B（暂缓）|
 |`Option+Cmd+H` 隐藏其他 App|无|F|
 |`Cmd+M` 最小化|`Super+Down`|B（暂缓）|
 |`Option+Cmd+M` 最小化全部窗口|无|F|
-|`Option+Cmd+Esc` 强制退出|D-Bus 近似|E|
+|`Option+Cmd+Esc` 强制退出|`Ctrl+Alt+Esc`|A|
 |`Cmd+空格` 聚焦/Spotlight|活动概览；**GNOME 原 `Super+space` 需让位**|E|
 |`Option+Cmd+空格` 访达内聚焦|无全局对应|F|
 |`Ctrl+Cmd+空格` 字符检视器|无|F|
@@ -188,8 +188,8 @@ macOS 的 `Cmd+Tab`（切换应用）、`Cmd+H`（隐藏）、`Cmd+↑/↓`（�
 |`Shift+Cmd+↑/↓` 选中到文稿首/末|`Ctrl+Shift+↑/↓`|A|
 |`Shift+↑/↓` 扩展选择到上/下一行|`Ctrl+Shift+↑/↓`|D|
 |`Shift+←/→` 扩展一个字符|`Ctrl+Shift+←/→`|D|
-|`Option+Shift+↑/↓` 扩展到段首/段尾|`Alt+Shift+↑/↓`|D|
-|`Option+Shift+←/→` 扩展到词首/词尾|`Alt+Shift+←/→`|D|
+|`Option+Shift+↑/↓` 扩展到段首/段尾|`Alt+Shift+↑/↓`|A（默认语义已覆盖）|
+|`Option+Shift+←/→` 扩展到词首/词尾|`Alt+Shift+←/→`|A（默认语义已覆盖）|
 |`Fn+↑/↓/←/→` PageUp/PageDown/Home/End|`Ctrl+↑/↓`（X11 惯例）|D|
 
 ### 删除
@@ -251,6 +251,27 @@ Ctrl+L 居中      Ctrl+H 删左字符  Ctrl+D 删右字符
 
 Safari、日历、音乐、邮件等各有自己的快捷键，**不纳入全局映射**。多数已在 Linux 上保持一致（如 `Cmd+C` 复制）。
 
+### 「应用处理」类的判定：`Option+Cmd+W`
+
+Apple 官方文档确有此键——「关闭最前方的窗口。要关闭 App 的所有窗口，
+请按下 Option-Command-W」。但它**由应用自行实现**，并非系统级：
+
+|应用|`Option+Cmd+W`|
+|---|---|
+|访达|有（关闭该窗口全部）|
+|Chrome|**无**（实测按了没反应）|
+
+因此归类为「应用处理」，标 F 或标 E 都不准确：
+
+- 标 **F**（概念不存在）→ 错，macOS 上确实存在
+- 标 **E**（本工具实现）→ 错，GNOME 无对应动作，且不该由 mackbind 代劳
+
+Linux 侧由默认语义给出 `Ctrl+Alt+W`，能否生效取决于应用。
+
+> **教训**：「在某个应用里实测无反应」≠「该快捷键不存在」。
+> 应用可能只是没实现它。换应用复测、或查官方文档后再下结论。
+> 这与「找错地方导致误判不存在」是同一类错误。
+
 ---
 
 ## 应用分类清单
@@ -296,6 +317,28 @@ code  code-url-handler  codium
 |`Cmd+↑/↓`|`Super+↑/↓`|已绑定|无冲突|
 |`Shift+Cmd+3/4/5` 截图|`Print` / `Shift+Print`|已绑定|无冲突|
 |`Shift+Cmd+Q` 退出登录|`Super+Shift+Q`|需确认|可能需新增|
+
+### GNOME 抢占 `Ctrl+Alt` 系列（重要）
+
+默认语义把 `Cmd` 变 `Ctrl`，于是所有 `Option+Cmd+X` 都落到 `Ctrl+Alt+X`。
+而 GNOME 把 `Ctrl+Alt` 系列绑给了**工作区切换**——这些在桌面环境层
+就被拦截，**应用根本收不到**：
+
+```
+switch-to-workspace-up      ['<Control><Alt>Up']
+switch-to-workspace-down    ['<Control><Alt>Down']
+switch-to-workspace-left    ['<Control><Alt>Left']
+switch-to-workspace-right   ['<Control><Alt>Right']
+switch-panels               ['<Control><Alt>Tab']
+cycle-panels                ['<Control><Alt>Escape']
+```
+
+影响：任何 `Option+Cmd+方向键/Tab/Esc` 组合都无法透传给应用。
+这不是 mackbind 的缺陷，是目标平台的既有绑定。遇到这类组合时，
+**必须查 DE 是否已占用**，不能只看应用认不认。
+
+（`Ctrl+Alt+W` 不在此列——`W` 未被占用，能传给应用。但 Chrome 也不认它，
+且 macOS 上该组合本就无行为，故标 F。）
 
 ---
 
