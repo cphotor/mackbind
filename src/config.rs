@@ -411,19 +411,21 @@ const DELETE_KEYS: &[&str] = &["KEY_BACKSPACE", "KEY_DELETE"];
 for key in DELETE_KEYS {
     // Cmd+Delete → 移到废纸篓
     //
-    // 发 `KEY_DELETE` 而非 `KEY_BACKSPACE`：GNOME 的文件管理器里
-    // 「移到回收站」绑的是 Delete（⌦），Ctrl+Delete 在 GTK 文本控件里
-    // 是「删下一个词」。虚拟键盘能发出本机不存在的键码，故可行。
+    // 发**裸 Delete**（不带 Ctrl）：GNOME 文件管理器把「移到回收站」
+    // 绑在 Delete 键上；Ctrl+Delete 在 GTK 文本控件里是「删下一个词」，
+    // 在文件管理器里也不是回收站。此前误加 Ctrl 导致完全不生效。
+    //
+    // 虚拟键盘能发出本机不存在的键码（MacBook 无 ⌦ 键），故可行。
     v.push(Rule {
         apps: vec![],
         keys: vec![(*key).to_string()],
         cmd: true,
         act: Action::Emit {
-            mods: vec!["C".into()],
+            mods: vec![],
             key: "KEY_DELETE".into(),
         },
         desc: Some(format!(
-            "移到废纸篓 (Cmd+Delete → Ctrl+Delete，key={key})"
+            "移到废纸篓 (Cmd+Delete → Delete，不带 Ctrl；key={key})"
         )),
     });
 

@@ -136,7 +136,7 @@ macOS 的 `Cmd+Tab`（切换应用）、`Cmd+H`（隐藏）、`Cmd+↑/↓`（�
 |`Cmd+I` 显示简介|`Ctrl+I`|A|
 |`Cmd+[` 上一个文件夹|`Alt+←`|D|
 |`Cmd+]` 下一个文件夹|`Alt+→`|D|
-|`Cmd+Delete` 移到废纸篓|`Ctrl+Delete`|D（已实现，见下）|
+|`Cmd+Delete` 移到废纸篓|`Delete`（不带 Ctrl）|D（已实现，见下）|
 |`Shift+Cmd+Delete` 清倒废纸篓|`gio trash --empty --force`|E（已实现，强制确认）|
 |`Option+Shift+Cmd+Delete` 不确认清倒废纸篓|`gio trash --empty --force`|E（已实现，仍强制确认）|
 |`Cmd+1/2/3/4` 图标/列表/分栏/画廊视图|Nautilus 内部|应用处理|
@@ -399,8 +399,11 @@ macOS 上 `Shift+Cmd+Delete` 清倒废纸篓（有确认），
 而本工具的映射是**全局**的——不限应用、不限焦点窗口，
 不设防的话误按一次就是永久删除，没有回收站可捞。
 
-确认方式：发出 GNOME 通知 + 在日志打印命令，`y` 键确认，
-20 秒超时自动放弃。无交互终端（如 systemd 服务）时**直接放弃执行**。
+确认方式：**zenity 模态确认框**，必须点「执行」才生效。
+
+早期版本用桌面通知，通知被静音或错过时功能等同于没有——
+用户按了键毫无反馈（实测踩过）。弹不出对话框时退回
+「再按一次同一组合」；再不行则放弃执行。
 
 规则表里写 `confirm = false` 也无法绕过——破坏性命令的确认
 由 `src/exec.rs` 强制保证。

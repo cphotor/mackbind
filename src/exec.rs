@@ -23,6 +23,9 @@
 
 use std::process::{Command, Stdio};
 
+/// 模态确认框的等待上限（秒）。超时按取消处理。
+const DIALOG_TIMEOUT_SECS: u64 = 60;
+
 /// 破坏性命令的确认超时（秒）。
 ///
 /// 超时即放弃执行——宁可不做，也不能在用户没注意时删掉东西。
@@ -159,9 +162,30 @@ pub fn run(
     let needs_confirm = confirm || risk == Risk::Destructive;
 
     if needs_confirm {
-        let prompt = format!("即将执行「{label}」：{} {}（不可撤销）", program, args.join(" "));
-        let key = confirm_key.unwrap_or("(同一组合)");
+        let prompt = format!(
+            "即将执行「{}」：{} {}\n\n此操作不可撤销。",
+            label,
+            program,
+            args.join(" ")
+        );
 
+        // 优先用模态对话框：用户必须点「执行」，无法被忽略或错过。
+        // 早期版本用桌面通知，通知被静音或错过时功能等同于没有——
+        // 用户按了键毫无反馈。
+        match confirm_dialog(&prompt) {
+            Some(true) => {
+                spawn(program, args, label);
+                return;
+            }
+            Some(false) => {
+                eprintln!("[exec] 用户取消，不执行：{label}");
+                return;
+            }
+            // 拿不到对话框（无 zenity / 无显示）→ 退回二次按组合
+            None => {}
+        }
+
+        let key = confirm_key.unwrap_or("(同一组合)");
         if let Some(done) = check_second_press(key) {
             if done {
                 spawn(program, args, label);
@@ -171,7 +195,6 @@ pub fn run(
             return;
         }
 
-        let _ = notify("确认破坏性操作", &prompt);
         if !wait_for_confirmation(&prompt, CONFIRM_TIMEOUT_SECS) {
             eprintln!("[exec] 未确认，不执行：{label}");
             return;
@@ -179,6 +202,40 @@ pub fn run(
     }
 
     spawn(program, args, label);
+}
+
+/// 弹出模态确认框。返回 `None` 表示无法弹（无 zenity / 无显示）。
+///
+/// 在独立线程里等待，**不阻塞按键处理循环**——阻塞会导致整块键盘无响应。
+fn confirm_dialog(prompt: &str) -> Option<bool> {
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel();
+    let text = prompt.to_string();
+
+    std::thread::spawn(move || {
+        let out = Command::new("zenity")
+            .args([
+                "--question",
+                "--title=确认破坏性操作",
+                "--width=420",
+                "--text",
+                &text,
+            ])
+            .output();
+        let ok = match out {
+            Ok(o) => o.status.success(),
+            Err(_) => {
+                let _ = tx.send(None);
+                return;
+            }
+        };
+        let _ = tx.send(Some(ok));
+    });
+
+    // 等用户点；超时按「取消」处理
+    rx.recv_timeout(std::time::Duration::from_secs(DIALOG_TIMEOUT_SECS))
+        .ok()
+        .flatten()
 }
 
 /// 已挂起待二次确认的组合。
