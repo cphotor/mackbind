@@ -349,17 +349,32 @@ fn default_rules() -> Vec<Rule> {
 
     // ── 截图：对应 macOS 的 Cmd+Shift+3/4/5 ──
     //
-    // 读 GNOME 现有绑定后发出同样的键，不改写用户配置：
-    //   Cmd+Shift+3 → show-screenshot-ui  （截图界面，本机 Print）
-    //   Cmd+Shift+4 → screenshot          （区域截图，本机 Shift+Print）
-    //   Cmd+Shift+5 → screenshot-window   （窗口截图，本机 Alt+Print）
+    // 读 GNOME 现有绑定后发出同样的键，不改写用户配置。
     //
-    // 键位对应按功能而非物理位置：macOS 的 3/4/5 是固定位置，
-    // Linux 侧 GNOME 自己绑在哪就发哪个。
+    // **与直觉相反的一点**（实测）：GNOME 的
+    //   screenshot        (Shift+Print) = **直接截全屏**，不弹界面
+    //   show-screenshot-ui(Print)       = **弹出截图界面**
+    // 而 macOS 是 Cmd+Shift+3 直接截全屏、Cmd+Shift+4/5 进选择模式。
+    // 故按功能对齐，3 对「直接截」、4/5 对「界面」：
+    //   Cmd+Shift+3 → screenshot          直接截全屏
+    //   Cmd+Shift+4 → show-screenshot-ui  截图界面（选区/窗口在其中选）
+    //   Cmd+Shift+5 → show-screenshot-ui  同上
+    //
+    // 4 与 5 行为相同是妥协：GNOME 只有三个截图动作，其中
+    // `screenshot` 与 `screenshot-window` 实测都直接截全屏，
+    // 无法据此区分选区与窗口。选区/窗口仍可在界面里选到。
     for (keys, feature, desc) in [
-        ("S-KEY_3", "screenshot-ui", "截图界面 (Cmd+Shift+3)"),
-        ("S-KEY_4", "screenshot", "区域截图 (Cmd+Shift+4)"),
-        ("S-KEY_5", "screenshot-window", "窗口截图 (Cmd+Shift+5)"),
+        ("S-KEY_3", "screenshot", "截全屏 (Cmd+Shift+3，直接截不弹界面)"),
+        (
+            "S-KEY_4",
+            "screenshot-ui",
+            "截图界面 (Cmd+Shift+4，选区/窗口在其中选)",
+        ),
+        (
+            "S-KEY_5",
+            "screenshot-ui",
+            "截图界面 (Cmd+Shift+5，同上)",
+        ),
     ] {
         v.push(Rule {
             apps: vec![],

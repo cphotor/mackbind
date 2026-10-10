@@ -108,7 +108,7 @@ macOS 的 `Cmd+Tab`（切换应用）、`Cmd+H`（隐藏）、`Cmd+↑/↓`（�
 |`Cmd+Tab` 切换应用|`Super+Tab`|B（暂缓）|
 |`Shift+Cmd+Tab` 反向切换|`Shift+Super+Tab`|B（暂缓）|
 |`Cmd+`` ` `` 切换窗口|无全局对应|F|
-|`Cmd+Shift+3/4/5` 截图/录屏|`Print` / `Shift+Print` / `Alt+Print`|D（已实现）|
+|`Cmd+Shift+3/4/5` 截图|`Shift+Print`（3）/ `Print`（4、5）|D（已实现，见下）|
 |`Cmd+Shift+N` 访达新建文件夹|`Ctrl+Shift+N`|A|
 |`Ctrl+Cmd+N` 新建含所选项目的文件夹|无|F|
 |`Shift+Cmd+6` Siri 询问（macOS 27+）|无|F|
@@ -488,3 +488,27 @@ gsettings get org.gnome.desktop.wm.keybindings show-desktop   # @as []（未绑�
 > 注：设置界面中的条目名因 GNOME 版本而异。GNOME 51（本机）中该动作的
 > schema 键为 `show-desktop`；「隐藏所有普通窗口」可能是其他版本或
 > 其他 schema 下的名称。设置界面的显示名与底层键名不一定一致。
+
+### 截图三键的映射（实测，与直觉相反）
+
+GNOME 的三个截图动作，**哪个直接截、哪个弹界面，与直觉相反**：
+
+|GNOME 动作|本机绑定|实际行为|
+|---|---|---|
+|`screenshot`|`Shift+Print`|**直接截全屏**，不弹界面|
+|`screenshot-window`|`Alt+Print`|直接截（本机实测亦为全屏）|
+|`show-screenshot-ui`|`Print`|**弹出截图界面**|
+
+macOS 则是 `Cmd+Shift+3` 直接截全屏、`Cmd+Shift+4/5` 进选择模式。
+故按功能对齐：
+
+|按键|映射到|行为|
+|---|---|---|
+|`Cmd+Shift+3`|`screenshot` → `Shift+Print`|直接截全屏（与 macOS 一致）|
+|`Cmd+Shift+4`|`show-screenshot-ui` → `Print`|截图界面，选区/窗口在其中选|
+|`Cmd+Shift+5`|`show-screenshot-ui` → `Print`|同上|
+
+**4 与 5 行为相同是妥协。** GNOME 只有三个截图动作，其中
+`screenshot` 与 `screenshot-window` 实测都表现为直接截全屏，
+无法据此把选区与窗口区分开。二者统一走截图界面，
+选区/窗口仍能在界面里选到。
