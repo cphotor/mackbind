@@ -81,22 +81,23 @@ fn notify(summary: &str, body: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 等待用户在通知上点「确认」。
+/// 等待用户确认。
 ///
-/// D-Bus 的通知 API 不提供「点击某按钮后回调」的同步查询，
-/// 因此这里用一个**折中且保守**的方案：
+/// 确认方式取决于环境：
 ///
-/// 1. 发出带确认动作的通知，永久显示
-/// 2. 同时在终端/日志打印提示
-/// 3. **等待超时窗口内用户按下确认键**，否则放弃
+/// - **有 TTY**（前台运行）：在终端里等 `y`，附带倒计时提示
+/// - **无 TTY**（systemd 服务）：等一个**写在该键组合上的二次确认**——
+///   即用户必须再按一次同样的组合才真正执行
 ///
-/// 确认键用 `y`——必须切到能看到日志的地方去按，这本身就构成了一道
-/// 人工确认。若拿不到输入设备（无 TTY），直接放弃执行。
+/// 第二种是必须的：程序由 systemd 拉起时没有可读的终端，
+/// 早期版本「无 TTY 即放弃」导致该功能完全不可用且毫无反馈——
+/// 用户按了键什么都没发生，也不给任何提示。
 fn wait_for_confirmation(prompt: &str, timeout_secs: u64) -> bool {
-    // 非交互环境（systemd 服务）没有可读的 TTY，直接放弃
     let has_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
     if !has_tty {
-        eprintln!("[exec] 无交互终端，无法确认 destructive 操作，已放弃：{prompt}");
+        // 无终端：请用户再按一次同样的组合确认（由调用方重试机制处理）
+        eprintln!("[exec] {prompt}");
+        eprintln!("[exec] 已在后台运行：请再按一次同样的组合以确认（{} 秒内有效）", timeout_secs);
         return false;
     }
     eprintln!("[exec] {prompt}");
@@ -129,30 +130,96 @@ fn wait_for_confirmation(prompt: &str, timeout_secs: u64) -> bool {
 /// 执行一条命令。
 ///
 /// `confirm` 为 `false` 时跳过确认——**仅用于非破坏性命令**。
-/// 破坏性命令即使 `confirm = false` 也会被强制确认，除非调用方
-/// 显式传 `force_destructive`。
-pub fn run(program: &str, args: &[String], desc: Option<&str>, confirm: bool, force_destructive: bool) {
+/// 破坏性命令即使 `confirm = false` 也会被强制确认。
+///
+/// # 二次确认（后台运行时的唯一可行方案）
+///
+/// 程序由 systemd 拉起时没有 TTY，无法等 `y`。此时改为要求
+/// **再按一次同样的组合**：第一次按下只发通知并记下时间，
+/// 第二次（窗口内）才真正执行。
+///
+/// 这比「无 TTY 即放弃」可用得多——早期那版让该功能完全静默失效，
+/// 用户按了键既没反应也没提示。同时它仍构成一道人工确认：
+/// 误按一次不会立刻删掉东西。
+pub fn run(
+    program: &str,
+    args: &[String],
+    desc: Option<&str>,
+    confirm: bool,
+    confirm_key: Option<&str>,
+) {
     let risk = classify(program, args);
     let label = desc.unwrap_or(program);
 
-    if risk == Risk::Destructive && !(confirm || force_destructive) {
+    if risk == Risk::Destructive && !confirm {
         eprintln!("[exec] 破坏性命令须显式确认，已拒绝：{label}");
         return;
     }
 
-    let needs_confirm = confirm || (risk == Risk::Destructive && !force_destructive);
+    let needs_confirm = confirm || risk == Risk::Destructive;
 
     if needs_confirm {
         let prompt = format!("即将执行「{label}」：{} {}（不可撤销）", program, args.join(" "));
-        let delivered = notify("确认破坏性操作", &prompt);
-        // 通知投递失败也照样要求终端确认——宁可麻烦，不可误删
-        let _ = delivered;
+        let key = confirm_key.unwrap_or("(同一组合)");
+
+        if let Some(done) = check_second_press(key) {
+            if done {
+                spawn(program, args, label);
+            } else {
+                arm(key, label);
+            }
+            return;
+        }
+
+        let _ = notify("确认破坏性操作", &prompt);
         if !wait_for_confirmation(&prompt, CONFIRM_TIMEOUT_SECS) {
             eprintln!("[exec] 未确认，不执行：{label}");
             return;
         }
     }
 
+    spawn(program, args, label);
+}
+
+/// 已挂起待二次确认的组合。
+static PENDING: std::sync::Mutex<Option<(String, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
+/// 二次确认窗口：秒。
+const CONFIRM_WINDOW_SECS: u64 = 8;
+
+/// 是否处于后台（无 TTY）——只有那时才用二次确认。
+fn is_background() -> bool {
+    (unsafe { libc::isatty(libc::STDIN_FILENO) } != 1)
+}
+
+/// 有 TTY 时返回 `None`（走终端确认）；后台时返回 `Some(是否本次即执行)`。
+fn check_second_press(key: &str) -> Option<bool> {
+    if !is_background() {
+        return None;
+    }
+    let mut g = PENDING.lock().ok()?;
+    let now = std::time::Instant::now();
+    match g.as_ref() {
+        Some((k, t)) if k == key && now.duration_since(*t).as_secs() < CONFIRM_WINDOW_SECS => {
+            *g = None;
+            Some(true)
+        }
+        _ => {
+            *g = Some((key.to_string(), now));
+            Some(false)
+        }
+    }
+}
+
+/// 第一次按下：挂起并通知。
+fn arm(key: &str, label: &str) {
+    let prompt = format!("再按一次 {key} 以确认执行「{label}」（{CONFIRM_WINDOW_SECS} 秒内有效）");
+    let _ = notify("待确认：破坏性操作", &prompt);
+    eprintln!("[exec] {prompt}");
+}
+
+fn spawn(program: &str, args: &[String], label: &str) {
     match Command::new(program)
         .args(args)
         .stdout(Stdio::null())

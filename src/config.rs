@@ -274,7 +274,7 @@ fn default_rules() -> Vec<Rule> {
     push_emit(&[], "KEY_LEFTBRACE", "A", "Left", "上一文件夹 (Cmd+[)");
     push_emit(&[], "KEY_RIGHTBRACE", "A", "Right", "下一文件夹 (Cmd+])");
     // ── 删除 ──
-    push_emit(&[], "KEY_DELETE", "C", "KEY_DELETE", "删左字符 (Ctrl+D)");
+    push_emit(&[], "KEY_DELETE", "C", "KEY_DELETE", "移到废纸篓 (Cmd+Delete → Ctrl+Delete)");
     // ── 窗口管理 ──
     // 跨应用的全局规则，故不受终端特化影响。
     // macOS 的 Cmd+Q 是「退出应用」，Linux 侧最接近的通用绑定是
@@ -393,7 +393,8 @@ fn default_rules() -> Vec<Rule> {
     v.push(Rule {
         apps: vec![],
         keys: vec!["C-KEY_UP".into()],
-        cmd: true,
+        // Ctrl+↑ 不含 Cmd——标成 true 会导致规则永不命中
+        cmd: false,
         act: Action::DeAccel {
             feature: "overview".into(),
         },
