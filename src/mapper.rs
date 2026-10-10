@@ -1471,6 +1471,34 @@ mod release_symmetry {
         assert!(out.is_empty(), "Shift 已被翻译时松开，不应再有输出: {:?}", codes(&out));
     }
 
+    /// `Ctrl+Cmd+Q` 不等同于 `Cmd+Q`：remap 已把物理 Ctrl 变成 CapsLock，
+    /// 查表落空后走默认语义，产出的是 `Ctrl+Q`（CapsLock 对应用无意义）。
+    ///
+    /// 记录此行为是因为它容易被误读成「Ctrl 被忽略了」——实机观感相同
+    /// （两者都关窗口），但发出的组合不同：`Cmd+Q` 给 Alt+F4，本组合给
+    /// Ctrl+Q。后者只在恰好绑了 Ctrl+Q 的应用里有效。
+    #[test]
+    fn ctrl_cmd_q_is_not_same_as_cmd_q() {
+        let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
+        m.translate(&k(KeyCode::KEY_LEFTCTRL.0, 1));
+        m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
+        let out = m.translate(&k(KeyCode::KEY_Q.0, 1));
+        let codes = codes(&out);
+
+        // 未发出 Alt+F4——若命中 Cmd+Q 规则则应出现 KEY_F4
+        assert!(
+            !codes.contains(&KeyCode::KEY_F4.0),
+            "Ctrl+Cmd+Q 不应命中 Cmd+Q 规则（remap 使 Ctrl 变 CapsLock）: {:?}",
+            codes
+        );
+        // 实际发出 Q，且物理 Ctrl 经 remap 后表现为 CapsLock
+        assert!(
+            codes.contains(&KeyCode::KEY_Q.0),
+            "应落到默认语义发出 Q: {:?}",
+            codes
+        );
+    }
+
     /// 裸 Shift 仍须正常输出按下与释放（fcitx5 依赖）
     #[test]
     fn bare_shift_still_works() {
