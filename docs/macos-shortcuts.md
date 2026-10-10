@@ -87,7 +87,7 @@ macOS 的 `Cmd+Tab`（切换应用）、`Cmd+H`（隐藏）、`Cmd+↑/↓`（�
 |`Cmd+A` 全选|`Ctrl+A`|A|
 |`Cmd+F` 查找|`Ctrl+F`|A|
 |`Cmd+G` 查找下一个|`Ctrl+G`|A|
-|`Shift+Cmd+G` 查找上一个|`Ctrl+G`|A|
+|`Shift+Cmd+G` 查找上一个|`Ctrl+Shift+G`|A|
 |`Cmd+O` 打开|`Ctrl+O`|A|
 |`Cmd+P` 打印|`Ctrl+P`|A|
 |`Cmd+Q` 退出应用|D-Bus 请求焦点应用退出|E|
@@ -103,7 +103,7 @@ macOS 的 `Cmd+Tab`（切换应用）、`Cmd+H`（隐藏）、`Cmd+↑/↓`（�
 |`Cmd+空格` 聚焦/Spotlight|活动概览；**GNOME 原 `Super+space` 需让位**|E|
 |`Option+Cmd+空格` 访达内聚焦|无全局对应|F|
 |`Ctrl+Cmd+空格` 字符检视器|无|F|
-|`Ctrl+Cmd+F` 全屏|`F11`|A|
+|`Ctrl+Cmd+F` 全屏|`F11`|D（已实现：显式规则）|
 |`Cmd+,` 偏好设置|无全局对应|F|
 |`Cmd+Tab` 切换应用|`Super+Tab`|B（暂缓）|
 |`Shift+Cmd+Tab` 反向切换|`Shift+Super+Tab`|B（暂缓）|

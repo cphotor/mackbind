@@ -77,6 +77,26 @@ grep '^\[trace\] IN' trace.log
 也挡不住这次的问题——测试覆盖的是我写下来的用例，
 不是「裸按键不该触发 Cmd 规则」这种常识。
 
+### 部署流程（两次踩坑后固定下来）
+
+```bash
+cargo build --release
+systemctl --user stop mackbind        # 必须先停，否则 cp 报「文本文件忙」
+cp target/release/mackbind ~/.local/bin/mackbind
+systemctl --user start mackbind
+# 核对：不一致就不要让用户测
+md5sum ~/.local/bin/mackbind target/release/mackbind
+```
+
+**核对 MD5 是硬性步骤。** 曾两次在没核对的情况下让用户测旧版本：
+一次 `cargo build` 后忘了 `cp` 就直接 `start`，一次服务本来就在跑、
+`cp` 因「文本文件忙」失败但被 `&&` 吞掉。用户测的是旧二进制，
+白费两轮验证，而且报上来的现象（「Ctrl+↑ 没反应」）会把我引向
+错误的排查方向。
+
+**服务是否在跑、跑的是哪个版本，是两个独立问题，必须分别确认。**
+我曾因为服务是 active 就以为部署成功了。
+
 ## 三、文档与实现必须机器核对，不能人工核对
 
 `scripts/audit.py` 是为此存在的。人工核对的代价已经付过两次
