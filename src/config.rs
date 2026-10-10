@@ -69,6 +69,23 @@ pub enum Action {
     /// 该键集在运行时从 GSettings 查得（见 `set_window_id`），
     /// 故此处无法写成固定输出——这是本表唯一的「条件」动作。
     TerminalCtrlShift,
+    /// 执行一条外部命令。
+    ///
+    /// 用于「本质是命令而非组合键」的操作，如清倒废纸篓。
+    /// 破坏性命令走 [`crate::exec`] 的确认流程。
+    Exec {
+        /// 可执行文件名，如 `gio`
+        program: String,
+        /// 参数
+        #[serde(default)]
+        args: Vec<String>,
+        /// 是否先要求用户确认，默认 `true`。
+        ///
+        /// 破坏性命令**强制**确认，写 `false` 也不行——
+        /// 免确认的全局热键一旦误按就是永久删除，没有回收站可捞。
+        #[serde(default = "default_true")]
+        confirm: bool,
+    },
 }
 
 /// 表的一行：`(应用, 按键组合) → 动作`。
@@ -381,6 +398,34 @@ fn default_rules() -> Vec<Rule> {
         },
         desc: Some("退出登录 (Shift+Cmd+Q，读 DE 现有绑定)".into()),
     });
+
+    // ── 清倒废纸篓：本质是命令，不是组合键 ──
+    //
+    // macOS 上分两个：Shift+Cmd+Delete 有确认，Option+Shift+Cmd+Delete
+    // 免确认。GNOME 侧对应 `gio trash --empty --force`。
+    //
+    // **两者都要确认。** 与 macOS 的免确认版不同——那是全局热键，
+    // 不限应用、不限焦点，误按一次就是永久删除。gio 自己带 --force
+    // 会跳过它的确认，所以这道确认必须由 exec 层保证。
+    for (keys, desc) in [
+        (vec!["S-KEY_DELETE"], "清倒废纸篓 (Shift+Cmd+Delete)"),
+        (
+            vec!["A-S-KEY_DELETE"],
+            "清倒废纸篓 (Option+Shift+Cmd+Delete)",
+        ),
+    ] {
+        v.push(Rule {
+            apps: vec![],
+            keys: keys.into_iter().map(String::from).collect(),
+            cmd: true,
+            act: Action::Exec {
+                program: "gio".into(),
+                args: vec!["trash".into(), "--empty".into(), "--force".into()],
+                confirm: true,
+            },
+            desc: Some(desc.into()),
+        });
+    }
 
     // ── 会漏发 SIGINT 的终端：复制键改走 Ctrl+Insert ──
     // 必须放在终端特化**之前**——查找取首个命中者，若在其后，

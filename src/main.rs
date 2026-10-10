@@ -23,6 +23,7 @@
 mod accel;
 mod config;
 mod desktop;
+mod exec;
 mod focus;
 mod keys;
 mod mapper;
@@ -201,6 +202,16 @@ fn main() {
                 crate::config::Action::TerminalCtrlShift => {
                     "Ctrl+Shift（若应用如此绑定）".to_string()
                 }
+                crate::config::Action::Exec {
+                    program,
+                    args,
+                    confirm,
+                } => format!(
+                    "执行 {}{}{}",
+                    program,
+                    if args.is_empty() { "" } else { " " },
+                    args.join(" ")
+                ) + if *confirm { "（需确认）" } else { "" },
             };
             println!(
                 "[config]   {:<28} {:<20} → {}{}",

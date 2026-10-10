@@ -137,8 +137,8 @@ macOS 的 `Cmd+Tab`（切换应用）、`Cmd+H`（隐藏）、`Cmd+↑/↓`（�
 |`Cmd+[` 上一个文件夹|`Alt+←`|D|
 |`Cmd+]` 下一个文件夹|`Alt+→`|D|
 |`Cmd+Delete` 移到废纸篓|`Ctrl+Delete`|D|
-|`Shift+Cmd+Delete` 清倒废纸篓|`gio trash --empty --force`|E|
-|`Option+Shift+Cmd+Delete` 不确认清倒废纸篓|`gio trash --empty --force`|E|
+|`Shift+Cmd+Delete` 清倒废纸篓|`gio trash --empty --force`|E（已实现，强制确认）|
+|`Option+Shift+Cmd+Delete` 不确认清倒废纸篓|`gio trash --empty --force`|E（已实现，仍强制确认）|
 |`Cmd+1/2/3/4` 图标/列表/分栏/画廊视图|Nautilus 内部|应用处理|
 |`Shift+Cmd+H` 个人文件夹|Nautilus 内部|应用处理|
 |`Option+Cmd+L` 下载文件夹|Nautilus 内部|应用处理|
@@ -387,11 +387,23 @@ cycle-panels                ['<Control><Alt>Escape']
 
 |项|阻塞原因|
 |---|---|
-|`Shift+Cmd+Delete` 清倒废纸篓|需执行 `gio trash --empty --force`；可做，未做|
-|`Ctrl+↑` 调度中心|复用 `Cmd+空格` 的概览动作（GNOME 无独立的「调度中心」）|
-|「显示桌面」|动作存在（`show-desktop`）但默认未绑定，需写入用户账户设置|
-|Option 类组合最终清单|`A-KEY_LEFT` / `A-KEY_RIGHT` 已做，其余未逐条核对|
+|「显示桌面」|动作存在（`show-desktop`）但默认未绑定（`@as []`），需用户自行绑定后本工具才能发出对应键|
 |访达 → Nautilus 内部操作|多数由应用自身处理，无需全局规则|
+
+### 清倒废纸篓：与 macOS 的差异（有意为之）
+
+macOS 上 `Shift+Cmd+Delete` 清倒废纸篓（有确认），
+`Option+Shift+Cmd+Delete` 免确认。两者都已实现，但**本工具强制要求确认**。
+
+原因：`gio trash --empty --force` 会跳过 gio 自己的确认（`--force`），
+而本工具的映射是**全局**的——不限应用、不限焦点窗口，
+不设防的话误按一次就是永久删除，没有回收站可捞。
+
+确认方式：发出 GNOME 通知 + 在日志打印命令，`y` 键确认，
+20 秒超时自动放弃。无交互终端（如 systemd 服务）时**直接放弃执行**。
+
+规则表里写 `confirm = false` 也无法绕过——破坏性命令的确认
+由 `src/exec.rs` 强制保证。
 
 ### 终端特化的粒度（重要）
 

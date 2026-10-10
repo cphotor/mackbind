@@ -126,6 +126,20 @@ enum CompiledAction {
     Emit(Vec<KeyCode>, KeyCode),
     DeAccel(String),
     TerminalCtrlShift,
+    /// 执行外部命令（清倒废纸篓等「本质是命令」的操作）
+    Exec {
+        program: String,
+        args: Vec<String>,
+        confirm: bool,
+    },
+}
+
+/// 查表命中的结果。
+enum Outcome {
+    /// 发出这组修饰键与主键
+    Convert(Vec<KeyCode>, KeyCode),
+    /// 动作已产生副作用（如执行了命令），**无需发任何按键**
+    NoOutput,
 }
 
 /// 已编译的映射规则。
@@ -244,6 +258,15 @@ fn compile_table(
                 CompiledAction::DeAccel(feature.clone())
             }
             crate::config::Action::TerminalCtrlShift => CompiledAction::TerminalCtrlShift,
+            crate::config::Action::Exec {
+                program,
+                args,
+                confirm,
+            } => CompiledAction::Exec {
+                program: program.clone(),
+                args: args.clone(),
+                confirm: *confirm,
+            },
         };
 
         out.push(CompiledRule {
@@ -657,7 +680,7 @@ impl Mapper {
         code: KeyCode,
         cur_mods: &[KeyCode],
         cmd_held: bool,
-    ) -> Option<(Vec<KeyCode>, KeyCode)> {
+    ) -> Option<Outcome> {
         for r in &self.rules {
             if r.requires_cmd && !cmd_held {
                 continue;
@@ -677,7 +700,9 @@ impl Mapper {
                 }
             }
             match &r.act {
-                CompiledAction::Emit(mods, key) => return Some((mods.clone(), *key)),
+                CompiledAction::Emit(mods, key) => {
+                    return Some(Outcome::Convert(mods.clone(), *key))
+                }
                 CompiledAction::DeAccel(feature) => {
                     // 读 DE 现有的绑定，发出同样的键。不改写用户配置，
                     // 用户改了绑定则自动跟上。启动时已剔除不可用的行，
@@ -685,7 +710,7 @@ impl Mapper {
                     if let Some((mods, key)) =
                         de_feature_accel(&self.desktop_type, feature)
                     {
-                        return Some((mods, key));
+                        return Some(Outcome::Convert(mods, key));
                     }
                     continue;
                 }
@@ -703,9 +728,22 @@ impl Mapper {
                         mods.push(KeyCode::KEY_LEFTSHIFT);
                         mods.sort();
                         mods.dedup();
-                        return Some((mods, code));
+                        return Some(Outcome::Convert(mods, code));
                     }
                     continue;
+                }
+                CompiledAction::Exec {
+                    program,
+                    args,
+                    confirm,
+                } => {
+                    // 本质是命令而非组合键的操作。
+                    //
+                    // 返回 `Some(空修饰键, 空主键)` 表示「已处理，但无需发按键」——
+                    // 调用方据此跳过整个输出流程，只跑副作用。
+                    crate::exec::run(program, args, r.desc.as_deref(), *confirm, false);
+                    // 已产生副作用，无需发出任何按键
+                    return Some(Outcome::NoOutput);
                 }
             }
         }
@@ -766,7 +804,9 @@ impl Mapper {
             //
             // 查表优先；表里没有才轮到默认语义（非 Cmd 组合则原样透传）。
             let decision = match self.lookup(code, &cur_mods, cmd_held) {
-                Some((m, k)) => Default::Convert(m, k),
+                Some(Outcome::Convert(m, k)) => Default::Convert(m, k),
+                // 动作已执行完，不该再发按键
+                Some(Outcome::NoOutput) => return Vec::new(),
                 None if cmd_held => default_semantics(&cur_mods, code),
                 // 非 Cmd 组合且表里没有：原样透传
                 None => Default::PassthroughPlain,
@@ -2517,6 +2557,65 @@ mod de_accels_all_resolvable {
             Some(evdev::KeyCode::KEY_SYSRQ),
             "GNOME 绑定里的 `Print` 须解析为 KEY_SYSRQ"
         );
+    }
+}
+
+/// `exec` 动作：产生副作用，但**不发出任何按键**。
+#[cfg(test)]
+mod exec_action {
+    use super::*;
+    use crate::config::Config;
+
+    fn k(c: u16, v: i32) -> InputEvent {
+        InputEvent::new(EventType::KEY.0, c, v)
+    }
+
+    /// 清倒废纸篓是命令而非按键，不能伪造一个按键事件出去
+    #[test]
+    fn exec_emits_no_key_events() {
+        let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
+        m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
+        m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 1));
+        let out = m.translate(&k(KeyCode::KEY_DELETE.0, 1));
+        assert!(
+            out.is_empty(),
+            "exec 动作不应发出按键事件（会误触发应用行为），实际 {:?}",
+            out.iter()
+                .map(|e| format!("{:?}{}", e.code(), e.value()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// 释放路径也不得凭空发出事件
+    #[test]
+    fn exec_release_is_silent() {
+        let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
+        m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
+        m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 1));
+        m.translate(&k(KeyCode::KEY_DELETE.0, 1));
+        let out = m.translate(&k(KeyCode::KEY_DELETE.0, 0));
+        assert!(out.is_empty(), "exec 动作的释放不应有输出: {:?}", out);
+    }
+
+    /// 表里两条清倒废纸篓规则都必须要求确认
+    #[test]
+    fn trash_rules_require_confirmation() {
+        let cfg = Config::with_defaults();
+        let rules = compile_table(&cfg.rules).expect("规则表应能编译");
+        let trash: Vec<_> = rules
+            .iter()
+            .filter(|r| matches!(&r.act, CompiledAction::Exec { program, .. } if program == "gio"))
+            .collect();
+        assert_eq!(trash.len(), 2, "应有两条清倒废纸篓规则");
+        for r in trash {
+            if let CompiledAction::Exec { confirm, .. } = &r.act {
+                assert!(
+                    *confirm,
+                    "破坏性命令必须确认，规则 {:?}",
+                    r.key
+                );
+            }
+        }
     }
 }
 
