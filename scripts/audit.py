@@ -239,13 +239,28 @@ def parse_rules() -> set[str]:
         apps, combo = m.group(1), m.group(2).strip()
         if combo:
             out.add(combo)
-    # `keys: vec!["…"]` 形式的规则（de_accel、terminal_ctrl_shift 等）
-    for m in re.finditer(r'keys:\s*vec!\[([^\]]*)\]', text, re.S):
-        for k in re.findall(r'"([^"]+)"', m.group(1)):
-            k = k.strip()
-            if k and k != "*":
-                out.add(k)
+    # 规则表中所有形如组合的字符串。
+    #
+    # 不用 `keys: vec![...]` 定位：部分规则在循环里生成
+    # （`keys: vec![keys.into()]`），正则抓不到字面量。
+    # 改为在 default_rules() 正文里匹配「修饰前缀 + KEY_xxx」形态，
+    # desc 是中文不会误命中。
+    body = _body_of(text, "fn default_rules")
+    for k in re.findall(r'"([ASCM-]*KEY_[A-Z0-9]+)"', body):
+        out.add(k)
     return out
+
+
+def _body_of(text: str, marker: str) -> str:
+    """取 `marker` 之后到下一个顶层 `fn`/`impl` 之前的正文。
+
+    `default_rules()` 是文件里最后一个大函数，其后直接是别的顶层
+    定义，故找不到下一个 `\nfn ` 时退回文件末尾。
+    """
+    i = text.index(marker)
+    m = re.search(r"\n(fn |impl |const |#\[cfg)", text[i + len(marker):])
+    j = i + len(marker) + m.start() if m else len(text)
+    return text[i:j]
 
 
 def parse_conditional_rules() -> set[str]:

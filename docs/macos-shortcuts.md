@@ -108,7 +108,7 @@ macOS 的 `Cmd+Tab`（切换应用）、`Cmd+H`（隐藏）、`Cmd+↑/↓`（�
 |`Cmd+Tab` 切换应用|`Super+Tab`|B（暂缓）|
 |`Shift+Cmd+Tab` 反向切换|`Shift+Super+Tab`|B（暂缓）|
 |`Cmd+`` ` `` 切换窗口|无全局对应|F|
-|`Cmd+Shift+3/4/5` 截图/录屏|`Print` / `Shift+Print` / `Print` 长按|D|
+|`Cmd+Shift+3/4/5` 截图/录屏|`Print` / `Shift+Print` / `Alt+Print`|D（已实现）|
 |`Cmd+Shift+N` 访达新建文件夹|`Ctrl+Shift+N`|A|
 |`Ctrl+Cmd+N` 新建含所选项目的文件夹|无|F|
 |`Shift+Cmd+6` Siri 询问（macOS 27+）|无|F|
@@ -120,7 +120,7 @@ macOS 的 `Cmd+Tab`（切换应用）、`Cmd+H`（隐藏）、`Cmd+↑/↓`（�
 |macOS|Linux 目标|类|
 |---|---|---|
 |`Ctrl+Cmd+Q` 锁定屏幕|`Super+l`|D|
-|`Shift+Cmd+Q` 退出登录|`Super+Shift+Q`|D|
+|`Shift+Cmd+Q` 退出登录|`Ctrl+Alt+Delete`|D（已实现）|
 |`Option+Shift+Cmd+Q` 直接退出登录|无|F|
 
 > 电源按钮类快捷键无对应键盘按键，忽略。
@@ -171,7 +171,7 @@ macOS 的 `Cmd+Tab`（切换应用）、`Cmd+H`（隐藏）、`Cmd+↑/↓`（�
 |`Ctrl+亮度键` 外接显示器亮度|无（硬件相关）|F|
 |`Option+调度中心键` 调度中心设置|无|F|
 |`Cmd+调度中心` / `Fn+H` / `Fn+F11` 显示桌面|实现方式待定|E|
-|`Ctrl+↑` 调度中心|活动概览|E|
+|`Ctrl+↑` 调度中心|活动概览|E（已实现）|
 |`Ctrl+↓` 前方 App 所有窗口|无|F|
 |`Option+音量/键盘亮度键` 打开对应设置|无全局对应|F|
 
@@ -340,7 +340,7 @@ code  code-url-handler  codium
 |`Cmd+Tab` 切换应用|`Super+Tab`|已绑定|无冲突|
 |`Cmd+↑/↓`|`Super+↑/↓`|已绑定|无冲突|
 |`Shift+Cmd+3/4/5` 截图|`Print` / `Shift+Print`|已绑定|无冲突|
-|`Shift+Cmd+Q` 退出登录|`Super+Shift+Q`|需确认|可能需新增|
+|`Shift+Cmd+Q` 退出登录|`Ctrl+Alt+Delete`|media-keys 的 `logout`（本机已绑定）|无冲突|
 
 ### GNOME 抢占 `Ctrl+Alt` 系列（重要）
 
@@ -388,7 +388,7 @@ cycle-panels                ['<Control><Alt>Escape']
 |项|阻塞原因|
 |---|---|
 |`Shift+Cmd+Delete` 清倒废纸篓|需执行 `gio trash --empty --force`；可做，未做|
-|`Ctrl+↑` 调度中心|与概览同键，GNOME 未提供独立的「调度中心」动作|
+|`Ctrl+↑` 调度中心|复用 `Cmd+空格` 的概览动作（GNOME 无独立的「调度中心」）|
 |「显示桌面」|动作存在（`show-desktop`）但默认未绑定，需写入用户账户设置|
 |Option 类组合最终清单|`A-KEY_LEFT` / `A-KEY_RIGHT` 已做，其余未逐条核对|
 |访达 → Nautilus 内部操作|多数由应用自身处理，无需全局规则|

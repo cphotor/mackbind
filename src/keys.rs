@@ -79,6 +79,11 @@ const ALIASES: &[(&str, &str)] = &[
     ("Return", "KEY_ENTER"),
     ("Page_Up", "KEY_PAGEUP"),
     ("Page_Down", "KEY_PAGEDOWN"),
+    // Print：GNOME 截图绑在它上面，但 evdev 的键码名是历史遗留的
+    // SYSRQ（SysRq 与 Print 是同一个物理键）。没有这条别名，
+    // `de_accel` 读到的 `Print` 解析失败，截图规则会被静默剔除。
+    ("print", "KEY_SYSRQ"),
+    ("sysrq", "KEY_SYSRQ"),
 ];
 
 /// 解析单个键名。

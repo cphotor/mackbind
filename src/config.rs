@@ -330,6 +330,58 @@ fn default_rules() -> Vec<Rule> {
         desc: Some("删除左边字词 (Option+Delete → Ctrl+Delete)".into()),
     });
 
+    // ── 截图：对应 macOS 的 Cmd+Shift+3/4/5 ──
+    //
+    // 读 GNOME 现有绑定后发出同样的键，不改写用户配置：
+    //   Cmd+Shift+3 → show-screenshot-ui  （截图界面，本机 Print）
+    //   Cmd+Shift+4 → screenshot          （区域截图，本机 Shift+Print）
+    //   Cmd+Shift+5 → screenshot-window   （窗口截图，本机 Alt+Print）
+    //
+    // 键位对应按功能而非物理位置：macOS 的 3/4/5 是固定位置，
+    // Linux 侧 GNOME 自己绑在哪就发哪个。
+    for (keys, feature, desc) in [
+        ("S-KEY_3", "screenshot-ui", "截图界面 (Cmd+Shift+3)"),
+        ("S-KEY_4", "screenshot", "区域截图 (Cmd+Shift+4)"),
+        ("S-KEY_5", "screenshot-window", "窗口截图 (Cmd+Shift+5)"),
+    ] {
+        v.push(Rule {
+            apps: vec![],
+            keys: vec![keys.into()],
+            cmd: true,
+            act: Action::DeAccel {
+                feature: feature.into(),
+            },
+            desc: Some(desc.into()),
+        });
+    }
+
+    // ── Ctrl+↑ 调度中心 → GNOME 概览 ──
+    //
+    // 与 `Cmd+空格` 是同一个动作，只是触发键不同。
+    v.push(Rule {
+        apps: vec![],
+        keys: vec!["C-KEY_UP".into()],
+        cmd: true,
+        act: Action::DeAccel {
+            feature: "overview".into(),
+        },
+        desc: Some("调度中心 (Ctrl+↑ → 概览)".into()),
+    });
+
+    // ── Shift+Cmd+Q 退出登录 ──
+    //
+    // GNOME 的 logout 绑在 media-keys 的 `logout`（本机 Ctrl+Alt+Delete），
+    // 与锁屏同一 schema。同样读现有绑定发出，不改写用户设置。
+    v.push(Rule {
+        apps: vec![],
+        keys: vec!["S-KEY_Q".into()],
+        cmd: true,
+        act: Action::DeAccel {
+            feature: "logout".into(),
+        },
+        desc: Some("退出登录 (Shift+Cmd+Q，读 DE 现有绑定)".into()),
+    });
+
     // ── 会漏发 SIGINT 的终端：复制键改走 Ctrl+Insert ──
     // 必须放在终端特化**之前**——查找取首个命中者，若在其后，
     // 通用终端规则会先命中，本条永不生效。

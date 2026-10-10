@@ -301,6 +301,12 @@ fn de_action_lookup(
         ),
         // 显示桌面：动作存在但默认未绑定，需用户自行绑定后此条才生效
         (Gnome, "show-desktop") => ("org.gnome.desktop.wm.keybindings", "show-desktop"),
+        // 截图三件套：全部在 shell 的 keybindings，不在 wm.keybindings
+        (Gnome, "screenshot-ui") => ("org.gnome.shell.keybindings", "show-screenshot-ui"),
+        (Gnome, "screenshot") => ("org.gnome.shell.keybindings", "screenshot"),
+        (Gnome, "screenshot-window") => ("org.gnome.shell.keybindings", "screenshot-window"),
+        // 退出登录：在 media-keys（与锁屏同一 schema），不在 wm.keybindings
+        (Gnome, "logout") => ("org.gnome.settings-daemon.plugins.media-keys", "logout"),
         // KDE 与裸 WM 的对应机制不同，暂未实现。
         // 「不可查」不等于「不存在」——见 docs/macos-shortcuts.md。
         _ => return None,
@@ -2453,6 +2459,63 @@ mod cmd_required {
             evs.iter()
                 .map(|e| format!("{:?}{}", e.code(), e.value()))
                 .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// 裸 Shift 仍须正常输出按下与释放（fcitx5 依赖）
+/// DE 动作全部可解析。
+///
+/// 曾因别名表缺 `print`（evdev 里叫历史名 `KEY_SYSRQ`），
+/// 三条截图规则被**静默剔除**——启动日志只说「DE 未提供」，
+/// 看不出是键名解析失败。这类问题必须用测试兜住。
+#[cfg(test)]
+mod de_accels_all_resolvable {
+    use super::*;
+
+    #[test]
+    fn every_bound_gnome_feature_resolves() {
+        // 只测 GNOME 默认已绑定的动作。
+        // `show-desktop` 默认未绑定（@as []），需用户自行绑定后
+        // 才生效——那是设计如此，不是解析失败。
+        for feature in [
+            "overview",
+            "lock-screen",
+            "screenshot-ui",
+            "screenshot",
+            "screenshot-window",
+            "logout",
+        ] {
+            assert!(
+                de_feature_accel(&DesktopType::Gnome, feature).is_some(),
+                "GNOME 动作 {feature} 无法解析——查 DE 绑定失败或键名不认识"
+            );
+        }
+    }
+
+    /// 表里每条 `de_accel` 规则，其功能都必须能解析——
+    /// 否则该行会被静默剔除，启动日志只说「DE 未提供」，看不出真相。
+    #[test]
+    fn no_rule_is_silently_dropped() {
+        let cfg = Config::with_defaults();
+        let compiled = compile_table(&cfg.rules).expect("规则表应能编译");
+        for r in &compiled {
+            if let CompiledAction::DeAccel(f) = &r.act {
+                assert!(
+                    de_feature_accel(&DesktopType::Gnome, f).is_some(),
+                    "规则 {f} 无法解析，该行会被静默剔除"
+                );
+            }
+        }
+    }
+
+    /// Print 必须能解析（GNOME 截图绑在它上面）
+    #[test]
+    fn print_alias_resolves() {
+        assert_eq!(
+            crate::keys::parse_external_key("Print"),
+            Some(evdev::KeyCode::KEY_SYSRQ),
+            "GNOME 绑定里的 `Print` 须解析为 KEY_SYSRQ"
         );
     }
 }
