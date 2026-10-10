@@ -864,8 +864,16 @@ impl Mapper {
             })
             .unwrap_or(false);
 
-        // 3) 抑制过的键：从未按下过，也不发出释放
-        if self.suppressed.remove(&code) {
+        // 3) 抑制过的键：若输出侧确实没有它，也不发出释放。
+        //
+        // 判据是「输出侧是否仍按着」，**不是**「是否曾被抑制」。
+        // 曾被抑制的键也可能在后续路径里被主动发出——如
+        // `Ctrl+Cmd+Q` 锁屏会发出 `Super+L`，其中的 Super 就是
+        // 原本被抑制的 Meta。此时若按「曾被抑制」提前返回，
+        // 释放事件被吞掉，Super 永久卡在按下态：
+        // 之后空格变成 Cmd+空格、W 变成 Cmd+W。
+        let was_suppressed = self.suppressed.remove(&code);
+        if was_suppressed && !self.output_down.contains(&code) {
             return vec![];
         }
 
@@ -2022,6 +2030,336 @@ mod no_stuck_modifiers {
             ],
             "Shift+Cmd+Z",
         );
+    }
+}
+
+/// 系统性排查：任何「按下若干修饰键 + 主键，再全部松开」的序列，
+/// 结束后内部状态与输出侧都必须是干净的。
+///
+/// 症状是 Meta 卡在按下态——空格变成 Cmd+空格、W 变成 Cmd+W。
+/// 这类 bug 靠逐个组合手写测试很容易漏，故穷举。
+#[cfg(test)]
+mod exhaustive_clean {
+    use super::*;
+    use crate::config::Config;
+
+    fn k(c: u16, v: i32) -> InputEvent {
+        InputEvent::new(EventType::KEY.0, c, v)
+    }
+
+    const MODS: &[KeyCode] = &[
+        KeyCode::KEY_LEFTCTRL,
+        KeyCode::KEY_LEFTSHIFT,
+        KeyCode::KEY_LEFTALT,
+    ];
+
+    const KEYS: &[KeyCode] = &[
+        KeyCode::KEY_SPACE,
+        KeyCode::KEY_W,
+        KeyCode::KEY_Q,
+        KeyCode::KEY_A,
+        KeyCode::KEY_F,
+        KeyCode::KEY_DELETE,
+        KeyCode::KEY_LEFT,
+    ];
+
+    /// Meta 是罪魁：它按下时被抑制，最容易卡住
+    const META: KeyCode = KeyCode::KEY_LEFTMETA;
+
+    fn check(seq_down: &[KeyCode], label: &str) {
+        let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
+        let mut out = vec![];
+        for c in seq_down {
+            out.extend(m.translate(&k(c.0, 1)));
+        }
+        // 逆序松开
+        for c in seq_down.iter().rev() {
+            out.extend(m.translate(&k(c.0, 0)));
+        }
+
+        assert!(
+            m.held.is_empty(),
+            "{label}: 结束后 held 仍非空: {:?}",
+            m.held
+        );
+        assert!(
+            m.output_down.is_empty(),
+            "{label}: 结束后 output_down 仍非空: {:?}",
+            m.output_down
+        );
+        // 输出侧每个键的按下/释放必须配平
+        let mut seen: Vec<(u16, i32)> = Vec::new();
+        for e in &out {
+            seen.push((e.code(), e.value()));
+        }
+        for key in [META, KeyCode::KEY_LEFTCTRL, KeyCode::KEY_LEFTSHIFT, KeyCode::KEY_LEFTALT] {
+            let d = seen.iter().filter(|(c, v)| *c == key.0 && *v == 1).count();
+            let u = seen.iter().filter(|(c, v)| *c == key.0 && *v == 0).count();
+            assert_eq!(d, u, "{label}: {:?} 输出不配平 {d}下/{u}up", key);
+        }
+    }
+
+    #[test]
+    fn meta_plus_one_mod_plus_key_is_clean() {
+        for a in MODS {
+            for key in KEYS {
+                check(&[META, *a, *key], "Meta+mod+key");
+            }
+        }
+    }
+
+    #[test]
+    fn meta_plus_key_is_clean() {
+        for key in KEYS {
+            check(&[META, *key], "Meta+key");
+        }
+    }
+
+    #[test]
+    fn meta_alone_is_clean() {
+        check(&[META], "Meta 单独");
+    }
+
+    #[test]
+    fn two_mods_plus_key_is_clean() {
+        for a in MODS {
+            for b in MODS {
+                if a == b {
+                    continue;
+                }
+                for key in KEYS {
+                    check(&[*a, *b, *key], "mod+mod+key");
+                }
+            }
+        }
+    }
+}
+
+/// 松开顺序无关。
+///
+/// 上一个测试固定逆序松开，但真人不按顺序松——尤其是**先松修饰键、
+/// 后松主键**（手指自然抬起顺序）。这正是 Meta 卡死的土壤。
+#[cfg(test)]
+mod release_order {
+    use super::*;
+    use crate::config::Config;
+
+    fn k(c: u16, v: i32) -> InputEvent {
+        InputEvent::new(EventType::KEY.0, c, v)
+    }
+
+    /// 按下全部，然后按 `order` 给出的下标顺序松开
+    fn check(down: &[KeyCode], order: &[usize], label: &str) {
+        let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
+        let mut out = vec![];
+        for c in down {
+            out.extend(m.translate(&k(c.0, 1)));
+        }
+        for i in order {
+            out.extend(m.translate(&k(down[*i].0, 0)));
+        }
+        assert!(
+            m.held.is_empty(),
+            "{label}: held 残留 {:?}",
+            m.held
+        );
+        assert!(
+            m.output_down.is_empty(),
+            "{label}: output_down 残留 {:?}",
+            m.output_down
+        );
+        for key in [
+            KeyCode::KEY_LEFTMETA,
+            KeyCode::KEY_LEFTCTRL,
+            KeyCode::KEY_LEFTSHIFT,
+            KeyCode::KEY_LEFTALT,
+        ] {
+            let d = out.iter().filter(|e| e.code() == key.0 && e.value() == 1).count();
+            let u = out.iter().filter(|e| e.code() == key.0 && e.value() == 0).count();
+            assert_eq!(d, u, "{label}: {:?} 不配平 {d}下/{u}up", key);
+        }
+    }
+
+    /// Meta 先松、主键后松 —— 最常见也最危险
+    #[test]
+    fn meta_released_before_key() {
+        let keys = [
+            KeyCode::KEY_SPACE,
+            KeyCode::KEY_W,
+            KeyCode::KEY_Q,
+            KeyCode::KEY_A,
+            KeyCode::KEY_LEFT,
+        ];
+        for key in keys {
+            // 下标 0=Meta, 1=主键；先松 0
+            check(
+                &[KeyCode::KEY_LEFTMETA, key],
+                &[0, 1],
+                "Meta 先松",
+            );
+        }
+    }
+
+    /// 三键，穷举全部 6 种松开顺序
+    #[test]
+    fn all_release_orders_for_meta_mod_key() {
+        let perms: [[usize; 3]; 6] = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        for key in [KeyCode::KEY_SPACE, KeyCode::KEY_W, KeyCode::KEY_A] {
+            for p in perms {
+                check(
+                    &[KeyCode::KEY_LEFTMETA, KeyCode::KEY_LEFTCTRL, key],
+                    &p,
+                    "Meta+Ctrl+key",
+                );
+            }
+        }
+    }
+}
+
+/// 「先松修饰键、主键未松、又按新键」——真实输入里极常见。
+///
+/// 症状：输出侧残留按下的修饰键，之后每个键都带上它
+/// （空格变成 Cmd+空格、W 变成 Cmd+W）。
+#[cfg(test)]
+mod mid_release_interleave {
+    use super::*;
+    use crate::config::Config;
+
+    fn k(c: u16, v: i32) -> InputEvent {
+        InputEvent::new(EventType::KEY.0, c, v)
+    }
+
+    const META: KeyCode = KeyCode::KEY_LEFTMETA;
+
+    #[test]
+    fn meta_lifted_before_key_then_new_key() {
+        let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
+        let mut out = vec![];
+
+        out.extend(m.translate(&k(META.0, 1)));
+        out.extend(m.translate(&k(KeyCode::KEY_Q.0, 1)));
+        // 先松 Meta，主键 Q 还按着
+        out.extend(m.translate(&k(META.0, 0)));
+        // 此时又按空格
+        out.extend(m.translate(&k(KeyCode::KEY_SPACE.0, 1)));
+
+        let d: Vec<String> = out
+            .iter()
+            .map(|e| format!("{:?}{}", e.code(), if e.value() == 1 { "+" } else { "-" }))
+            .collect();
+        assert!(
+            m.output_down.is_empty() || !m.output_down.contains(&META),
+            "输出侧 Meta 仍处于按下态: output_down={:?} 事件={:?}",
+            m.output_down,
+            d
+        );
+    }
+
+    /// 同上，但走「放行」路径（表里无规则且 Ctrl 槽位被占）
+    #[test]
+    fn meta_lifted_after_passthrough_then_new_key() {
+        let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
+        let mut out = vec![];
+        out.extend(m.translate(&k(KeyCode::KEY_LEFTCTRL.0, 1)));
+        out.extend(m.translate(&k(META.0, 1)));
+        out.extend(m.translate(&k(KeyCode::KEY_W.0, 1)));
+        out.extend(m.translate(&k(META.0, 0)));
+        out.extend(m.translate(&k(KeyCode::KEY_SPACE.0, 1)));
+
+        assert!(
+            !m.output_down.contains(&META),
+            "放行后先松 Meta 再按空格：Meta 残留 output_down={:?}",
+            m.output_down
+        );
+    }
+}
+
+/// 锁屏路径的特有陷阱：`Ctrl+Cmd+Q` 的输出是 `Super+L`，**含 Meta**。
+///
+/// 早期版本测不出问题，因为 `Cmd+Q` 的输出是 `Alt+F4`（不含 Meta）。
+/// 只有当**转换结果本身含 Meta** 时，下面的缺陷才会暴露：
+///
+/// 1. 按下时 Meta 被抑制（`suppressed`），从未进入 output_down
+/// 2. 转换后主动发出 Meta（作为 `Super+L` 的一部分），并记入 injected_mods
+/// 3. 用户先松开 Cmd → 释放路径走 `suppressed.remove()` 分支**提前返回**，
+///    不发释放——但 Meta 此时**确实**在 output_down 里
+/// 4. 之后每个键都带着这个残留的 Super
+///
+/// 实机症状：锁屏后空格变成 Cmd+空格（开概览）、W 变成 Cmd+W。
+#[cfg(test)]
+mod lock_screen_meta_leak {
+    use super::*;
+    use crate::config::Config;
+
+    fn k(c: u16, v: i32) -> InputEvent {
+        InputEvent::new(EventType::KEY.0, c, v)
+    }
+
+    const META: KeyCode = KeyCode::KEY_LEFTMETA;
+
+    /// 先松 Cmd（Q 仍按着），再按空格 —— Meta 不得残留在输出侧
+    #[test]
+    fn lifting_cmd_after_lock_leaves_no_stuck_super() {
+        let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
+        let mut out = vec![];
+
+        out.extend(m.translate(&k(KeyCode::KEY_LEFTCTRL.0, 1)));
+        out.extend(m.translate(&k(META.0, 1)));
+        out.extend(m.translate(&k(KeyCode::KEY_Q.0, 1)));
+        // 用户先松开 Cmd
+        out.extend(m.translate(&k(META.0, 0)));
+        // Q 还按着，此时按空格
+        out.extend(m.translate(&k(KeyCode::KEY_SPACE.0, 1)));
+
+        let d: Vec<String> = out
+            .iter()
+            .map(|e| format!("{:?}{}", e.code(), if e.value() == 1 { "+" } else { "-" }))
+            .collect();
+
+        assert!(
+            !m.output_down.contains(&META),
+            "输出侧 Super 残留：output_down={:?}\n事件序列: {:?}",
+            m.output_down,
+            d
+        );
+    }
+
+    /// 完整键入一段，确认没有修饰键被带进后续按键
+    #[test]
+    fn typing_after_lock_is_clean() {
+        let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
+        let mut out = vec![];
+        // 锁屏
+        for c in [KeyCode::KEY_LEFTCTRL, META, KeyCode::KEY_Q] {
+            out.extend(m.translate(&k(c.0, 1)));
+        }
+        // 松开全部（各种顺序）
+        for c in [META, KeyCode::KEY_Q, KeyCode::KEY_LEFTCTRL] {
+            out.extend(m.translate(&k(c.0, 0)));
+        }
+        // 输密码
+        for c in [KeyCode::KEY_A, KeyCode::KEY_1, KeyCode::KEY_B, KeyCode::KEY_9] {
+            out.extend(m.translate(&k(c.0, 1)));
+            out.extend(m.translate(&k(c.0, 0)));
+        }
+        assert!(
+            m.output_down.is_empty(),
+            "输密码后输出侧应无残留: {:?}",
+            m.output_down
+        );
+        // 数字键不得携带修饰键
+        for e in &out {
+            if e.code() == KeyCode::KEY_9.0 && e.value() == 1 {
+                // 它前面紧邻的按下事件不应有修饰键
+            }
+        }
     }
 }
 
