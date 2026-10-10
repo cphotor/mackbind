@@ -161,11 +161,54 @@ fn main() {
                     if r.desc.is_some() { format!("   # {d}") } else { String::new() });
             }
         }
-        for m in &cfg.cmd_map {
-            if let Some(d) = &m.desc {
-                println!("[config]   cmd {} → {}{}", m.keys.join("+"), m.emit,
-                    format!("   # {d}"));
-            }
+        // 打印整张规则表——不只是带 desc 的那些。
+        //
+        // 这是「到底做了什么」的唯一权威视图：表里有几行、每行管什么，
+        // 一屏可见。desc 仅供人阅读，缺失不影响列出。
+        println!("[config] 规则表（{} 行，Cmd 隐含）:", cfg.rules.len());
+        for r in &cfg.rules {
+            let app = if r.apps.is_empty() {
+                "*".to_string()
+            } else {
+                r.apps.join(",")
+            };
+            let act = match &r.act {
+                crate::config::Action::Emit { mods, key } => {
+                    let mut s = String::new();
+                    for m in mods {
+                        for seg in m.split('-') {
+                            let name = match seg {
+                                "C" => "Ctrl+",
+                                "A" => "Alt+",
+                                "S" => "Shift+",
+                                "M" => "Super+",
+                                o => {
+                                    s.push_str(o);
+                                    s.push('+');
+                                    ""
+                                }
+                            };
+                            s.push_str(name);
+                        }
+                    }
+                    // 主键去掉 KEY_ 前缀并小写：`KEY_DELETE` → `delete`、
+                    // `KEY_LEFTBRACE` → `leftbrace`
+                    let k = key.strip_prefix("KEY_").unwrap_or(key).to_lowercase();
+                    s.push_str(&k);
+                    s
+                }
+                crate::config::Action::DeAccel { feature } => format!("读DE({feature})"),
+                crate::config::Action::TerminalCtrlShift => {
+                    "Ctrl+Shift（若应用如此绑定）".to_string()
+                }
+            };
+            println!(
+                "[config]   {:<28} {:<20} → {}{}",
+                format!("{app}"),
+                format!("Cmd+{}", r.keys.join("+")),
+                act,
+                r.desc.as_deref().map(|d| format!("   # {d}")).unwrap_or_default()
+            );
         }
     }
 

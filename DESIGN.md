@@ -147,7 +147,7 @@ gsettings list-recursively org.gnome.Ptyxis.Shortcuts
 
 ### 例外：ptyxis / konsole 的复制键
 
-这两个终端在**无选中文本**时会把 `Ctrl+Shift+C` 穿透给子进程当作 SIGINT，使「复制」杀掉正在运行的任务（wezterm、ghostty、gnome-terminal 无此问题）。故改用 `Ctrl+Insert`（X11 传统复制键）。由 `app_cmd_map` 承载，判定依据是**行为差异**而非应用名单。
+这两个终端在**无选中文本**时会把 `Ctrl+Shift+C` 穿透给子进程当作 SIGINT，使「复制」杀掉正在运行的任务（wezterm、ghostty、gnome-terminal 无此问题）。故改用 `Ctrl+Insert`（X11 传统复制键）。由规则表中一条按应用限定的 `emit` 承载，判定依据是**行为差异**而非应用名单。
 
 ### 终端判定：按 freedesktop 规范，不枚举
 

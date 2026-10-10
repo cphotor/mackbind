@@ -61,19 +61,77 @@ pub fn is_modifier(code: KeyCode) -> bool {
 /// 这些键按下时进入 `pending` 而非直接透传，因为它们的下游行为
 /// 取决于后续组合（Cmd+C → Ctrl+C）与 Fn 优先级。
 
-/// cmd_map 的索引：主键 + 要求的输入侧修饰键集合。
+/// 已编译规则的一行。
 ///
-/// 不能只用主键做key——`"z"`（Cmd+Z）与 `"S-z"`（Cmd+Shift+Z）主键
-/// 同为 KEY_Z，若只用主键索引会互相覆盖，导致其中一条永远无法命中。
-/// 实测症状：Cmd+Z 退化为裸 z，Cmd+Shift+Z 泄漏出裸 Shift。
-type CmdMapKey = (KeyCode, Vec<KeyCode>);
+/// 输入侧索引由 `(主键, 修饰键集合)` 组成——不能只用主键：`"KEY_Z"`
+/// （Cmd+Z）与 `"S-KEY_Z"`（Cmd+Shift+Z）主键相同，只用主键索引会互相
+/// 覆盖，导致其中一条永远无法命中。实测症状：Cmd+Z 退化为裸 z，
+/// Cmd+Shift+Z 泄漏出裸 Shift。
+type RuleKey = (KeyCode, Vec<KeyCode>);
+
+/// 应用选择子。
+#[derive(Debug, Clone)]
+enum AppMatch {
+    /// 所有应用（表中省略 `apps` 时的默认）
+    Any,
+    /// 终端——按 `.desktop` 的 `Categories=TerminalEmulator` 判定
+    Terminal,
+    /// 按 wm_class 子串匹配
+    Contains(Vec<String>),
+}
+
+impl AppMatch {
+    fn parse(specs: &[String]) -> AppMatch {
+        if specs.is_empty() || specs.iter().any(|s| s == "*") {
+            AppMatch::Any
+        } else if specs.iter().any(|s| s == "TerminalEmulator") {
+            AppMatch::Terminal
+        } else {
+            AppMatch::Contains(specs.to_vec())
+        }
+    }
+
+    fn matches(&self, wm_class: &str, is_term: bool) -> bool {
+        match self {
+            AppMatch::Any => true,
+            AppMatch::Terminal => is_term,
+            AppMatch::Contains(v) => v.iter().any(|a| wm_class.contains(a.as_str())),
+        }
+    }
+}
+
+/// 一条编译后的规则。
+struct CompiledRule {
+    /// 输入侧索引
+    key: RuleKey,
+    /// 主键通配（`keys = ["*"]`）——匹配任意主键
+    wildcard: bool,
+    /// 适用的应用
+    app: AppMatch,
+    /// 动作
+    act: CompiledAction,
+    /// 说明，仅供日志
+    desc: Option<String>,
+}
+
+/// 编译后的动作。`TerminalCtrlShift` 是唯一的条件动作——
+/// 它是否真的加 Shift，取决于目标应用运行时查得的绑定。
+enum CompiledAction {
+    Emit(Vec<KeyCode>, KeyCode),
+    DeAccel(String),
+    TerminalCtrlShift,
+}
 
 /// 已编译的映射规则。
 pub struct Mapper {
     /// remap 规则：原键 → 目标键
     remap: HashMap<KeyCode, KeyCode>,
-    /// cmd_map：(主键, 要求的输入侧修饰键) → (输出侧修饰键, 输出主键)
-    cmd_map: HashMap<CmdMapKey, (Vec<KeyCode>, KeyCode)>,
+    /// **映射规则表**——唯一的映射真源。
+    ///
+    /// 按声明顺序线性查找，首个命中者生效（用户配置追加在末尾，
+    /// 故天然优先）。表很小（数十行），线性扫描比建索引更简单，
+    /// 也让「声明顺序即优先级」这件事保持显式。
+    rules: Vec<CompiledRule>,
     /// **物理状态**：用户当前实际按住的修饰键，按下顺序。
     ///
     /// 反映硬件事实，不因发送事件而改变。每次新键按下时据此匹配组合。
@@ -98,51 +156,97 @@ pub struct Mapper {
     fkey_media: HashMap<KeyCode, KeyCode>,
     /// 焦点窗口是否属于「Ctrl 已被占用」的应用（终端、GVIM）
     ctrl_busy_window: bool,
+    /// 当前焦点窗口是否为终端（`Categories=TerminalEmulator`）
+    is_terminal: bool,
     /// Ctrl 占用应用列表（WM_CLASS / app_id）
     ctrl_busy_apps: Vec<String>,
-    /// 「Ctrl 已被占用」的应用里，这些键需映射为 Ctrl+Shift。
+    /// 「Ctrl 已被占用」的应用**自身**用 Ctrl+Shift 绑定的键。
     ///
-    /// 只包含这些应用**自身用 Ctrl+Shift 绑定**的键（终端的复制、
-    /// 关标签页等）。未列出的键仍走默认的 Ctrl——因为加 Shift 是为了
-    /// 命中它们已有的绑定，而非笼统地「躲冲突」。
+    /// 运行时从 GSettings 查得（见 `set_window_id`），是
+    /// `TerminalCtrlShift` 动作的判定依据。加 Shift 是为了命中它们
+    /// 已有的绑定，而非笼统「躲冲突」。
     terminal_bindings: Vec<KeyCode>,
-    /// 按应用生效的规则：(应用匹配串列表, 规则表)
-    ///
-    /// 优先于全局 cmd_map 与终端特化。用于「同一按键在不同应用里需要
-    /// 不同输出」——典型是复制键：ptyxis/konsole 会把 Ctrl+Shift+C
-    /// 漏发成 SIGINT，必须改走 Ctrl+Insert。
-    app_cmd_map: Vec<(Vec<String>, HashMap<CmdMapKey, (Vec<KeyCode>, KeyCode)>)>,
-    /// 当前焦点窗口的 wm_class，用于匹配 app_cmd_map
+    /// 当前焦点窗口的 wm_class，用于匹配表的应用列
     wm_class: String,
     /// 是否输出调试日志
     verbose: bool,
 }
 
-/// 把规则列表编译成查找表。
+/// 把规则表编译成可线性扫描的形式。
 ///
 /// `keys` 是键名列表，可能带修饰前缀（如 `"S-z"` 表示 Shift+Z）。
 /// 取最后一段作为主键，前缀作为输入侧修饰键。前缀修饰键排序后参与
-/// 索引，使 `(z,[])` 与 `(z,[Shift])` 成为不同的条目而不互相覆盖。
-fn parse_rules(
-    rules: &[crate::config::CmdMap],
-) -> Result<HashMap<CmdMapKey, (Vec<KeyCode>, KeyCode)>, crate::keys::KeyError> {
-    let mut map = HashMap::new();
-    for m in rules {
+/// 索引，使 `(z,[])` 与 `(z,[Shift])` 成为不同条目而不互相覆盖。
+fn compile_table(
+    rules: &[crate::config::Rule],
+) -> Result<Vec<CompiledRule>, crate::keys::KeyError> {
+    let mut out = Vec::with_capacity(rules.len());
+    for r in rules {
         let mut in_mods: Vec<KeyCode> = Vec::new();
         let mut key: Option<KeyCode> = None;
-        for k in &m.keys {
+        // `keys = ["*"]` 表示主键通配——供 TerminalCtrlShift 这类
+        // 「命中与否取决于运行时状态」的动作使用。
+        let mut wildcard = false;
+        for k in &r.keys {
+            if k == "*" {
+                wildcard = true;
+                continue;
+            }
             let (mods, kc) = parse_combo(k)?;
             in_mods.extend(mods);
             key = Some(kc);
         }
-        let key = key.ok_or_else(|| {
-            crate::keys::KeyError::BadCombo(m.emit.clone(), "keys 为空".into())
-        })?;
-        let (out_mods, out_key) = parse_combo(&m.emit)?;
+        let key = match key {
+            Some(k) => k,
+            // 通配规则本就无固定主键，匹配时不比较主键
+            None if wildcard => KeyCode::KEY_RESERVED,
+            None => {
+                return Err(crate::keys::KeyError::BadCombo(
+                    r.keys.join("+"),
+                    "keys 为空".into(),
+                ))
+            }
+        };
         in_mods.sort();
-        map.insert((key, in_mods), (out_mods, out_key));
+
+        let act = match &r.act {
+            crate::config::Action::Emit { mods, key } => {
+                // `mods` 每项形如 `"C"` 或 `"C-S"`——修饰键缩写，可多个。
+                // 按组合解析会把 `A` 当成 Alt 主键而丢掉，故逐段解析。
+                let mut out_mods = Vec::new();
+                for m in mods {
+                    for seg in m.split('-') {
+                        match crate::keys::modifier_from_abbrev(seg) {
+                            Some(k) => out_mods.push(k),
+                            None => {
+                                return Err(crate::keys::KeyError::BadModifier(
+                                    seg.to_string(),
+                                    "emit 的 mods 只接受 C/A/S/M（可用 - 组合，如 C-S）".into(),
+                                ))
+                            }
+                        }
+                    }
+                }
+                out_mods.sort();
+                out_mods.dedup();
+                let (_, out_key) = parse_combo(key)?;
+                CompiledAction::Emit(out_mods, out_key)
+            }
+            crate::config::Action::DeAccel { feature } => {
+                CompiledAction::DeAccel(feature.clone())
+            }
+            crate::config::Action::TerminalCtrlShift => CompiledAction::TerminalCtrlShift,
+        };
+
+        out.push(CompiledRule {
+            key: (key, in_mods),
+            wildcard,
+            app: AppMatch::parse(&r.apps),
+            act,
+            desc: r.desc.clone(),
+        });
     }
-    Ok(map)
+    Ok(out)
 }
 
 /// GTK 加速键的主键名 → evdev 键码。
@@ -196,7 +300,7 @@ fn de_action_lookup(
 fn de_feature_rule(
     dt: &DesktopType,
     feature: &str,
-) -> Option<(CmdMapKey, Vec<KeyCode>, KeyCode)> {
+) -> Option<(RuleKey, Vec<KeyCode>, KeyCode)> {
     // 功能标识 → 触发该功能的 macOS 按键。当前仅 Cmd+空格（Spotlight）。
     let trigger: KeyCode = match feature {
         "overview" => KeyCode::KEY_SPACE,
@@ -211,6 +315,22 @@ fn de_feature_rule(
     Some(((trigger, Vec::new()), out_mods, key))
 }
 
+    /// 默认语义：`Cmd+X` → `Ctrl+X`。
+///
+/// 不做穷举：macOS 的 Cmd 组合是长尾的，固定表覆盖不全。实测 GNOME 的
+/// 28 个 Super 绑定中仅 `Super+h` 涉及字母，`Super+字母` 基本空闲——
+/// 保留 Super 会让绝大多数组合什么也不发生。
+///
+/// 用户正按住的修饰键（如 Cmd+Shift+Z 的 Shift）需保留，否则翻译时
+/// 松开的修饰键不会再按下，组合就散了。
+fn default_semantics(cur_mods: &[KeyCode], code: KeyCode) -> (Vec<KeyCode>, KeyCode) {
+    let mut mods = cur_mods.to_vec();
+    mods.push(KeyCode::KEY_LEFTCTRL);
+    mods.sort();
+    mods.dedup();
+    (mods, code)
+}
+
 impl Mapper {
     /// 从配置构建。键名解析失败会立即返回错误——配置写错时
     /// 必须大声失败，不能静默忽略。
@@ -222,7 +342,7 @@ impl Mapper {
             remap.insert(from, to);
         }
 
-        let mut cmd_map = parse_rules(&cfg.cmd_map)?;
+        let rules = compile_table(&cfg.rules)?;
 
         // DE 相关规则：读取 DE 现有的绑定，不改写绑定。
         //
@@ -230,28 +350,31 @@ impl Mapper {
         // 已把该动作绑在 `toggle-overview` 上（本机为 `Ctrl+Shift+空格`）。
         // 直接发出同样的键即可，无需在用户配置里留下任何记录——
         // 也不会覆盖用户自己对该键的设置。
-        if cfg.desktop.spotlight {
-            // 按功能标识查表，不按 DE 分支——新增 DE 功能只改表不改逻辑
-            if let Some((trigger, mods, key)) = de_feature_rule(&cfg.desktop.r#type, "overview") {
-                cmd_map.insert(trigger, (mods.clone(), key));
-                if verbose {
-                    eprintln!("[de] Cmd+空格 → 概览（{mods:?} + {key:?}）");
-                }
-            } else if verbose {
+        //
+        // 表里已有一条 `DeAccel{overview}` 行，此处只做可用性检查：
+        // 查得到则该行生效，查不到则整条规则无动作可做。
+        let de_ready = cfg.desktop.spotlight
+            && de_feature_rule(&cfg.desktop.r#type, "overview").is_some();
+        if verbose {
+            if cfg.desktop.spotlight && de_ready {
+                eprintln!("[de] Cmd+空格 → 概览（读 DE 现有绑定）");
+            } else if cfg.desktop.spotlight {
                 eprintln!("[de] 未找到概览绑定，Cmd+空格 不做映射");
             }
         }
 
-        let app_cmd_map = cfg
-            .app_cmd_map
-            .iter()
-            .map(|a| Ok((a.apps.clone(), parse_rules(&a.rules)?)))
-            .collect::<Result<Vec<_>, crate::keys::KeyError>>()?;
+        // 无 DE 支持时剔除该行，避免运行时反复查询
+        let rules = rules
+            .into_iter()
+            .filter(|r| match &r.act {
+                CompiledAction::DeAccel(_) => de_ready,
+                _ => true,
+            })
+            .collect();
 
         Ok(Mapper {
             remap,
-            cmd_map,
-            app_cmd_map,
+            rules,
             held: Vec::new(),
             suppressed: HashSet::new(),
             output_down: Vec::new(),
@@ -261,9 +384,9 @@ impl Mapper {
             fn_mode: cfg.fn_mode.unwrap_or_default(),
             fkey_media: build_fkey_media_table(),
             ctrl_busy_window: false,
+            is_terminal: false,
             ctrl_busy_apps: cfg.ctrl_busy_apps.clone(),
-            terminal_bindings: cfg
-                .terminal_shift_keys
+            terminal_bindings: crate::config::DEFAULT_TERMINAL_SHIFT_KEYS
                 .iter()
                 .map(|k| crate::keys::parse_key(k))
                 .collect::<Result<Vec<_>, _>>()?,
@@ -289,6 +412,7 @@ impl Mapper {
         self.wm_class = id.to_string();
         let is_term = crate::desktop::is_terminal(id);
         let in_list = self.ctrl_busy_apps.iter().any(|t| id.contains(t));
+        self.is_terminal = is_term;
         self.ctrl_busy_window = is_term || in_list;
 
         if is_term {
@@ -452,6 +576,63 @@ impl Mapper {
         }
     }
 
+
+    /// 查表。返回 `(输出修饰键, 输出主键)`，未命中则 `None`。
+    ///
+    /// 线性扫描，按声明顺序取首个命中者。表很小（数十行），
+    /// 且这样「声明顺序即优先级」是显式的，不需额外的排序或索引。
+    fn lookup(&self, code: KeyCode, cur_mods: &[KeyCode]) -> Option<(Vec<KeyCode>, KeyCode)> {
+        for r in &self.rules {
+            if r.key.1 != cur_mods {
+                continue;
+            }
+            if !r.wildcard && r.key.0 != code {
+                continue;
+            }
+            if !r.app.matches(&self.wm_class, self.is_terminal) {
+                continue;
+            }
+            if self.verbose {
+                if let Some(d) = &r.desc {
+                    eprintln!("[mapper] 命中规则: Cmd+{:?} — {d}", code);
+                }
+            }
+            match &r.act {
+                CompiledAction::Emit(mods, key) => return Some((mods.clone(), *key)),
+                CompiledAction::DeAccel(feature) => {
+                    // 读 DE 现有的绑定，发出同样的键。不改写用户配置，
+                    // 用户改了绑定则自动跟上。查不到则跳过该行继续找。
+                    if let Some((trigger, mods, key)) =
+                        de_feature_rule(&crate::config::DesktopType::Gnome, feature)
+                    {
+                        let _ = trigger;
+                        return Some((mods, key));
+                    }
+                    continue;
+                }
+                CompiledAction::TerminalCtrlShift => {
+                    // 条件动作：仅当目标应用**自己**用 Ctrl+Shift 绑定了
+                    // 这个键时才加 Shift。加 Shift 是为了命中它已有的
+                    // 绑定，而不是笼统躲冲突。
+                    //
+                    // 未绑定则落到默认语义——这正是「逐键」而非「整体
+                    // 换语义」的意义：`Cmd+Q` 不在此白名单里，故仍是
+                    // 全局的 Alt+F4，而不会变成谁也不认的 Ctrl+Shift+Q。
+                    if self.ctrl_busy_window && self.terminal_bindings.contains(&code) {
+                        let mut mods = cur_mods.to_vec();
+                        mods.push(KeyCode::KEY_LEFTCTRL);
+                        mods.push(KeyCode::KEY_LEFTSHIFT);
+                        mods.sort();
+                        mods.dedup();
+                        return Some((mods, code));
+                    }
+                    continue;
+                }
+            }
+        }
+        None
+    }
+
     /// 非修饰键的按下处理。
     fn handle_key_press(&mut self, physical: KeyCode) -> Vec<InputEvent> {
         // Fn 预处理：只替换键本身，之后统一走下方流程。
@@ -477,59 +658,14 @@ impl Mapper {
                 .collect();
             cur_mods.sort();
 
-            // 按应用生效的规则最优先。
+            // 查表：按声明顺序线性扫描，首个命中者生效。
             //
-            // 例：ptyxis/konsole 的复制键改走 Ctrl+Insert——这两个终端
-            // 在无选中文本时会把 Ctrl+Shift+C 漏给进程当 SIGINT，
-            // 使「复制」杀掉正在跑的任务。放在终端特化之前，才能
-            // 覆盖掉「Cmd+C → Ctrl+Shift+C」的结果。
-            let app_specific = self
-                .app_cmd_map
-                .iter()
-                .find(|(apps, _)| apps.iter().any(|a| self.wm_class.contains(a)))
-                .and_then(|(_, rules)| rules.get(&(code, cur_mods.clone())).cloned());
-
-            // 其次是全局显式规则（目标键与主键不同者，如 Cmd+[ → Alt+←）
-            let explicit = app_specific
-                .or_else(|| self.cmd_map.get(&(code, cur_mods.clone())).cloned());
-
-            let (out_mods, out_key) = match explicit {
-                Some(v) => v,
-                None if self.ctrl_busy_window && self.terminal_bindings.contains(&code) => {
-                    // 终端里，**终端自身已绑定**的键：Cmd+X → Ctrl+Shift+X。
-                    //
-                    // 这类键加 Shift 正是为了命中终端的 Ctrl+Shift 绑定
-                    // （Ctrl+Shift+C 复制、Ctrl+Shift+W 关标签页…）。
-                    //
-                    // 关键在于这是**逐键白名单**，而非「终端里把整个 Cmd
-                    // 语义换成 Ctrl+Shift」。后者会让 Cmd+Q 变成
-                    // Ctrl+Shift+Q——一个谁也不认的组合；而 macOS 的
-                    // Cmd+Q（退出）对应的 Linux 键是 Alt+F4，属全局规则，
-                    // 不应被终端特化吞掉。
-                    let mut mods = cur_mods.clone();
-                    mods.push(KeyCode::KEY_LEFTCTRL);
-                    mods.push(KeyCode::KEY_LEFTSHIFT);
-                    mods.sort();
-                    mods.dedup();
-                    (mods, code)
-                }
-                None => {
-                    // 默认语义：Cmd+X → Ctrl+X。
-                    //
-                    // 不做穷举：macOS 的 Cmd 组合是长尾的，固定表覆盖不全。
-                    // 实测 GNOME 的 28 个 Super 绑定中仅 Super+h 涉及字母，
-                    // Super+字母 基本空闲——保留 Super 会让绝大多数组合
-                    // 什么也不发生。
-                    //
-                    // 用户正按住的修饰键（如 Cmd+Shift+Z 的 Shift）需保留，
-                    // 否则翻译时松开的修饰键不会再按下，组合就散了。
-                    let mut mods = cur_mods.clone();
-                    mods.push(KeyCode::KEY_LEFTCTRL);
-                    mods.sort();
-                    mods.dedup();
-                    (mods, code)
-                }
-            };
+            // 「声明顺序即优先级」是这张表的核心性质——原先散落在
+            // `app_cmd_map > cmd_map > 终端特化` 三处的优先级关系，
+            // 现在只由规则在表中的位置决定。
+            let (out_mods, out_key) = self
+                .lookup(code, &cur_mods)
+                .unwrap_or_else(|| default_semantics(&cur_mods, code));
 
             if self.verbose {
                 eprintln!(
@@ -646,7 +782,6 @@ impl Mapper {
         vec![InputEvent::new(EventType::KEY.0, code.0, value)]
     }
 }
-
 /// F1-F12 与亮度/媒体键的对应表。
 ///
 /// macBook 键盘顶排是双功能键。裸按时给 F 键，按住 Fn 时给亮度/音量/

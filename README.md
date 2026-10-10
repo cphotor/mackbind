@@ -196,15 +196,49 @@ $MACKBIND_CONFIG                    环境变量指定（最高优先级）
 |选项|默认|说明|
 |---|---|---|
 |`remap`|CapsLock ↔ 左 Ctrl|修饰键替换/互换|
-|`cmd_map`|14 条显式规则|目标键与主键不同者；其余 Cmd 组合走默认的 `Ctrl`|
+|`rules`|29 行|**映射真源**。每行 = `(应用, 按键组合) → 动作`，顺序即优先级|
 |`fn_mode`|`fkeysfirst`|Fn 优先级：`fkeysfirst` / `fkeyslast` / `disabled`|
 |`desktop.type`|`gnome`|桌面环境：`gnome` / `kde` / `none`|
 |`desktop.spotlight`|`true`|`Cmd+空格` 是否映射为概览（读取 DE 现有绑定，不改写）|
 |`ctrl_busy_apps`|`["gvim"]`|终端之外、Ctrl 有非标准含义的应用。**终端无需列举**，按 `.desktop` 的 `Categories=TerminalEmulator` 判定|
-|`terminal_shift_keys`|12 个终端键|在上述应用内映射为 `Ctrl+Shift` 的键|
-|`app_cmd_map`|ptyxis/konsole 复制键|按应用生效的规则覆盖，优先于其他规则|
 
 配置中字段名写错会**直接报错退出**而非静默忽略。
+
+**规则表就是全部映射**——没有散落在别处的隐藏行为。启动时
+`mackbind --verbose` 会打印整张表，每行管什么一屏可见。
+
+### 规则表
+
+三列：`apps`（应用）· `keys`（用户按下的组合，不含 Cmd）· `action`（做什么）。
+
+```toml
+# 全局：Cmd+Q 退出应用
+[[rules]]
+keys   = ["KEY_Q"]
+action = { emit = { mods = ["A"], key = "KEY_F4" } }
+
+# 只在 VSCode 里改写 Cmd+B
+[[rules]]
+apps   = ["code"]
+keys   = ["KEY_B"]
+action = { emit = { mods = ["C"], key = "KEY_B" } }
+
+# Cmd+空格 → 概览：读 DE 现有绑定后发出同样的键
+[[rules]]
+keys   = ["KEY_SPACE"]
+action = { de_accel = "overview" }
+```
+
+三种动作：
+
+|动作|含义|
+|---|---|
+|`emit`|发出固定组合|
+|`de_accel`|读桌面环境现有的绑定，发出同样的键（不改写用户配置）|
+|`terminal_ctrl_shift`|仅当应用**自己**用 `Ctrl+Shift` 绑了该键时才加 Shift|
+
+**顺序即优先级**：自上而下首个命中者生效。你的条目追加在默认之后，
+故天然覆盖默认。
 
 ### 修改示例
 
@@ -215,11 +249,11 @@ remap = []
 # 只把 CapsLock 变成左 Ctrl，不动左 Ctrl 本身
 remap = [{ from = "KEY_CAPSLOCK", to = "KEY_LEFTCTRL" }]
 
-# 加一条自己的快捷键
-[[cmd_map]]
-keys = ["e"]
-emit = "S-e"
-desc = "我的快捷键"
+# 加一条自己的快捷键：Cmd+E → Ctrl+Shift+E
+[[rules]]
+keys   = ["KEY_E"]
+action = { emit = { mods = ["C-S"], key = "KEY_E" } }
+desc   = "我的快捷键"
 
 # 关闭 Fn 优先级
 fn_mode = "disabled"

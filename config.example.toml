@@ -20,19 +20,47 @@
 # desc = "CapsLock → Esc"
 
 # ─────────────────────────────────────────────────────────────
-# Cmd 组合的显式覆盖
+# 映射规则表
 # ─────────────────────────────────────────────────────────────
-# 默认情况下 `Cmd+X` 自动映射为 `Ctrl+X`，无需在此列举。
-# 此表只用于**目标键与主键不同**的情形。
+# **唯一的映射真源。** 每行回答「用户按了什么，该发什么」。
 #
-# 键名可用 evdev 形式（KEY_A、KEY_LEFTBRACE）；带前缀表示输入侧
-# 附加修饰键："S-z" = Shift+Z，"A-Left" = Alt+←。
-# emit 语法：C=Ctrl, A=Alt, S=Shift, M=Cmd。
+# 三列：
+#   apps   适用的应用。省略或 ["*"] = 所有应用。
+#          "TerminalEmulator" = 按 .desktop 的 Categories 判定，
+#          装新终端自动生效。其余按 wm_class 子串匹配。
+#   keys   用户实际按下的组合，**不含 Cmd**（Cmd 是隐含项：按下 Meta
+#          本身不输出，只有组合才决定输出）。
+#          键名用 evdev 形式（KEY_A、KEY_LEFTBRACE）；前缀表示附加
+#          修饰键："S-z" = Shift+Z，"A-Left" = Alt+←。
+#          "*" 表示主键通配（配合 terminal_ctrl_shift 使用）。
+#   action 做什么。两类：
+#          emit              发出固定组合
+#          de_accel          读桌面环境现有的绑定，发出同样的键
+#          terminal_ctrl_shift  仅当应用自己用 Ctrl+Shift 绑了该键才加 Shift
 #
-# [[cmd_map]]
-# keys = ["KEY_HOME"]       # Cmd+Home
-# emit = "A-KEY_HOME"       # → Alt+Home
-# desc = "跳到文稿开头"
+# **顺序即优先级**：自上而下首个命中者生效。你的条目追加在默认之后，
+# 故天然覆盖默认。
+#
+# 查看当前生效的完整表：`mackbind --verbose`（启动时打印）
+#
+# mods 语法：C=Ctrl, A=Alt, S=Shift, M=Cmd，可用 - 组合如 "C-S"。
+#
+# [[rules]]
+# keys   = ["KEY_HOME"]              # Cmd+Home
+# action = { emit = { mods = ["A"], key = "KEY_HOME" } }
+# desc   = "跳到文稿开头"
+#
+# # 只在 VSCode 里把 Cmd+B 改成别的（默认全局已是 Ctrl+B）
+# [[rules]]
+# apps   = ["code"]
+# keys   = ["KEY_B"]
+# action = { emit = { mods = ["C"], key = "KEY_B" } }
+#
+# # 在某个应用里把 Cmd+空格 改成别的动作
+# [[rules]]
+# apps   = ["firefox"]
+# keys   = ["KEY_SPACE"]
+# action = { de_accel = "overview" }
 
 # ─────────────────────────────────────────────────────────────
 # Fn 键优先级
@@ -68,21 +96,32 @@
 # 该组合在 macOS 中是「切换输入法」，语义亦相符。
 # 查不到对应动作时自动跳过，不视为错误。
 #
+# 注意：`Cmd+空格` → 概览这条规则本身已内置在规则表里
+# （`de_accel { feature = "overview" }`），此处只是开关。
+#
 # spotlight = true
-
-# 需扩展提供焦点窗口信息，用于按应用区分（终端特化）：
-# https://extensions.gnome.org/extension/focused-window-dbus/
 
 # ─────────────────────────────────────────────────────────────
 # Ctrl 已被占用的应用
 # ─────────────────────────────────────────────────────────────
-# 在这些应用里，`Cmd` 映射为 **Ctrl+Shift** 而非 Ctrl，以避开
-# 应用内 Ctrl 的既定含义（Ctrl+C 中断、Ctrl+V 块选择等）。
+# 这些应用内 Ctrl 有既定含义（Ctrl+C 中断、Ctrl+V 块选择），
+# Cmd 在其中需映射为 **Ctrl+Shift** 以避开。配合规则表里的
+# `terminal_ctrl_shift` 动作使用。
 #
-# **终端无需列举**——本工具按 freedesktop 桌面条目规范判定：
-# `.desktop` 的 `Categories` 含 `TerminalEmulator` 即视为终端。
+# **终端无需列举**——按 freedesktop 桌面条目规范判定：
+# `.desktop` 的 `Categories` 含 `TerminalEmulator` 即视为终端，
 # 新装的终端自动生效。
 #
 # 此处只用于终端之外的特例，例如独立窗口的 gvim。
 #
 # ctrl_busy_apps = ["gvim", "org.gnome.gedit"]
+
+# ─────────────────────────────────────────────────────────────
+# 需扩展提供焦点窗口信息，用于按应用区分
+# ─────────────────────────────────────────────────────────────
+# https://extensions.gnome.org/extension/focused-window-dbus/
+#
+# 验证是否可用（注意 --dest 必须是 org.gnome.Shell）：
+#   gdbus call --session --dest org.gnome.Shell \
+#     --object-path /org/gnome/shell/extensions/FocusedWindow \
+#     --method org.gnome.shell.extensions.FocusedWindow.Get

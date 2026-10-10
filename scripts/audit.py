@@ -222,35 +222,50 @@ def parse_doc() -> list[dict]:
 # ── 解析代码 ──────────────────────────────────────────────────────────
 
 
-def parse_default_cmd_map() -> set[str]:
-    """src/config.rs 的 DEFAULT_CMD_MAP，取每条规则的输入侧组合。"""
+def parse_rules() -> set[str]:
+    """src/config.rs 的 default_rules()，取每条规则的输入侧组合。
+
+    表驱动重构后，映射真源是 `default_rules()` 里的 `push_emit` 调用。
+    形如 `push_emit(&[], "KEY_LEFT", "C", "Left", "…")`——
+    第二个参数即输入侧组合（不含隐含的 Cmd）。
+
+    注意：只取 `push_emit` 生成的固定输出规则。`TerminalCtrlShift`
+    与 `DeAccel` 走的是条件/运行时动作，由 parse_conditional_rules
+    单独统计。
+    """
     text = CONFIG_RS.read_text(encoding="utf-8")
-    m = re.search(r"DEFAULT_CMD_MAP[^=]*=\s*&\[(.*?)\n\];", text, re.S)
-    if not m:
-        return set()
     out = set()
-    for entry in re.findall(r'\(\s*"([^"]+)"\s*,', m.group(1)):
-        combo = entry.strip()
-        if combo and combo not in ("from", "to"):
+    for m in re.finditer(r'push_emit\(\s*&\[(.*?)\]\s*,\s*"([^"]+)"', text, re.S):
+        apps, combo = m.group(1), m.group(2).strip()
+        if combo:
             out.add(combo)
     return out
 
 
+def parse_conditional_rules() -> set[str]:
+    """条件动作规则覆盖的输入侧组合。
+
+    `keys = vec!["*"]` 表示主键通配——运行时才决定哪些键生效，
+    故不能逐键计入（那正是它存在的理由：终端绑定各终端不同）。
+    """
+    text = CONFIG_RS.read_text(encoding="utf-8")
+    out = set()
+    # push_emit 之外的、显式写了 keys 的规则
+    for m in re.finditer(r'keys:\s*vec!\[([^\]]*)\]', text, re.S):
+        for k in re.findall(r'"([^"]+)"', m.group(1)):
+            k = k.strip()
+            if k and k != "*":
+                out.add(k)
+    return out
+
+
 def parse_terminal_shift_keys() -> set[str]:
+    """终端特化的兜底键集（通配规则之外的静态部分）。"""
     text = CONFIG_RS.read_text(encoding="utf-8")
     m = re.search(r"DEFAULT_TERMINAL_SHIFT_KEYS[^=]*=\s*&\[(.*?)\n\];", text, re.S)
     if not m:
         return set()
     return {k.strip() for k in re.findall(r'"([^"]+)"', m.group(1))}
-
-
-def parse_app_cmd_map() -> set[str]:
-    """app_cmd_map 里的显式规则（本项目仅终端复制键一条）。"""
-    text = CONFIG_RS.read_text(encoding="utf-8")
-    m = re.search(r"app_cmd_map:\s*vec!\[(.*?)\n\s*\],", text, re.S)
-    if not m:
-        return set()
-    return {k.strip() for k in re.findall(r'keys:\s*vec!\["([^"]+)"\]', m.group(1))}
 
 
 def parse_remap() -> set[str]:
@@ -273,9 +288,9 @@ def parse_fn_rules() -> set[str]:
 def main() -> int:
     rows = parse_doc()
     implemented = (
-        parse_default_cmd_map()
+        parse_rules()
+        | parse_conditional_rules()
         | parse_terminal_shift_keys()
-        | parse_app_cmd_map()
     )
     remap = parse_remap()
     fn_rules = parse_fn_rules()

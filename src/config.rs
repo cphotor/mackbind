@@ -37,38 +37,60 @@ pub struct Remap {
     pub desc: Option<String>,
 }
 
-/// Cmd 组合的显式映射规则。
+/// 一条映射规则的动作。
 ///
-/// 默认为空——绝大多数 Cmd 组合由「默认语义」自动处理（`Cmd+X` →
-/// `Ctrl+X`），无需逐条列举。此表用于**目标键与主键不同**的情况，
-/// 如 `Cmd+[` → `Alt+←`。
+/// **动作即函数**：前两种是「发出固定组合」，后两种在**运行时求值**——
+/// 查 DE 现有的绑定、或查终端自己声明的快捷键。这样表负责命名，
+/// 求值交给函数，不必把动态发现的结果冻结成会过期的快照。
+///
+/// 参见 `docs/table-driven-design.md`。
 #[derive(Debug, Clone, Deserialize)]
-pub struct CmdMap {
-    /// 非修饰键，evdev 键码名，如 ["c"]。可带修饰前缀，如 "S-z"。
-    pub keys: Vec<String>,
-    /// 输出组合，如 "C-c"（C=Ctrl, A=Alt, S=Shift, M=Cmd）
-    pub emit: String,
-    #[serde(default)]
-    pub desc: Option<String>,
+#[serde(rename_all = "snake_case")]
+pub enum Action {
+    /// 发出固定组合，如 `Cmd+Q` → `Alt+F4`
+    Emit {
+        /// 输出侧修饰键
+        #[serde(default)]
+        mods: Vec<String>,
+        /// 输出主键
+        key: String,
+    },
+    /// 读取桌面环境对该功能的现有绑定，发出同样的键。
+    ///
+    /// 好处是不在用户配置里留下记录，也不覆盖用户自己的设置；
+    /// 用户改了绑定则自动跟上。查不到时**跳过**（不视为错误）。
+    DeAccel {
+        /// 功能标识，如 `overview`。查表见 `de_action_lookup`。
+        feature: String,
+    },
+    /// 仅当目标应用**自己**用 `Ctrl+Shift` 绑定了这个键时才加 Shift。
+    ///
+    /// 加 Shift 的目的是命中应用已有的绑定，而不是笼统躲冲突。
+    /// 该键集在运行时从 GSettings 查得（见 `set_window_id`），
+    /// 故此处无法写成固定输出——这是本表唯一的「条件」动作。
+    TerminalCtrlShift,
 }
 
-/// 针对特定应用的 Cmd 规则覆盖。
-///
-/// 用于**同一按键在不同应用里需要不同输出**的情形。最典型的例子：
-/// 终端的复制键。Linux 终端系普遍用 `Ctrl+Shift+C`，但 ptyxis 与
-/// konsole 在无选中文本时会把它穿透给进程，当作 SIGINT ——于是
-/// 「复制」会杀掉正在跑的任务。这两个应用必须改用 `Ctrl+Insert`
-///（X11 传统复制键，不会误触发信号）。
-///
-/// Toshy 把这条写死在配置里（`term_sigint_preventer_lst`），此处改为
-/// 数据驱动：判定依据是行为差异，不是应用名单。
+/// 表的一行：`(应用, 按键组合) → 动作`。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AppCmdMap {
-    /// 适用的应用 WM_CLASS / app_id，匹配方式为子串包含
+pub struct Rule {
+    /// 适用的应用。省略或 `["*"]` 表示所有应用。
+    ///
+    /// `"TerminalEmulator"` 是特殊取值——按 `.desktop` 的 `Categories`
+    /// 判定（freedesktop 规范），装新终端自动生效。其余按 wm_class
+    /// 子串匹配。
+    #[serde(default)]
     pub apps: Vec<String>,
-    /// 仅对这些应用生效的规则。优先于全局 `cmd_map`
-    pub rules: Vec<CmdMap>,
+    /// 输入侧组合，不含 Cmd（Cmd 是隐含项：按下 Meta 本身不输出）。
+    /// 如 `["KEY_Q"]`、`["S-KEY_LEFT"]`。
+    pub keys: Vec<String>,
+    /// 动作
+    #[serde(rename = "action")]
+    pub act: Action,
+    /// 可选说明，仅供人阅读
+    #[serde(default)]
+    pub desc: Option<String>,
 }
 
 /// 桌面环境类型。
@@ -125,9 +147,14 @@ pub enum FnMode {
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// 修饰键互换/替换。默认为 CapsLock ↔ 左 Ctrl 互换。
+    ///
+    /// **不在规则表内**：它作用于按键本身而非组合，发生在组合判定之前。
     pub remap: Vec<Remap>,
-    /// Cmd 组合的显式覆盖规则。默认为空。
-    pub cmd_map: Vec<CmdMap>,
+    /// 映射规则表。**唯一的映射真源**——查表即遍历此列表。
+    ///
+    /// 查找顺序即声明顺序，首个命中者生效。用户配置在默认值之后追加，
+    /// 故用户条目天然优先。
+    pub rules: Vec<Rule>,
     /// Fn 键优先级。`None` 表示未指定，保留默认值。
     #[serde(default)]
     pub fn_mode: Option<FnMode>,
@@ -140,77 +167,21 @@ pub struct Config {
     /// 按 freedesktop 规范自动覆盖新装的终端。
     ///
     /// 此项用于终端之外、Ctrl 有非标准含义的应用，如独立窗口的 gvim。
+    ///
+    /// 与规则表里的 `TerminalCtrlShift` 动作配合：命中此名单的应用，
+    /// 该动作才可能生效。
     pub ctrl_busy_apps: Vec<String>,
-    /// 在「Ctrl 已被占用」的应用内，Cmd 需映射为 Ctrl+Shift 的键。
-    ///
-    /// 只列**这些应用自身已用 Ctrl+Shift 绑定**的键：终端的复制
-    /// （Ctrl+Shift+C）、关标签页（Ctrl+Shift+W）、新标签页
-    /// （Ctrl+Shift+T）等。加 Shift 正是为了命中它们。
-    ///
-    /// 之所以逐键列举而非整体换语义：若终端里把 Cmd 一律变成
-    /// Ctrl+Shift，`Cmd+Q` 就会变成 `Ctrl+Shift+Q`——一个谁也不认的
-    /// 组合。而 `Cmd+Q`（退出）对应的 Linux 键是 `Alt+F4`，属跨应用的
-    /// 全局规则，不该被终端特化吞掉。
-    pub terminal_shift_keys: Vec<String>,
-    /// 按应用生效的 Cmd 规则覆盖，优先于全局 `cmd_map` 与终端特化。
-    ///
-    /// 默认为 ptyxis / konsole 的复制键改用 `Ctrl+Insert`——这两个
-    /// 终端在无选中文本时会把 `Ctrl+Shift+C` 穿透给进程当作 SIGINT，
-    /// 使「复制」杀掉正在运行的任务。
-    pub app_cmd_map: Vec<AppCmdMap>,
 }
 
-/// macOS 特有组合的显式映射表（目标键与主键不同者）。
+/// 终端特化的**兜底**键集。
 ///
-/// 依据 Apple 官方快捷键表，详见 `docs/macos-shortcuts.md`。
-const DEFAULT_CMD_MAP: &[(&str, &str, &str)] = &[
-    // ── 光标移动（macOS 用 Cmd/Option，Linux 用 Ctrl/Alt）──
-    ("KEY_LEFT", "C-Left", "行首 (Cmd+←)"),
-    ("KEY_RIGHT", "C-Right", "行尾 (Cmd+→)"),
-    ("KEY_UP", "C-Up", "文稿开头 (Cmd+↑)"),
-    ("KEY_DOWN", "C-Down", "文稿末尾 (Cmd+↓)"),
-    ("S-KEY_LEFT", "C-S-Left", "选中到行首"),
-    ("S-KEY_RIGHT", "C-S-Right", "选中到行尾"),
-    ("S-KEY_UP", "C-S-Up", "选中到文稿开头"),
-    ("S-KEY_DOWN", "C-S-Down", "选中到文稿末尾"),
-    // Option 类：macOS 用 Option 跳词，Linux 用 Alt
-    ("A-KEY_LEFT", "A-Left", "上一词 (Option+←)"),
-    ("A-KEY_RIGHT", "A-Right", "下一词 (Option+→)"),
-    // ── 访达导航（Cmd+[ / Cmd+]）──
-    ("KEY_LEFTBRACE", "A-Left", "上一文件夹 (Cmd+[)"),
-    ("KEY_RIGHTBRACE", "A-Right", "下一文件夹 (Cmd+])"),
-    // ── 删除 ──
-    ("KEY_DELETE", "C-KEY_DELETE", "删左字符 (Ctrl+D)"),
-    // ── 窗口管理 ──
-    // 跨应用的全局规则，故不受终端特化影响。
-    // macOS 的 Cmd+Q 是「退出应用」，Linux 侧最接近的通用绑定是
-    // Alt+F4（GNOME 的 wm.keybindings close）。Toshy 用的是同一条。
-    ("KEY_Q", "A-KEY_F4", "退出应用 (Cmd+Q → Alt+F4)"),
-];
-
-/// 「Ctrl 已被占用」的应用：终端与编辑器。
+/// 运行时优先从终端自己的 GSettings 查得实际绑定（`set_window_id`），
+/// 查不到才用这份名单——适用于不走 GSettings 的终端（kitty、wezterm）。
 ///
-/// 这些应用内 Ctrl 有既定含义（终端 Ctrl+C 中断、GVIM Ctrl+V 块选择），
-/// Cmd 需映射为 Ctrl+Shift 以避免冲突。
-const DEFAULT_CTRL_BUSY_APPS: &[&str] = &[
-    // 终端不再列举——由 `src/desktop.rs` 按 freedesktop 规范的
-    // `Categories=TerminalEmulator` 判定，装了新终端自动生效。
-    //
-    // 曾在此硬编码 14 个终端，结果 ptyxis 漏判：名单写的是小写
-    // `ptyxis`，实际 wm_class 是 `org.gnome.Ptyxis`。
-    //
-    // GVIM：Ctrl+C 退出、Ctrl+V 块选择、Ctrl+D 半选。
-    // 注意终端里跑的 vim 其窗口属于终端，已被 TerminalEmulator 覆盖；
-    // 此处针对独立窗口的 gvim。
-    "gvim",
-];
-
-/// 终端自己用 Ctrl+Shift 绑定的键。
-///
-/// 依据 Toshy 的终端段配置（`default-toshy-config/toshy_config.py`），
-/// 以及 GNOME 终端系（ptyxis / gnome-terminal / Console）的常用绑定。
-/// 这些键在 macOS 是 Cmd 组合，在 Linux 终端里对应 Ctrl+Shift。
-const DEFAULT_TERMINAL_SHIFT_KEYS: &[&str] = &[
+/// 这份名单**必然不完整**：走 GSettings 的终端各自声明不同绑定，
+/// 例如 ptyxis 有 `new-window = Ctrl+Shift+N`，而 `N` 不在此列。
+/// 故表中另有一条 `keys = ["*"]` 的通配行承接运行时发现的键。
+pub const DEFAULT_TERMINAL_SHIFT_KEYS: &[&str] = &[
     "KEY_C",          // 复制
     "KEY_V",          // 粘贴
     "KEY_X",          // 剪切
@@ -225,15 +196,138 @@ const DEFAULT_TERMINAL_SHIFT_KEYS: &[&str] = &[
     "KEY_RIGHTBRACE", // 下一个标签页
 ];
 
-/// 复制键会漏发 SIGINT 的终端。
+/// 会把 `Ctrl+Shift+C` 漏发成 SIGINT 的终端。
 ///
-/// ptyxis 与 konsole 在**无选中文本**时会把 `Ctrl+Shift+C` 穿透给
-/// 子进程，当作 SIGINT ——复制会杀掉正在跑的任务。wezterm、ghostty、
-/// gnome-terminal（VTE 系）无此问题：它们无条件吞掉该组合。
+/// ptyxis 与 konsole 在**无选中文本**时把该组合穿透给子进程当作
+/// SIGINT——「复制」会杀掉正在跑的任务。wezterm、ghostty、
+/// gnome-terminal（VTE 系）无条件吞掉该组合，无此问题。
 ///
-/// 改用 `Ctrl+Insert`（X11 传统复制键）：终端无一例外支持，且不会被
-/// 误当作控制字符发送给进程。
-const SIGINT_LEAKY_TERMINALS: &[&str] = &["org.gnome.Ptyxis", "org.kde.konsole", "konsole"];
+/// 改用 `Ctrl+Insert`（X11 传统复制键）：终端均支持，且不会被当作
+/// 控制字符发给进程。判定依据是**行为差异**，不是应用名单——故此行
+/// 的 `apps` 只是「哪些终端有此行为」，换终端时按行为增删即可。
+const SIGINT_LEAKY_TERMINALS: &[&str] = &["org.gnome.Ptyxis", "org.gnome.konsole", "konsole"];
+
+/// 内置默认规则表。
+///
+/// **这是唯一的映射真源**——用户配置在其之上追加（后者优先命中）。
+/// 完整设计见 `docs/table-driven-design.md`。
+fn default_rules() -> Vec<Rule> {
+    let mut v: Vec<Rule> = Vec::new();
+
+    let mut push_emit = |apps: &[&str], keys: &str, mods: &str, key: &str, desc: &str| {
+        v.push(Rule {
+            apps: apps.iter().map(|s| s.to_string()).collect(),
+            keys: vec![keys.to_string()],
+            act: Action::Emit {
+                mods: if mods.is_empty() {
+                    vec![]
+                } else {
+                    vec![mods.to_string()]
+                },
+                key: key.to_string(),
+            },
+            desc: Some(desc.to_string()),
+        });
+    };
+
+    // ── 光标移动（macOS 用 Cmd/Option，Linux 用 Ctrl/Alt）──
+    push_emit(&[], "KEY_LEFT", "C", "Left", "行首 (Cmd+←)");
+    push_emit(&[], "KEY_RIGHT", "C", "Right", "行尾 (Cmd+→)");
+    push_emit(&[], "KEY_UP", "C", "Up", "文稿开头 (Cmd+↑)");
+    push_emit(&[], "KEY_DOWN", "C", "Down", "文稿末尾 (Cmd+↓)");
+    push_emit(&[], "S-KEY_LEFT", "C-S", "Left", "选中到行首");
+    push_emit(&[], "S-KEY_RIGHT", "C-S", "Right", "选中到行尾");
+    push_emit(&[], "S-KEY_UP", "C-S", "Up", "选中到文稿开头");
+    push_emit(&[], "S-KEY_DOWN", "C-S", "Down", "选中到文稿末尾");
+    push_emit(&[], "A-KEY_LEFT", "A", "Left", "上一词 (Option+←)");
+    push_emit(&[], "A-KEY_RIGHT", "A", "Right", "下一词 (Option+→)");
+    // ── 访达导航（Cmd+[ / Cmd+]）──
+    push_emit(&[], "KEY_LEFTBRACE", "A", "Left", "上一文件夹 (Cmd+[)");
+    push_emit(&[], "KEY_RIGHTBRACE", "A", "Right", "下一文件夹 (Cmd+])");
+    // ── 删除 ──
+    push_emit(&[], "KEY_DELETE", "C", "KEY_DELETE", "删左字符 (Ctrl+D)");
+    // ── 窗口管理 ──
+    // 跨应用的全局规则，故不受终端特化影响。
+    // macOS 的 Cmd+Q 是「退出应用」，Linux 侧最接近的通用绑定是
+    // Alt+F4（GNOME 的 wm.keybindings close）。Toshy 用的是同一条。
+    push_emit(&[], "KEY_Q", "A", "KEY_F4", "退出应用 (Cmd+Q → Alt+F4)");
+
+    // ── 桌面环境功能：读 DE 现有绑定后发出同样的键 ──
+    // 放在末尾：它按主键（空格）匹配，不该被上面的行抢走。
+    v.push(Rule {
+        apps: vec![],
+        keys: vec!["KEY_SPACE".into()],
+        act: Action::DeAccel {
+            feature: "overview".into(),
+        },
+        desc: Some("Cmd+空格 → 概览（读 DE 现有绑定）".into()),
+    });
+
+    // ── 会漏发 SIGINT 的终端：复制键改走 Ctrl+Insert ──
+    // 必须放在终端特化**之前**——查找取首个命中者，若在其后，
+    // 通用终端规则会先命中，本条永不生效。
+    v.push(Rule {
+        apps: SIGINT_LEAKY_TERMINALS.iter().map(|s| s.to_string()).collect(),
+        keys: vec!["KEY_C".into()],
+        act: Action::Emit {
+            mods: vec!["C".into()],
+            key: "KEY_INSERT".into(),
+        },
+        desc: Some(
+            "改用 Ctrl+Insert 复制：ptyxis/konsole 在无选中文本时会把 \
+             Ctrl+Shift+C 当作 SIGINT 漏给进程"
+                .into(),
+        ),
+    });
+
+    // ── GVIM：Ctrl 已被占用（Ctrl+V 块选择、Ctrl+C 退出）──
+    // 终端里跑的 vim 其窗口属于终端，已被 TerminalEmulator 覆盖；
+    // 此处针对独立窗口的 gvim。同样须在通用终端规则之前。
+    for key in DEFAULT_TERMINAL_SHIFT_KEYS {
+        v.push(Rule {
+            apps: vec!["gvim".into()],
+            keys: vec![(*key).to_string()],
+            act: Action::TerminalCtrlShift,
+            desc: Some("GVIM 特化：Ctrl 已被占用".into()),
+        });
+    }
+
+    // ── 终端特化 ──
+    // 命中条件是「终端自己绑定了该键」，故为条件动作。
+    //
+    // 放在最后：更具体的应用规则（上方）须先于它命中。
+    //
+    // 注意 `Cmd+Q` 不在此列：它是 Alt+F4，已被全局规则覆盖。若在此
+    // 列出，Cmd+Q 会变成 Ctrl+Shift+Q——一个谁也不认的组合。
+    //
+    // 用 `keys = ["*"]` 通配而非逐键列举：终端的绑定是**运行时**从
+    // GSettings 查得的，各终端不同（ptyxis 有 `new-window=Ctrl+Shift+N`，
+    // 而 N 不在任何静态名单里）。逐键列举只能覆盖兜底名单，
+    // 运行时发现的键将无处安放——这正是 commit 18c03a2 之前的缺陷。
+    // 通配行承接全部，具体哪些键生效由动作在运行时判定。
+    v.push(Rule {
+        apps: vec!["TerminalEmulator".into()],
+        keys: vec!["*".into()],
+        act: Action::TerminalCtrlShift,
+        desc: Some("终端特化：终端自己绑定了该键时才加 Shift".into()),
+    });
+
+    v
+}
+
+/// 「Ctrl 已被占用」的应用：终端之外的特例。
+///
+/// 终端无需列举——由 `src/desktop.rs` 按 freedesktop 规范的
+/// `Categories=TerminalEmulator` 判定，装了新终端自动生效。
+///
+/// 曾在此硬编码 14 个终端，结果 ptyxis 漏判：名单写的是小写
+/// `ptyxis`，实际 wm_class 是 `org.gnome.Ptyxis`。
+const DEFAULT_CTRL_BUSY_APPS: &[&str] = &[
+    // GVIM：Ctrl+C 退出、Ctrl+V 块选择、Ctrl+D 半选。
+    // 注意终端里跑的 vim 其窗口属于终端，已被 TerminalEmulator 覆盖；
+    // 此处针对独立窗口的 gvim。
+    "gvim",
+];
 
 impl Config {
     /// 内置默认配置。用户配置在此基础上叠加。
@@ -251,14 +345,7 @@ impl Config {
                     desc: Some("左 Ctrl → CapsLock（与上条成对互换）".into()),
                 },
             ],
-            cmd_map: DEFAULT_CMD_MAP
-                .iter()
-                .map(|(keys, emit, desc)| CmdMap {
-                    keys: vec![(*keys).to_string()],
-                    emit: (*emit).to_string(),
-                    desc: Some((*desc).to_string()),
-                })
-                .collect(),
+            rules: default_rules(),
             fn_mode: Some(FnMode::Fkeysfirst),
             desktop: DesktopConfig {
                 spotlight: true,
@@ -268,22 +355,6 @@ impl Config {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
-            terminal_shift_keys: DEFAULT_TERMINAL_SHIFT_KEYS
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect(),
-            app_cmd_map: vec![AppCmdMap {
-                apps: SIGINT_LEAKY_TERMINALS.iter().map(|s| (*s).to_string()).collect(),
-                rules: vec![CmdMap {
-                    keys: vec!["KEY_C".into()],
-                    emit: "C-KEY_INSERT".into(),
-                    desc: Some(
-                        "改用 Ctrl+Insert 复制：ptyxis/konsole 在无选中文本时会把 \
-                         Ctrl+Shift+C 当作 SIGINT 漏给进程"
-                            .into(),
-                    ),
-                }],
-            }],
         }
     }
 }
@@ -323,15 +394,14 @@ pub fn candidate_paths() -> Vec<PathBuf> {
 
 /// 合并用户配置到默认配置之上。
 ///
-/// `remap` / `cmd_map` / `ctrl_busy_apps` 采用**追加**（用户条目在默认
-/// 之后，查找时用户优先命中）；`fn_mode` 采用**替换**。
+/// `rules` / `remap` / `ctrl_busy_apps` 采用**追加**——用户条目在默认
+/// 之后，而查找取**首个命中者**，故用户条目天然优先。
+/// `fn_mode` 采用**替换**。
 impl Config {
     fn merge(&mut self, other: Config) {
         self.remap.extend(other.remap);
-        self.cmd_map.extend(other.cmd_map);
+        self.rules.extend(other.rules);
         self.ctrl_busy_apps.extend(other.ctrl_busy_apps);
-        self.terminal_shift_keys.extend(other.terminal_shift_keys);
-        self.app_cmd_map.extend(other.app_cmd_map);
         if other.fn_mode.is_some() {
             self.fn_mode = other.fn_mode;
         }
@@ -340,9 +410,9 @@ impl Config {
     /// 人类可读的摘要，用于启动日志。
     pub fn summary(&self) -> String {
         format!(
-            "{} 条 remap, {} 条 cmd_map, DE={:?}, {} 个 Ctrl 占用应用",
+            "{} 条 remap, {} 条规则, DE={:?}, {} 个 Ctrl 占用应用",
             self.remap.len(),
-            self.cmd_map.len(),
+            self.rules.len(),
             self.desktop.r#type,
             self.ctrl_busy_apps.len()
         )
