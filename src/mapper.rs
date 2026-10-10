@@ -131,6 +131,8 @@ enum CompiledAction {
         program: String,
         args: Vec<String>,
         confirm: bool,
+        prompt: Option<String>,
+        ok_label: Option<String>,
     },
 }
 
@@ -262,10 +264,14 @@ fn compile_table(
                 program,
                 args,
                 confirm,
+                prompt,
+                ok_label,
             } => CompiledAction::Exec {
                 program: program.clone(),
                 args: args.clone(),
                 confirm: *confirm,
+                prompt: prompt.clone(),
+                ok_label: ok_label.clone(),
             },
         };
 
@@ -736,6 +742,8 @@ impl Mapper {
                     program,
                     args,
                     confirm,
+                    prompt,
+                    ok_label,
                 } => {
                     // 本质是命令而非组合键的操作。
                     //
@@ -754,13 +762,15 @@ impl Mapper {
                             .collect::<String>()
                             + &format!("{:?}", r.key.0)
                     );
-                    crate::exec::run(
+                    crate::exec::run(crate::exec::ExecRequest {
                         program,
                         args,
-                        r.desc.as_deref(),
-                        *confirm,
-                        Some(&key_desc),
-                    );
+                        label: r.desc.as_deref(),
+                        confirm: *confirm,
+                        prompt: prompt.as_deref(),
+                        ok_label: ok_label.as_deref(),
+                        confirm_key: Some(&key_desc),
+                    });
                     // 已产生副作用，无需发出任何按键
                     return Some(Outcome::NoOutput);
                 }

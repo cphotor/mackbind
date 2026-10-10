@@ -85,6 +85,12 @@ pub enum Action {
         /// 免确认的全局热键一旦误按就是永久删除，没有回收站可捞。
         #[serde(default = "default_true")]
         confirm: bool,
+        /// 确认框正文。省略则用自动生成的说明。
+        #[serde(default)]
+        prompt: Option<String>,
+        /// 确认按钮文字。省略则用「执行」。
+        #[serde(default)]
+        ok_label: Option<String>,
     },
 }
 
@@ -462,6 +468,8 @@ for key in DELETE_KEYS {
                 program: "gio".into(),
                 args: vec!["trash".into(), "--empty".into(), "--force".into()],
                 confirm: true,
+                prompt: Some("确定要永久抹掉回收站中的项目吗？".into()),
+                ok_label: Some("清倒回收站".into()),
             },
             desc: Some(format!("{desc}，key={key}")),
         });

@@ -206,6 +206,7 @@ fn main() {
                     program,
                     args,
                     confirm,
+                    ..
                 } => format!(
                     "执行 {}{}{}",
                     program,

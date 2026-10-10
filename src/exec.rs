@@ -144,15 +144,32 @@ fn wait_for_confirmation(prompt: &str, timeout_secs: u64) -> bool {
 /// 这比「无 TTY 即放弃」可用得多——早期那版让该功能完全静默失效，
 /// 用户按了键既没反应也没提示。同时它仍构成一道人工确认：
 /// 误按一次不会立刻删掉东西。
-pub fn run(
-    program: &str,
-    args: &[String],
-    desc: Option<&str>,
-    confirm: bool,
-    confirm_key: Option<&str>,
-) {
+pub struct ExecRequest<'a> {
+    pub program: &'a str,
+    pub args: &'a [String],
+    /// 说明文字，来自规则表的 `desc`
+    pub label: Option<&'a str>,
+    pub confirm: bool,
+    /// 确认框正文。`None` 时自动生成
+    pub prompt: Option<&'a str>,
+    /// 确认按钮文字。`None` 时用「执行」
+    pub ok_label: Option<&'a str>,
+    /// 用于「再按一次同一组合」的描述
+    pub confirm_key: Option<&'a str>,
+}
+
+pub fn run(req: ExecRequest<'_>) {
+    let ExecRequest {
+        program,
+        args,
+        label,
+        confirm,
+        prompt: custom_prompt,
+        ok_label,
+        confirm_key,
+    } = req;
     let risk = classify(program, args);
-    let label = desc.unwrap_or(program);
+    let label = label.unwrap_or(program);
 
     if risk == Risk::Destructive && !confirm {
         eprintln!("[exec] 破坏性命令须显式确认，已拒绝：{label}");
@@ -162,17 +179,19 @@ pub fn run(
     let needs_confirm = confirm || risk == Risk::Destructive;
 
     if needs_confirm {
-        let prompt = format!(
-            "即将执行「{}」：{} {}\n\n此操作不可撤销。",
-            label,
-            program,
-            args.join(" ")
-        );
+        let prompt = custom_prompt.map(|s| s.to_string()).unwrap_or_else(|| {
+            format!(
+                "即将执行「{}」：{} {}\n\n此操作不可撤销。",
+                label,
+                program,
+                args.join(" ")
+            )
+        });
 
         // 优先用模态对话框：用户必须点「执行」，无法被忽略或错过。
         // 早期版本用桌面通知，通知被静音或错过时功能等同于没有——
         // 用户按了键毫无反馈。
-        match confirm_dialog(&prompt) {
+        match confirm_dialog(&prompt, ok_label.unwrap_or("执行")) {
             Some(true) => {
                 spawn(program, args, label);
                 return;
@@ -207,10 +226,11 @@ pub fn run(
 /// 弹出模态确认框。返回 `None` 表示无法弹（无 zenity / 无显示）。
 ///
 /// 在独立线程里等待，**不阻塞按键处理循环**——阻塞会导致整块键盘无响应。
-fn confirm_dialog(prompt: &str) -> Option<bool> {
+fn confirm_dialog(prompt: &str, ok_label: &str) -> Option<bool> {
     use std::sync::mpsc;
     let (tx, rx) = mpsc::channel();
     let text = prompt.to_string();
+    let ok = ok_label.to_string();
 
     std::thread::spawn(move || {
         let out = Command::new("zenity")
@@ -220,6 +240,10 @@ fn confirm_dialog(prompt: &str) -> Option<bool> {
                 "--width=420",
                 "--text",
                 &text,
+                "--ok-label",
+                &ok,
+                "--cancel-label",
+                "取消",
             ])
             .output();
         let ok = match out {
