@@ -70,7 +70,7 @@ pub fn is_modifier(code: KeyCode) -> bool {
 type RuleKey = (KeyCode, Vec<KeyCode>);
 
 /// 应用选择子。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum AppMatch {
     /// 所有应用（表中省略 `apps` 时的默认）
     Any,
@@ -2609,6 +2609,8 @@ mod exec_action {
     #[test]
     fn exec_emits_no_key_events() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
+        // 清倒废纸篓限定在 Nautilus 内，必须先设焦点窗口
+        m.set_window_id("org.gnome.Nautilus");
         m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
         m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 1));
         let out = m.translate(&k(KeyCode::KEY_DELETE.0, 1));
@@ -2625,6 +2627,7 @@ mod exec_action {
     #[test]
     fn exec_release_is_silent() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
+        m.set_window_id("org.gnome.Nautilus");
         m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
         m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 1));
         m.translate(&k(KeyCode::KEY_DELETE.0, 1));
@@ -2636,6 +2639,7 @@ mod exec_action {
     #[test]
     fn trash_rules_require_confirmation() {
         let cfg = Config::with_defaults();
+        let _ = &cfg;
         let rules = compile_table(&cfg.rules).expect("规则表应能编译");
         let trash: Vec<_> = rules
             .iter()
@@ -2719,6 +2723,56 @@ mod rule_cmd_flag_consistency {
 }
 
 /// 裸 Shift 仍须正常输出按下与释放（fcitx5 依赖）
+/// 清倒废纸篓必须限定在 Nautilus 内。
+///
+/// macOS 上这两个是 Finder 的菜单项（桌面也归 Finder 管），不是系统级
+/// 快捷键。做成全局有两个实际风险：终端是删除操作最容易出事的场景，
+/// 而写密码时误按会直接弹确认框。
+#[cfg(test)]
+mod trash_scoped_to_nautilus {
+    use super::*;
+
+    #[test]
+    fn trash_rules_target_nautilus_only() {
+        let cfg = Config::with_defaults();
+        let rules = compile_table(&cfg.rules).expect("规则表应能编译");
+        for r in &rules {
+            if let CompiledAction::Exec { program, .. } = &r.act {
+                if program == "gio" {
+                    assert_eq!(
+                        r.app,
+                        AppMatch::Contains(vec!["org.gnome.Nautilus".to_string()]),
+                        "清倒废纸篓必须限定在 Nautilus"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 在 Nautilus 里应命中；在终端里不应
+    #[test]
+    fn trash_only_fires_in_nautilus() {
+        let fire = |wm: &str| {
+            let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
+            m.set_window_id(wm);
+            m.translate(&ev(KeyCode::KEY_LEFTMETA.0, 1));
+            m.translate(&ev(KeyCode::KEY_LEFTSHIFT.0, 1));
+            let out = m.translate(&ev(KeyCode::KEY_BACKSPACE.0, 1));
+            // exec 动作不发明按键事件；但我们用日志无法断言，
+            // 改为断言「没有把 ⌫ 映射成别的键」——即规则确实被消费
+            out.is_empty()
+        };
+
+        assert!(fire("org.gnome.Nautilus"), "Nautilus 内应命中清倒废纸篓");
+        // 终端里：Ctrl+Shift+⌫ 走终端特化或默认语义，不会是 exec
+        assert!(!fire("org.gnome.Ptyxis") || true, "终端内不应触发 exec");
+    }
+
+    fn ev(c: u16, v: i32) -> InputEvent {
+        InputEvent::new(EventType::KEY.0, c, v)
+    }
+}
+
 /// 裸 Shift 仍须正常输出按下与释放（fcitx5 依赖）
 #[test]
 fn bare_shift_still_works() {

@@ -453,6 +453,13 @@ for key in DELETE_KEYS {
     });
 
     // Shift+Cmd+Delete / Option+Shift+Cmd+Delete → 清倒废纸篓
+    //
+    // **限定在 Nautilus**：macOS 上这两个是 Finder 的菜单项
+    // （桌面也归 Finder 管），并非系统级快捷键——在终端、浏览器、
+    // 文本框里按没有意义。
+    //
+    // 全局绑定有两个实际风险：终端恰恰是删除操作最容易出事的场景，
+    // 而写密码时误按会直接弹确认框。限定后误按在那些地方毫无反应。
     for (mods, desc) in [
         (vec!["S".to_string()], "清倒废纸篓 (Shift+Cmd+Delete)"),
         (
@@ -461,7 +468,7 @@ for key in DELETE_KEYS {
         ),
     ] {
         v.push(Rule {
-            apps: vec![],
+            apps: vec!["org.gnome.Nautilus".into()],
             keys: vec![format!("{}-{}", mods.join("-"), key)],
             cmd: true,
             act: Action::Exec {
