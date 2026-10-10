@@ -421,17 +421,45 @@ impl Mapper {
         self.emit_key(output, 1)
     }
 
-    /// 非修饰键的按下处理。
-    fn handle_key_press(&mut self, code: KeyCode) -> Vec<InputEvent> {
-        // Fn 优先级：Fn 按住时，F 键换成对应的媒体键
-        if self.fn_held && self.fn_mode != FnMode::Disabled {
-            if let Some(media) = self.fkey_media.get(&code).copied() {
-                if self.verbose {
-                    eprintln!("[mapper] Fn+{:?} -> {:?}", code, media);
-                }
-                return self.emit_key(media, 1);
-            }
+    /// Fn 键预处理：F1–F12 在当前 Fn 状态与模式下，实际代表哪个键。
+    ///
+    /// 只做**替换**，绝不提前返回——调用方须继续走正常的组合流程。
+    ///
+    /// 早期实现在此直接 `return emit_key(media, 1)`，绕过了整个 Cmd
+    /// 查表。后果是 `Fn+Meta+Shift+F1`（macOS 上取功能键的组合）会
+    /// 泄漏出 Meta 按下——Meta 此前已被抑制、此处却原样发出——同时
+    /// Ctrl/Shift 丢失。实测输出为 `Meta + 媒体键`，明显不对。
+    ///
+    /// 方向由 [`FnMode`] 决定：
+    /// - `Fkeysfirst`：Fn 未按时出 F 键，按下出媒体键
+    /// - `Fkeyslast`：反之
+    fn resolve_fn(&self, code: KeyCode) -> KeyCode {
+        if self.fn_mode == FnMode::Disabled {
+            return code;
         }
+        // 只需正向查表，无需反向。反向（「媒体键 → F 键」）在内核
+        // fnmode=1 时不会发生：那时内核直接上报 F 键码，F1 进来就
+        // 该原样输出。
+        //
+        // 内核 `fnmode=2`（本机当前值）下的分工：
+        //   F1 → KEY_F1、Fn+F1 → KEY_BRIGHTNESSDOWN  ← 内核已翻译
+        // 此时 `fkey_media` 查得到媒体键才转换，查不到即原样透传。
+        match (self.fn_held, self.fn_mode) {
+            (true, FnMode::Fkeysfirst) | (false, FnMode::Fkeyslast) => {
+                self.fkey_media.get(&code).copied().unwrap_or(code)
+            }
+            _ => code,
+        }
+    }
+
+    /// 非修饰键的按下处理。
+    fn handle_key_press(&mut self, physical: KeyCode) -> Vec<InputEvent> {
+        // Fn 预处理：只替换键本身，之后统一走下方流程。
+        //
+        // `pressed` 仍以**物理键**为键——`handle_release` 拿物理键直接
+        // 查表即可拿到当时的输出，无需重新推断 Fn 状态（Fn 可能已先于
+        // F 键松开，重新推断会得到错误结果）。invariant 2 依赖这一点。
+        let code = self.resolve_fn(physical);
 
         // Cmd 组合处理
         let cmd_held = self
@@ -529,13 +557,13 @@ impl Mapper {
             out.extend(self.emit_key(out_key, 1));
             self.output_down.push(out_key);
             self.injected_mods.extend(out_mods.iter().copied());
-            self.pressed.insert(code, out_key);
+            self.pressed.insert(physical, out_key);
             return out;
         }
 
         // 表外：原样透传
         self.output_down.push(code);
-        self.pressed.insert(code, code);
+        self.pressed.insert(physical, code);
         self.emit_key(code, 1)
     }
 
@@ -586,12 +614,9 @@ impl Mapper {
             return out;
         }
 
-        // Fn 优先级下的 F 键，释放时也要换成媒体键
-        if self.fn_held && self.fn_mode != FnMode::Disabled {
-            if let Some(media) = self.fkey_media.get(&code).copied() {
-                return self.emit_key(media, 0);
-            }
-        }
+        // 无需在此重复 Fn 翻译：按下时已把「物理键 → 输出键」记入
+        // `pressed`（以物理键为键），上面的 `out_key` 分支直接对称释放。
+        // 若在此再翻译，一旦 Fn 先于 F 键松开就会得到错误的键。
 
         // 兜底：未登记的键。输出侧不处于按下态时不应发释放
         // （那是一个无对应按下的多余事件）。
@@ -1491,7 +1516,7 @@ mod release_symmetry {
             "Ctrl+Cmd+Q 不应命中 Cmd+Q 规则（remap 使 Ctrl 变 CapsLock）: {:?}",
             codes
         );
-        // 实际发出 Q，且物理 Ctrl 经 remap 后表现为 CapsLock
+                // 实际发出 Q，且物理 Ctrl 经 remap 后表现为 CapsLock
         assert!(
             codes.contains(&KeyCode::KEY_Q.0),
             "应落到默认语义发出 Q: {:?}",
@@ -1507,5 +1532,131 @@ mod release_symmetry {
         assert_eq!(codes(&d), vec![KeyCode::KEY_LEFTSHIFT.0]);
         let u = m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 0));
         assert_eq!(codes(&u), vec![KeyCode::KEY_LEFTSHIFT.0], "裸 Shift 释放须透传");
+    }
+}
+
+/// Fn 键预处理的回归测试。
+///
+/// 对应一个已修复的真实 bug：Fn 分支曾用 `return` 短路，绕过整个 Cmd
+/// 查表流程。见 `resolve_fn` 的文档注释。
+#[cfg(test)]
+mod fn_resolve {
+    use super::*;
+    use crate::config::FnMode;
+
+    fn k(c: u16, v: i32) -> InputEvent {
+        InputEvent::new(EventType::KEY.0, c, v)
+    }
+
+    fn codes(evs: &[InputEvent]) -> Vec<u16> {
+        evs.iter().map(|e| e.code()).collect()
+    }
+
+    fn mapper(mode: FnMode) -> Mapper {
+        let mut cfg = Config::with_defaults();
+        cfg.fn_mode = Some(mode);
+        Mapper::new(&cfg, false).unwrap()
+    }
+
+    /// fkeysfirst：F1 单独 → F1
+    #[test]
+    fn fkeysfirst_bare_f1_stays_f1() {
+        let mut m = mapper(FnMode::Fkeysfirst);
+        let d = m.translate(&k(KeyCode::KEY_F1.0, 1));
+        assert_eq!(codes(&d), vec![KeyCode::KEY_F1.0]);
+    }
+
+    /// fkeysfirst：Fn+F1 → 亮度减
+    #[test]
+    fn fkeysfirst_fn_f1_becomes_media() {
+        let mut m = mapper(FnMode::Fkeysfirst);
+        m.translate(&k(KeyCode::KEY_FN.0, 1));
+        let d = m.translate(&k(KeyCode::KEY_F1.0, 1));
+        assert_eq!(
+            codes(&d),
+            vec![KeyCode::KEY_BRIGHTNESSDOWN.0],
+            "Fn+F1 应为亮度减"
+        );
+    }
+
+    /// fkeyslast 方向相反：F1 单独 → 亮度减，Fn+F1 → F1
+    #[test]
+    fn fkeyslast_inverts_both_directions() {
+        let mut m = mapper(FnMode::Fkeyslast);
+        let bare = m.translate(&k(KeyCode::KEY_F1.0, 1));
+        assert_eq!(codes(&bare), vec![KeyCode::KEY_BRIGHTNESSDOWN.0]);
+
+        let mut m2 = mapper(FnMode::Fkeyslast);
+        m2.translate(&k(KeyCode::KEY_FN.0, 1));
+        let with_fn = m2.translate(&k(KeyCode::KEY_F1.0, 1));
+        assert_eq!(codes(&with_fn), vec![KeyCode::KEY_F1.0]);
+    }
+
+    /// 核心回归：Fn+Meta+Shift+F1 不得泄漏 Meta（invariant 3）。
+    ///
+    /// 修复前输出为 `Meta+媒体键`——Meta 被原样发出，而它本应被抑制；
+    /// 且 Ctrl/Shift 丢失。修复后应与裸 `Meta+Shift+F1` 同形，仅主键不同。
+    #[test]
+    fn fn_with_other_mods_does_not_leak_meta() {
+        let mut m = mapper(FnMode::Fkeysfirst);
+        m.translate(&k(KeyCode::KEY_FN.0, 1));
+        m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
+        m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 1));
+        let out = m.translate(&k(KeyCode::KEY_F1.0, 1));
+        let c = codes(&out);
+
+        // Meta 若泄漏，会出现按下后无对应释放的孤立事件，
+        // 故其出现次数应为偶数（press/release 配对）。
+        let meta_count = c.iter().filter(|x| **x == KeyCode::KEY_LEFTMETA.0).count();
+        assert_eq!(
+            meta_count % 2,
+            0,
+            "Meta 出现次数应为偶数（按下与释放配对）: {:?}",
+            c
+        );
+
+        // 且必须真正走到 Cmd 查表：注入 Ctrl，而非只发裸媒体键
+        assert!(
+            c.contains(&KeyCode::KEY_LEFTCTRL.0),
+            "应继续走 Cmd 查表并注入 Ctrl: {:?}",
+            c
+        );
+    }
+
+    /// 释放顺序无关：先松 Fn 与先松 F1 都应释放同一个媒体键。
+    ///
+    /// 依赖 `pressed` 以**物理键**为键——若以解析后的键为键，
+    /// Fn 先松开时释放路径会推导出错误的键。
+    #[test]
+    fn release_is_symmetric_regardless_of_fn_order() {
+        for fn_first in [true, false] {
+            let mut m = mapper(FnMode::Fkeysfirst);
+            let mut out = vec![];
+            out.extend(m.translate(&k(KeyCode::KEY_FN.0, 1)));
+            out.extend(m.translate(&k(KeyCode::KEY_F1.0, 1)));
+            if fn_first {
+                out.extend(m.translate(&k(KeyCode::KEY_FN.0, 0)));
+                out.extend(m.translate(&k(KeyCode::KEY_F1.0, 0)));
+            } else {
+                out.extend(m.translate(&k(KeyCode::KEY_F1.0, 0)));
+                out.extend(m.translate(&k(KeyCode::KEY_FN.0, 0)));
+            }
+            let last = out.last().unwrap().code();
+            assert_eq!(
+                last,
+                KeyCode::KEY_BRIGHTNESSDOWN.0,
+                "Fn 先松={} 时最后一个事件须为媒体键释放",
+                fn_first
+            );
+        }
+    }
+
+    /// `Disabled` 模式下不做任何转换
+    #[test]
+    fn disabled_mode_passes_through() {
+        let mut m = mapper(FnMode::Disabled);
+        m.translate(&k(KeyCode::KEY_FN.0, 1));
+        let d = m.translate(&k(KeyCode::KEY_F1.0, 1));
+        assert_eq!(codes(&d), vec![KeyCode::KEY_F1.0]);
     }
 }
