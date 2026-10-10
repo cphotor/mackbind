@@ -82,9 +82,20 @@ pub struct Rule {
     /// 子串匹配。
     #[serde(default)]
     pub apps: Vec<String>,
-    /// 输入侧组合，不含 Cmd（Cmd 是隐含项：按下 Meta 本身不输出）。
+    /// 输入侧组合，**不含 Cmd**（见 `cmd` 字段）。
     /// 如 `["KEY_Q"]`、`["S-KEY_LEFT"]`。
     pub keys: Vec<String>,
+    /// 本规则是否**要求按住 Cmd**。默认 `true`。
+    ///
+    /// 表内绝大多数行都是「Cmd+某键」，故默认要求 Cmd。
+    /// 少数不含 Cmd 的组合（如 macOS 的 `Option+Delete`）须显式写
+    /// `cmd = false`。
+    ///
+    /// **必须有这个区分**：查表对所有组合生效（否则非 Cmd 组合无法
+    /// 配置），若规则不再校验 Cmd 是否按住，则**裸按空格也会命中
+    /// `Cmd+空格` 那条规则**，直接触发 GNOME 概览。
+    #[serde(default = "default_true")]
+    pub cmd: bool,
     /// 动作
     #[serde(rename = "action")]
     pub act: Action,
@@ -218,6 +229,7 @@ fn default_rules() -> Vec<Rule> {
         v.push(Rule {
             apps: apps.iter().map(|s| s.to_string()).collect(),
             keys: vec![keys.to_string()],
+            cmd: true,
             act: Action::Emit {
                 mods: if mods.is_empty() {
                     vec![]
@@ -257,6 +269,7 @@ fn default_rules() -> Vec<Rule> {
     v.push(Rule {
         apps: vec![],
         keys: vec!["KEY_SPACE".into()],
+        cmd: true,
         act: Action::DeAccel {
             feature: "overview".into(),
         },
@@ -277,6 +290,7 @@ fn default_rules() -> Vec<Rule> {
     v.push(Rule {
         apps: vec![],
         keys: vec!["C-KEY_Q".into()],
+        cmd: true,
         act: Action::DeAccel {
             feature: "lock-screen".into(),
         },
@@ -289,6 +303,7 @@ fn default_rules() -> Vec<Rule> {
     v.push(Rule {
         apps: vec![],
         keys: vec!["C-KEY_F".into()],
+        cmd: true,
         act: Action::Emit {
             mods: vec![],
             key: "KEY_F11".into(),
@@ -306,6 +321,8 @@ fn default_rules() -> Vec<Rule> {
     v.push(Rule {
         apps: vec![],
         keys: vec!["A-KEY_DELETE".into()],
+        // 唯一一条不含 Cmd 的规则
+        cmd: false,
         act: Action::Emit {
             mods: vec!["C".into()],
             key: "KEY_DELETE".into(),
@@ -319,6 +336,7 @@ fn default_rules() -> Vec<Rule> {
     v.push(Rule {
         apps: SIGINT_LEAKY_TERMINALS.iter().map(|s| s.to_string()).collect(),
         keys: vec!["KEY_C".into()],
+        cmd: true,
         act: Action::Emit {
             mods: vec!["C".into()],
             key: "KEY_INSERT".into(),
@@ -337,6 +355,7 @@ fn default_rules() -> Vec<Rule> {
         v.push(Rule {
             apps: vec!["gvim".into()],
             keys: vec![(*key).to_string()],
+            cmd: true,
             act: Action::TerminalCtrlShift,
             desc: Some("GVIM 特化：Ctrl 已被占用".into()),
         });
@@ -358,6 +377,7 @@ fn default_rules() -> Vec<Rule> {
     v.push(Rule {
         apps: vec!["TerminalEmulator".into()],
         keys: vec!["*".into()],
+        cmd: true,
         act: Action::TerminalCtrlShift,
         desc: Some("终端特化：终端自己绑定了该键时才加 Shift".into()),
     });

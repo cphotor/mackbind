@@ -106,6 +106,12 @@ struct CompiledRule {
     key: RuleKey,
     /// 主键通配（`keys = ["*"]`）——匹配任意主键
     wildcard: bool,
+    /// 是否要求按住 Cmd
+    ///
+    /// 查表对所有组合生效（否则非 Cmd 组合无法配置），故须显式区分：
+    /// 不校验的话，**裸按空格也会命中 `Cmd+空格` 那条规则**，
+    /// 任何人按空格都弹出 GNOME 概览。
+    requires_cmd: bool,
     /// 适用的应用
     app: AppMatch,
     /// 动作
@@ -243,6 +249,7 @@ fn compile_table(
         out.push(CompiledRule {
             key: (key, in_mods),
             wildcard,
+            requires_cmd: r.cmd,
             app: AppMatch::parse(&r.apps),
             act,
             desc: r.desc.clone(),
@@ -639,8 +646,16 @@ impl Mapper {
     ///
     /// 线性扫描，按声明顺序取首个命中者。表很小（数十行），
     /// 且这样「声明顺序即优先级」是显式的，不需额外的排序或索引。
-    fn lookup(&self, code: KeyCode, cur_mods: &[KeyCode]) -> Option<(Vec<KeyCode>, KeyCode)> {
+    fn lookup(
+        &self,
+        code: KeyCode,
+        cur_mods: &[KeyCode],
+        cmd_held: bool,
+    ) -> Option<(Vec<KeyCode>, KeyCode)> {
         for r in &self.rules {
+            if r.requires_cmd && !cmd_held {
+                continue;
+            }
             if r.key.1 != cur_mods {
                 continue;
             }
@@ -744,7 +759,7 @@ impl Mapper {
             // 表里写了也没用。现已提到分支外。
             //
             // 查表优先；表里没有才轮到默认语义（非 Cmd 组合则原样透传）。
-            let decision = match self.lookup(code, &cur_mods) {
+            let decision = match self.lookup(code, &cur_mods, cmd_held) {
                 Some((m, k)) => Default::Convert(m, k),
                 None if cmd_held => default_semantics(&cur_mods, code),
                 // 非 Cmd 组合且表里没有：原样透传
@@ -2360,6 +2375,85 @@ mod lock_screen_meta_leak {
                 // 它前面紧邻的按下事件不应有修饰键
             }
         }
+    }
+}
+
+/// Cmd 规则必须**要求按住 Cmd**。
+///
+/// 回归测试：查表曾被移出 `if cmd_held` 分支（为支持非 Cmd 组合），
+/// 但规则本身不校验 Meta 是否按住——于是**裸按空格也命中
+/// `Cmd+空格` 那条规则**，任何人按空格都弹出 GNOME 概览。
+///
+/// 现场证据（--trace 抓到的真实输入输出）：
+///   IN KEY_SPACE 按下 -> OUT [SHIFT+, CTRL+, SPACE+]
+#[cfg(test)]
+mod cmd_required {
+    use super::*;
+
+    fn k(c: u16, v: i32) -> InputEvent {
+        InputEvent::new(EventType::KEY.0, c, v)
+    }
+
+    fn codes(evs: &[InputEvent]) -> Vec<u16> {
+        evs.iter().map(|e| e.code()).collect()
+    }
+
+    /// 裸空格必须原样透传，绝不能变成 Ctrl+Shift+空格
+    #[test]
+    fn bare_space_is_not_overview() {
+        let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
+        let out = codes(&m.translate(&k(KeyCode::KEY_SPACE.0, 1)));
+        assert_eq!(
+            out,
+            vec![KeyCode::KEY_SPACE.0],
+            "裸空格不应触发概览规则"
+        );
+    }
+
+    /// `Cmd+空格` 仍须命中概览规则
+    #[test]
+    fn cmd_space_still_maps_to_overview() {
+        let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
+        m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
+        let out = codes(&m.translate(&k(KeyCode::KEY_SPACE.0, 1)));
+        assert!(
+            out.contains(&KeyCode::KEY_LEFTSHIFT.0)
+                && out.contains(&KeyCode::KEY_LEFTCTRL.0),
+            "Cmd+空格 应为 GNOME 的 Ctrl+Shift+空格，实际 {:?}",
+            out
+        );
+    }
+
+    /// 裸 A 不得变成 Ctrl+A（默认语义只在 Cmd 组合下生效）
+    #[test]
+    fn bare_letter_is_not_translated() {
+        let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
+        let out = codes(&m.translate(&k(KeyCode::KEY_A.0, 1)));
+        assert_eq!(out, vec![KeyCode::KEY_A.0], "裸 A 应原样输出");
+    }
+
+    /// 不含 Cmd 的规则仍须生效：`Option+Delete` → `Ctrl+Delete`
+    #[test]
+    fn non_cmd_rule_still_works() {
+        let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
+        m.translate(&k(KeyCode::KEY_LEFTALT.0, 1));
+        let evs = m.translate(&k(KeyCode::KEY_DELETE.0, 1));
+        let c = codes(&evs);
+        assert!(
+            c.contains(&KeyCode::KEY_LEFTCTRL.0) && c.contains(&KeyCode::KEY_DELETE.0),
+            "Option+Delete 应为 Ctrl+Delete，实际 {:?}",
+            c
+        );
+        // Alt 只能被**释放**（转换时排空 output_down），不得再按下
+        assert!(
+            !evs
+                .iter()
+                .any(|e| e.code() == KeyCode::KEY_LEFTALT.0 && e.value() == 1),
+            "Alt 不应被再次按下: {:?}",
+            evs.iter()
+                .map(|e| format!("{:?}{}", e.code(), e.value()))
+                .collect::<Vec<_>>()
+        );
     }
 }
 

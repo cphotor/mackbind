@@ -237,6 +237,18 @@ fn main() {
         libc::signal(libc::SIGHUP, handler);
     }
 
+    // --trace：只观察，不接管。
+    //
+    // **不 grab、不创建虚拟设备、不注入任何事件**——键盘完全保持原生
+    // 行为，用户可以正常打字。同时把「输入事件 → 本应发出的事件」
+    // 记录到 stderr，用于诊断映射逻辑。
+    //
+    // 存在的理由：映射一旦生效，键盘就由本程序接管，出现问题时
+    // 用户无法再打字，也就没有办法观察现场。trace 模式绕开这一点。
+    if std::env::args().any(|a| a == "--trace") {
+        run_trace(&target_from_env());
+    }
+
     // 选择目标设备
     let target = match std::env::var("MACKBIND_DEVICE") {
         Ok(p) => std::path::PathBuf::from(p),
@@ -252,7 +264,7 @@ fn main() {
 
     // 建虚拟设备。必须声明完整按键集，否则系统可能不认它是键盘。
     let keys = full_keyboard_capabilities();
-    let vdev = match VirtualDevice::builder() {
+    let mut vdev = match VirtualDevice::builder() {
         Ok(b) => match b
             .name("mackbind (virtual)")
             .with_keys(&keys)
@@ -290,6 +302,33 @@ fn main() {
         std::process::exit(1);
     };
     println!("[grab] 已独占，映射已生效");
+
+    // 主动发出所有修饰键的**释放**事件，清除可能残留的按下态。
+    //
+    // 为什么需要：若此前 mackbind（或任何程序）让某个修饰键卡在按下态，
+    // GNOME 会把它记在**合成器侧**。重启 mackbind 只销毁了虚拟设备，
+    // 合成器并不保证自动清除——于是空格变 Cmd+空格、W 变 Cmd+W，
+    // 且按物理 Cmd 也无济于事（本程序抑制了 Meta 的按下与释放，
+    // GNOME 收不到任何事件来纠正自己的状态）。
+    //
+    // 「无对应的按下」而发释放，对 libinput 是安全的空操作。
+    for key in [
+        evdev::KeyCode::KEY_LEFTMETA,
+        evdev::KeyCode::KEY_RIGHTMETA,
+        evdev::KeyCode::KEY_LEFTCTRL,
+        evdev::KeyCode::KEY_RIGHTCTRL,
+        evdev::KeyCode::KEY_LEFTSHIFT,
+        evdev::KeyCode::KEY_RIGHTSHIFT,
+        evdev::KeyCode::KEY_LEFTALT,
+        evdev::KeyCode::KEY_RIGHTALT,
+        evdev::KeyCode::KEY_CAPSLOCK,
+    ] {
+        let _ = vdev.emit(&[evdev::InputEvent::new(
+            evdev::EventType::KEY.0,
+            key.0,
+            0,
+        )]);
+    }
     // 打印 PID 与退出方式。Ctrl+C 不可用——本程序占用了 Ctrl 与 Cmd，
     // 键盘已无法产生 SIGINT，必须提供明确的替代退出通道。
     println!("[ready] 映射已生效（PID {}）", std::process::id());
@@ -415,6 +454,72 @@ fn pick_keyboard() -> Option<std::path::PathBuf> {
 
 /// 完整的键盘能力集。
 ///
+/// 选定 trace 模式要观察的设备（不 grab，仅读取）。
+fn target_from_env() -> std::path::PathBuf {
+    match std::env::var("MACKBIND_DEVICE") {
+        Ok(p) => std::path::PathBuf::from(p),
+        Err(_) => pick_keyboard().unwrap_or_else(|| {
+            eprintln!("[fatal] 未找到键盘设备");
+            std::process::exit(1);
+        }),
+    }
+}
+
+/// trace 模式：读入事件，跑一遍映射，把结果打到 stderr，不注入。
+fn run_trace(target: &std::path::Path) -> ! {
+    let cfg = match config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[config] {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut mapper = match Mapper::new(&cfg, false) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("[config] 规则解析失败: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut dev = match Device::open(target) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[fatal] 打开设备失败: {e}");
+            std::process::exit(1);
+        }
+    };
+    eprintln!("[trace] 观察 {}（不 grab、不注入）", target.display());
+    loop {
+    let events: Vec<InputEvent> = match dev.fetch_events() {
+        Ok(iter) => iter.collect(),
+        Err(e) => {
+            eprintln!("[fatal] 读取事件失败: {e}");
+            std::process::exit(1);
+        }
+    };
+    for ev in events {
+        if ev.event_type() != EventType::KEY {
+            continue;
+        }
+        let outs = mapper.translate(&ev);
+        let desc = |c: u16| {
+            format!("{:?}", evdev::KeyCode(c))
+        };
+        eprintln!(
+            "[trace] IN {:<22} {} -> OUT [{}]",
+            desc(ev.code()),
+            if ev.value() == 1 { "按下" } else if ev.value() == 0 { "松开" } else { "重复" },
+            outs.iter()
+                .map(|o| format!("{}{}", desc(o.code()),
+                    if o.value() == 1 { "+" } else if o.value() == 0 { "-" } else { "=" }))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    }
+
+}
+
 /// uinput 创建的虚拟设备若不声明某按键，系统会忽略该键的事件。
 /// 因此这里列出 evdev 的全部键码。
 /// 相对轴能力声明。

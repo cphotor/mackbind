@@ -240,6 +240,33 @@ action = { de_accel = "overview" }
 **顺序即优先级**：自上而下首个命中者生效。你的条目追加在默认之后，
 故天然覆盖默认。
 
+规则默认**要求按住 Cmd**（`cmd = true`）。少数不含 Cmd 的组合需显式写
+`cmd = false`，例如：
+
+```toml
+[[rules]]
+keys   = ["A-KEY_DELETE"]
+cmd    = false                                   # 不需要 Cmd
+action = { emit = { mods = ["C"], key = "KEY_DELETE" } }
+```
+
+### 排查映射问题
+
+映射生效后键盘由本程序接管，**出问题时无法打字，也就无法观察现场**。
+`--trace` 模式不接管键盘，只把「输入 → 实际输出」打到 stderr：
+
+```bash
+./target/release/mackbind --trace 2>trace.log
+# 正常打字，然后看另一个终端
+grep '^\[trace\] IN' trace.log
+```
+
+```text
+[trace] IN KEY_SPACE  按下 -> OUT [KEY_SPACE+]                    裸空格原样透传
+[trace] IN KEY_LEFTMETA 按下 -> OUT []                           Cmd 被抑制
+[trace] IN KEY_SPACE  按下 -> OUT [SHIFT+, CTRL+, SPACE+]        Cmd+空格 → 概览
+```
+
 ### 修改示例
 
 ```toml
