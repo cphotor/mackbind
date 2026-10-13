@@ -161,6 +161,31 @@ cargo test
    释放路径对不上，修饰键卡死。
 6. **自动重复事件（`value=2`）与 `MISC` 事件须过滤** —— 否则产生成对的
    按下/释放。
+7. **退出必须真的退得出** —— 否则 `Cleanup` 不执行，修饰键会残留，
+   后果与下面两次 Super 卡死同类。见下方说明。
+
+### 退出路径：别用 `libc::signal()`
+
+现象：关机卡 90 秒，报「A stop job is running for User Manager for UID 1000」，
+最后被 SIGKILL，`Cleanup` 的 Drop 从未执行。
+
+原因：`libc::signal()` 是 BSD 语义，隐含 `SA_RESTART` —— 处理函数返回后，
+内核会**自动重启**被它打断的 `read()`。而主循环正阻塞在 `fetch_events()` 上，
+于是永远回不到循环顶部检查 `SHUTDOWN`，程序一直不退出。
+
+要点：
+
+1. 用 `sigaction` 且 `sa_flags = 0`，让阻塞读返回 `EINTR`
+2. 主循环必须把 `ErrorKind::Interrupted` 当作「继续」，不能当读取错误退出 ——
+   否则任何一次无关信号的 `EINTR` 都会让程序直接退出
+3. **每个**阻塞循环都要能响应 `SHUTDOWN`。`run_trace` 曾漏检查，
+   于是 trace 模式下同样卡死
+4. 签名是 `-> !` 的函数里用 `exit(0)`，不能用 `break`
+
+排查这类卡顿时，先看耗时是否**恰好等于某个超时值**（本例 90 秒 =
+`DefaultTimeoutStopSec=1min 30s`），相等就说明是等超时被 KILL，
+而不是某个 unit 真的在干慢活；`journalctl -b -1` 里搜
+`timed out. Killing` 能直接指出是谁。
 
 ### 两次 Super 卡死事故（同一类，两次）
 
