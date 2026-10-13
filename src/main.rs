@@ -211,7 +211,10 @@ fn main() {
         // This is the only authoritative view of "what it actually does": how
         // many rows the table has and what each governs, all on one screen. desc
         // is for humans only; a missing desc does not affect the listing.
-        println!("[config] rule table ({} rows, Cmd implicit):", cfg.rules.len());
+        println!(
+            "[config] rule table ({} rows; a row without a Cmd+ prefix does not require Cmd):",
+            cfg.rules.len()
+        );
         for r in &cfg.rules {
             let app = if r.apps.is_empty() {
                 "*".to_string()
@@ -262,7 +265,7 @@ fn main() {
             println!(
                 "[config]   {:<28} {:<20} → {}{}",
                 format!("{app}"),
-                format!("Cmd+{}", r.keys.join("+")),
+                format!("{}{}", if r.cmd { "Cmd+" } else { "" }, r.keys.join("+")),
                 act,
                 r.desc.as_deref().map(|d| format!("   # {d}")).unwrap_or_default()
             );
@@ -555,6 +558,13 @@ fn run_trace(target: &std::path::Path) -> ! {
         }
     };
     eprintln!("[trace] observing {} (no grab, no injection)", target.display());
+    // Same lazy focus lookup as the production loop. Without it `wm_class` stays
+    // empty, so **every app-scoped rule silently never matches** and trace reports
+    // "pass-through" for a per-app row that does work in production -- a wrong
+    // answer that looks like a right one. That is precisely the kind of evidence
+    // that sends a diagnosis down the wrong path.
+    let mut last_focus: Option<String> = None;
+    let mut focus_warned = false;
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
             eprintln!("[trace] exit signal received, finishing");
@@ -571,6 +581,29 @@ fn run_trace(target: &std::path::Path) -> ! {
             std::process::exit(1);
         }
     };
+    if events.iter().any(|e| e.event_type() == EventType::KEY) {
+        match focus::focused_wm_class() {
+            Some(wm_class) => {
+                if last_focus.as_deref() != Some(wm_class.as_str()) {
+                    eprintln!("[trace] focused window: {wm_class}");
+                    last_focus = Some(wm_class.clone());
+                    mapper.set_window_id(&wm_class);
+                }
+            }
+            None => {
+                // Say it out loud once: otherwise an app-scoped rule that cannot
+                // match is indistinguishable from one that matched and did nothing.
+                if !focus_warned {
+                    focus_warned = true;
+                    eprintln!(
+                        "[trace] focused window unknown: app-scoped rules cannot match \
+                         (is the focused-window GNOME Shell extension enabled? it is only \
+                         loaded at login)"
+                    );
+                }
+            }
+        }
+    }
     for ev in events {
         if ev.event_type() != EventType::KEY {
             continue;
