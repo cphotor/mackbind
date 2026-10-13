@@ -306,13 +306,13 @@ fn main() {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("[fatal] 创建虚拟键盘失败: {e}");
-                eprintln!("        请确认 /dev/uinput 存在，且当前用户在 input 组中。");
+                uinput_permission_hint();
                 std::process::exit(1);
             }
         },
         Err(e) => {
             eprintln!("[fatal] 无法打开 uinput: {e}");
-            eprintln!("        请确认 /dev/uinput 存在，且当前用户在 input 组中。");
+            uinput_permission_hint();
             std::process::exit(1);
         }
     };
@@ -562,6 +562,22 @@ fn run_trace(target: &std::path::Path) -> ! {
     }
     }
 
+}
+
+/// `/dev/uinput` 打开失败时的排查提示。
+///
+/// 这里刻意按发行版分述：Arch/EndeavourOS 的 udev 默认已放开
+/// `/dev/uinput`，只被「不在 input 组」挡住；而 Debian/Ubuntu 默认是
+/// `root:root 0600`——**加入 input 组也不够**，还需本仓库的 udev 规则。
+/// 只提示「加入 input 组」会让 Ubuntu 用户反复无效尝试。
+fn uinput_permission_hint() {
+    eprintln!("        /dev/uinput 需可读可写。排查：");
+    eprintln!("          · 是否处于 input 组：id -nG");
+    eprintln!("          · Debian/Ubuntu 默认仅 root 可写，需额外安装 udev 规则：");
+    eprintln!("            sudo install -m644 packaging/99-mackbind.rules \\");
+    eprintln!("              /etc/udev/rules.d/99-mackbind.rules");
+    eprintln!("            sudo udevadm control --reload && sudo udevadm trigger");
+    eprintln!("            然后注销重新登录。详见 README「环境要求」。");
 }
 
 /// uinput 创建的虚拟设备若不声明某按键，系统会忽略该键的事件。

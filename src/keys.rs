@@ -84,6 +84,10 @@ const ALIASES: &[(&str, &str)] = &[
     // `de_accel` 读到的 `Print` 解析失败，截图规则会被静默剔除。
     ("print", "KEY_SYSRQ"),
     ("sysrq", "KEY_SYSRQ"),
+    // GNOME 的 `overlay-key` 是**字符串型** schema（值为 `Super`），
+    // 用于「裸按 Super 开概览」。解析它时主键就是这个词，故需此别名。
+    ("super", "KEY_LEFTMETA"),
+    ("meta", "KEY_LEFTMETA"),
 ];
 
 /// 解析单个键名。

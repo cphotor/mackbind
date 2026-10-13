@@ -232,10 +232,10 @@ Shift+Cmd+P                →  Ctrl+Shift+P                打印相关
 `docs/macos-shortcuts.md` 的「实现状态」。
 
 ```
-Shift+Cmd+3 / 4 / 5   截图            → GNOME 自带 PrtSc 体系
-Cmd+Space             Spotlight        → GNOME 概览；无可绑定动作，未实现
+Shift+Cmd+3 / 4 / 5   截图            → 读 GNOME 现有截图绑定（见 macos-shortcuts.md）
+Cmd+Space             Spotlight        → GNOME 概览；读 toggle-overview，未绑定时退回 mutter overlay-key
 Cmd+Del               移到废纸篓        → 依应用而定
-Ctrl+Cmd+Q            锁屏             → Super+L
+Ctrl+Cmd+Q            锁屏             → 读 media-keys screensaver（本机 Super+L）
 Fn 系列               显示台/Dictation → 无等价物
 Cmd+Tab               切换应用         → Super+Tab（分类 B，暂缓）
 ```

@@ -140,6 +140,8 @@ enum CompiledAction {
 enum Outcome {
     /// 发出这组修饰键与主键
     Convert(Vec<KeyCode>, KeyCode),
+    /// 立即「点按」该键（按下后马上松开），不进入输出状态跟踪
+    Tap(KeyCode),
     /// 动作已产生副作用（如执行了命令），**无需发任何按键**
     NoOutput,
 }
@@ -343,6 +345,19 @@ fn de_action_lookup(
     Some((schema.to_string(), key.to_string()))
 }
 
+/// 桌面环境动作的求值结果。
+///
+/// 多数动作是「修饰键 + 主键」的组合，但 GNOME 的概览不是：GNOME 50 起
+/// `toggle-overview` 默认为空（`@as []`），概览改由 mutter 的
+/// `overlay-key`（默认 `Super`）触发——即**裸按 Super 键**。裸按是一次
+/// 「点按」而非组合，无法塞进 `(mods, key)`，故单独表达。
+enum DeKeys {
+    /// 按下这些修饰键后按下主键（物理键松开时一并释放）。
+    Combo(Vec<KeyCode>, KeyCode),
+    /// 该键的一次「点按」：按下后立即松开。
+    Tap(KeyCode),
+}
+
 /// 把某个 DE 功能解析为要发出的组合。
 ///
 /// 步骤统一为：查表拿 schema 与动作键名 → 读该动作的现有加速键 →
@@ -352,15 +367,41 @@ fn de_action_lookup(
 /// 输入侧（哪个 macOS 组合触发它）由规则表的 `keys` 列决定，
 /// 不在此硬编码——否则 `Ctrl+Cmd+Q` 锁屏这类非空格触发就无从表达。
 ///
-/// 返回 `(输出修饰键, 输出主键)`。
-fn de_feature_accel(
-    dt: &DesktopType,
-    feature: &str,
-) -> Option<(Vec<KeyCode>, KeyCode)> {
-    let (schema, action) = de_action_lookup(dt, feature)?;
-    let accel = crate::accel::action_accel(&schema, &action)?;
-    let (mods, key) = crate::accel::parse_accel(&accel)?;
-    Some((mods.into_iter().map(KeyCode::new).collect(), key))
+/// DE 未绑定该动作时退回 [`de_feature_fallback`]，而不是直接判定
+/// 该功能不可用。
+fn de_feature_accel(dt: &DesktopType, feature: &str) -> Option<DeKeys> {
+    if let Some((schema, action)) = de_action_lookup(dt, feature) {
+        if let Some(accel) = crate::accel::action_accel(&schema, &action) {
+            if let Some((mods, key)) = crate::accel::parse_accel(&accel) {
+                return Some(DeKeys::Combo(
+                    mods.into_iter().map(KeyCode::new).collect(),
+                    key,
+                ));
+            }
+        }
+    }
+    de_feature_fallback(dt, feature)
+}
+
+/// DE 动作未绑定时的兜底。
+///
+/// GNOME 50 起 `toggle-overview` 默认未绑定，概览改由 mutter 的
+/// `overlay-key`（默认 `Super`）触发。这不是「读用户现有绑定」，而是
+/// 该版本 GNOME 的**固定行为**，故单独处理。
+///
+/// **只在 `toggle-overview` 确实未绑定时才走这里。** 用户或发行版若
+/// 绑定了它（旧版 GNOME / EndeavourOS 实测为 `Ctrl+Shift+空格`），仍以
+/// 绑定为准——平台差异只做**追加**，不覆盖既有行为。
+fn de_feature_fallback(dt: &DesktopType, feature: &str) -> Option<DeKeys> {
+    use DesktopType::Gnome;
+    match (dt, feature) {
+        (Gnome, "overview") => {
+            let key = crate::accel::action_accel("org.gnome.mutter", "overlay-key")?;
+            let kc = crate::keys::parse_external_key(&key)?;
+            Some(DeKeys::Tap(kc))
+        }
+        _ => None,
+    }
 }
 
 /// DE 功能是否可用。启动时据此剔除表中的 `de_accel` 行，
@@ -539,6 +580,21 @@ impl Mapper {
         }
     }
 
+    /// 测试专用：不查 `.desktop`，直接把窗口标记为「Ctrl 被占用」。
+    ///
+    /// 终端特化的**行为**（Cmd→Ctrl+Shift）与终端的**检测**是两回事：
+    /// 检测由 `desktop::is_terminal` 负责，已有独立测试覆盖。这里要验的
+    /// 是「已判定为终端之后」的映射，故不应受本机装没装某个终端影响——
+    /// 各发行版默认终端不同（Ubuntu 26.04 只有 ptyxis，而它恰好属
+    /// 「漏发 SIGINT」名单，走 Ctrl+Insert 而非 Ctrl+Shift）。
+    #[cfg(test)]
+    pub fn force_ctrl_busy_window(&mut self, id: &str) {
+        self.wm_class = id.to_string();
+        self.is_terminal = true;
+        self.ctrl_busy_window = true;
+        // 保留默认白名单，不查 GSettings：让测试结果与本机装的终端无关。
+    }
+
     /// 处理一个输入事件，产出要注入输出的事件序列（可能为空）。
     pub fn translate(&mut self, ev: &InputEvent) -> Vec<InputEvent> {
         // 1) 透传非按键事件，保持与真实设备一致的时间流
@@ -712,13 +768,14 @@ impl Mapper {
                 CompiledAction::DeAccel(feature) => {
                     // 读 DE 现有的绑定，发出同样的键。不改写用户配置，
                     // 用户改了绑定则自动跟上。启动时已剔除不可用的行，
-                    // 此处仍以 `if let` 兜底——DE 绑定可能在运行中改变。
-                    if let Some((mods, key)) =
-                        de_feature_accel(&self.desktop_type, feature)
-                    {
-                        return Some(Outcome::Convert(mods, key));
+                    // 此处仍以 `match` 兜底——DE 绑定可能在运行中改变。
+                    match de_feature_accel(&self.desktop_type, feature) {
+                        Some(DeKeys::Combo(mods, key)) => {
+                            return Some(Outcome::Convert(mods, key))
+                        }
+                        Some(DeKeys::Tap(k)) => return Some(Outcome::Tap(k)),
+                        None => continue,
                     }
-                    continue;
                 }
                 CompiledAction::TerminalCtrlShift => {
                     // 条件动作：仅当目标应用**自己**用 Ctrl+Shift 绑定了
@@ -835,6 +892,34 @@ impl Mapper {
             // 查表优先；表里没有才轮到默认语义（非 Cmd 组合则原样透传）。
             let decision = match self.lookup(code, &cur_mods, cmd_held) {
                 Some(Outcome::Convert(m, k)) => Default::Convert(m, k),
+                Some(Outcome::Tap(k)) => {
+                    // 「点按」：先把输出侧仍按着的键全部松开，再按下并立即
+                    // 松开目标键，随后立即返回。
+                    //
+                    // 先松开是必须的：`Ctrl+↑` 触发概览时，用户物理上仍按着
+                    // Ctrl，它作为透传修饰键已在输出侧按下。若不清掉，mutter
+                    // 看到的是 `Ctrl+Super` 而非裸 Super，overlay-key 不会触发。
+                    // 组合转换路径（`Default::Convert`）同样先排空 output_down，
+                    // 这里保持一致。
+                    //
+                    // 之所以必须**立即**松开目标键：GNOME 的 overlay-key 在
+                    // 松开时才开概览；若把 Super 留到物理键（空格）松开，期间
+                    // mutter 会把它当成 `Super+空格`（输入法切换）。
+                    //
+                    // 该物理键不进入 `pressed` 的状态跟踪——它不产生持续输出，
+                    // 故其释放事件（handle_release）会因「输出侧未按下」而
+                    // 自然地无输出。
+                    let mut out = Vec::new();
+                    for h in self.output_down.drain(..).collect::<Vec<_>>() {
+                        out.extend(self.emit_key(h, 0));
+                    }
+                    // 上面已把注入的修饰键随 output_down 一并释放，清空记录，
+                    // 避免其释放事件在后续路径里重复发出。
+                    self.injected_mods.clear();
+                    out.extend(self.emit_key(k, 1));
+                    out.extend(self.emit_key(k, 0));
+                    return out;
+                }
                 // 动作已执行完，不该再发按键
                 Some(Outcome::NoOutput) => return Vec::new(),
                 None if cmd_held => default_semantics(&cur_mods, code),
@@ -1057,8 +1142,10 @@ mod tests {
 
     fn terminal_mapper() -> Mapper {
         let mut m = default_mapper();
+        // 注入「已判定为终端」的上下文，而非依赖某台机器上装没装 ghostty
+        // （不同发行版默认终端不同）。终端检测本身由 desktop 的测试覆盖。
         // 用不会漏发 SIGINT 的终端作代表（ptyxis 有单独的规则，见下）
-        m.set_window_id("com.mitchellh.ghostty");
+        m.force_ctrl_busy_window("com.mitchellh.ghostty");
         m
     }
 
@@ -1099,35 +1186,70 @@ mod tests {
         }
     }
 
-    /// `Cmd+空格` 映射为 GNOME 已有的概览绑定（默认 `Ctrl+Shift+空格`）。
+    /// 概览（macOS 的 `Cmd+空格`）随 GNOME 版本有两种形态：
     ///
-    /// 实现方式是**读取** GNOME 对 `toggle-overview` 的现有绑定再发出
-    /// 同样的键，而非改写绑定——因此不在用户配置里留下记录，也不影响
-    /// 用户自己对该键的设置。
+    /// - 旧版：`toggle-overview` 已绑定（EndeavourOS 实测 `Ctrl+Shift+空格`）
+    /// - GNOME 50 起：该动作默认未绑定（`@as []`），概览改由 mutter 的
+    ///   `overlay-key`（裸按 `Super`）触发，对应一次 Super 点按
     ///
-    /// 该组合在 macOS 中是 `Cmd+Ctrl+空格`（切换输入法），语义亦相符。
+    /// 两者都必须让 `Cmd+空格` 产出与动作一致的输出。
     #[test]
     fn cmd_space_maps_to_gnome_overview() {
-        let Some((out_mods, out_key)) = de_feature_accel(&DesktopType::Gnome, "overview") else {
-            // 本机未装 GNOME 或动作未绑定，跳过而非误判
+        let Some(feature) = de_feature_accel(&DesktopType::Gnome, "overview") else {
+            // 本机未装 GNOME，或两种机制都查不到，跳过而非误判
             return;
         };
-        assert!(
-            out_mods.contains(&KeyCode::KEY_LEFTCTRL)
-                && out_mods.contains(&KeyCode::KEY_LEFTSHIFT),
-            "概览应发出 DE 现有的 Ctrl+Shift 组合，实际 {out_mods:?}"
-        );
-        assert_eq!(out_key, KeyCode::KEY_SPACE, "本机 GNOME 的 toggle-overview 绑在空格上");
 
-        // 端到端：Cmd+空格 应产生那组键
+        // 端到端：Cmd+空格 应产生该动作对应的键
         let mut m = default_mapper();
         m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
         let out = desc(&m.translate(&k(KeyCode::KEY_SPACE.0, 1)));
+
+        match feature {
+            DeKeys::Combo(mods, key) => {
+                for m in &mods {
+                    assert!(out.contains(&(m.0, 1)), "修饰键 {m:?} 未输出: {out:?}");
+                }
+                assert!(out.contains(&(key.0, 1)), "主键 {key:?} 未输出: {out:?}");
+            }
+            DeKeys::Tap(key) => {
+                assert!(
+                    out.contains(&(key.0, 1)) && out.contains(&(key.0, 0)),
+                    "overlay-key 应被点按（按下后立即松开），实际 {out:?}"
+                );
+                // 点按必须干净：不得留下任何按下态的输出键，否则 mutter
+                // 看到的是带修饰键的组合，overlay-key 不触发。
+                assert!(
+                    m.output_down.is_empty(),
+                    "点按后输出侧仍残留按下态: {:?}",
+                    m.output_down
+                );
+            }
+        }
+    }
+
+    /// `Ctrl+↑`（`cmd = false`）也必须能触发概览。
+    ///
+    /// 关键差异：Ctrl 是用户物理按住的**透传**修饰键，落在 output_down 里。
+    /// 若点按前不清掉它，mutter 收到的是 `Ctrl+Super` 而非裸 Super，
+    /// overlay-key 不会开概览。本测试专门覆盖这一点——比 Cmd+空格 更严格。
+    #[test]
+    fn ctrl_up_overview_is_a_clean_tap() {
+        // 仅当概览走「点按」路径时才有意义（旧版为组合，已在上面覆盖）
+        if !matches!(
+            de_feature_accel(&DesktopType::Gnome, "overview"),
+            Some(DeKeys::Tap(_))
+        ) {
+            return;
+        }
+
+        let mut m = default_mapper();
+        m.translate(&k(KeyCode::KEY_LEFTCTRL.0, 1));
+        let out = desc(&m.translate(&k(KeyCode::KEY_UP.0, 1)));
         assert!(
-            out.contains(&(KeyCode::KEY_LEFTCTRL.0, 1))
-                && out.contains(&(KeyCode::KEY_LEFTSHIFT.0, 1))
-                && out.contains(&(KeyCode::KEY_SPACE.0, 1)),
-            "Cmd+空格 应发出 Ctrl+Shift+空格，实际 {out:?}"
+            m.output_down.is_empty(),
+            "点按前须释放透传的 Ctrl，实际残留 {:?}：{out:?}",
+            m.output_down
         );
     }
 
@@ -1155,6 +1277,8 @@ mod tests {
         assert_eq!(p("F4"), Some(KeyCode::KEY_F4));
         assert_eq!(p("w"), Some(KeyCode::KEY_W));
         assert_eq!(p("KEY_A"), Some(KeyCode::KEY_A));
+        // GNOME 的 `overlay-key` 值是字符串 `Super`，概览兜底要能解析它
+        assert_eq!(p("Super"), Some(KeyCode::KEY_LEFTMETA));
         assert_eq!(p(""), None);
         assert_eq!(p("NotAKey"), None);
     }
@@ -2492,12 +2616,25 @@ mod cmd_required {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
         m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
         let out = codes(&m.translate(&k(KeyCode::KEY_SPACE.0, 1)));
-        assert!(
-            out.contains(&KeyCode::KEY_LEFTSHIFT.0)
-                && out.contains(&KeyCode::KEY_LEFTCTRL.0),
-            "Cmd+空格 应为 GNOME 的 Ctrl+Shift+空格，实际 {:?}",
-            out
-        );
+        // 概览的形态随 GNOME 版本而异：旧版是组合（Ctrl+Shift+空格），
+        // GNOME 50 起是裸 Super 的一次点按。这里只断言「确实命中了概览」，
+        // 具体形态由 `cmd_space_maps_to_gnome_overview` 覆盖。
+        match de_feature_accel(&DesktopType::Gnome, "overview")
+            .expect("本机 GNOME 的概览应可解析")
+        {
+            DeKeys::Combo(mods, key) => {
+                for mm in &mods {
+                    assert!(out.contains(&mm.0), "概览修饰键 {mm:?} 缺失: {out:?}");
+                }
+                assert!(out.contains(&key.0), "概览主键 {key:?} 缺失: {out:?}");
+            }
+            DeKeys::Tap(key) => {
+                assert!(
+                    out.contains(&key.0),
+                    "Cmd+空格 应点按 {key:?}，实际 {out:?}"
+                );
+            }
+        }
     }
 
     /// 裸 A 不得变成 Ctrl+A（默认语义只在 Cmd 组合下生效）

@@ -28,7 +28,7 @@ mackbind 采用的模型：**`Cmd` 即 `Ctrl`，规则表只管例外**。默认
 - **CapsLock ↔ 左 Ctrl 位置互换**，两个键在 GUI 与终端下均发真 Ctrl
 - **`Cmd+X` 默认映射为 `Ctrl+X`** —— 不做穷举，长尾组合自动生效（`Cmd+E`、`Cmd+B` 等原表未收录的组合同样可用）
 - **14 条显式规则** —— 目标键与主键不同者：`Cmd+Q` → `Alt+F4`、光标移动、`Cmd+[` `Cmd+]` → `Alt+←` `Alt+→` 等
-- **`Cmd+空格` → 概览** —— 读取桌面环境现有的绑定并发出同样的键，不改写你的设置
+- **`Cmd+空格` → 概览** —— 优先读取桌面环境现有的绑定并发出同样的键；GNOME 50 起该动作默认未绑定，改发一次 `overlay-key`（裸按 Super）。均不改写你的设置
 - **终端逐键特化** —— 终端内 `Cmd+C` → `Ctrl+Shift+C` 复制，而 `Ctrl+C` 仍是中断。GNOME 系终端的快捷键直接读其 GSettings schema，改过绑定也能跟上
 - **Fn 键优先级** —— 用户态实现 F 键与亮度/媒体键的切换，无需修改内核参数或 root 权限
 
@@ -38,7 +38,7 @@ mackbind 采用的模型：**`Cmd` 即 `Ctrl`，规则表只管例外**。默认
 
 |macOS|Linux|状态|
 |---|---|---|
-|`Cmd+空格` Spotlight|GNOME 概览|✅ 读取 GNOME 现有绑定后发出同样的键|
+|`Cmd+空格` Spotlight|GNOME 概览|✅ 读 GNOME 现有 `toggle-overview` 绑定；GNOME 50 起该动作默认未绑，改发 `overlay-key` 点按|
 |`Cmd+Tab` / `Cmd+H`|Super 组合|**暂缓**。Super 在 Linux 上是 Windows 键语义，与 macOS Cmd 不等价|
 |显示桌面|`show-desktop`|动作存在但默认未绑定，实现需写入用户账户设置|
 |`Shift+Cmd+Delete` 清倒废纸篓|`gio trash`|未实现|
@@ -105,7 +105,32 @@ MacBook 的键盘与触控板是同一个 evdev 设备。本工具独占该设�
 
 - Linux（evdev + uinput）
 - Rust 1.64+（编译需要）
-- 当前用户在 `input` 组
+- 一个 C 链接器（Rust 链接可执行文件时必需）。Ubuntu/Debian：
+  `sudo apt install build-essential`；否则会报
+  `error: linker \`cc\` not found`
+- 当前用户能访问 `/dev/input/event*` 与 `/dev/uinput`
+
+**权限因发行版而异，这一步最容易卡住。先看本机实况：**
+
+```bash
+ls -l /dev/input/event* /dev/uinput
+```
+
+Ubuntu 26.04 实测：
+
+```text
+/dev/input/eventN   root:input  0660   ← 加入 input 组可读
+/dev/uinput         root:root   0600   ← 普通用户打不开
+```
+
+因此 Debian 系**必须**做两件事：把用户加入 `input` 组（读物理键盘），
+并用本仓库提供的 [`packaging/99-mackbind.rules`](packaging/99-mackbind.rules)
+放开 `/dev/uinput`（建虚拟键盘）。只做前者会在创建虚拟键盘时以
+「无法打开 uinput」退出。
+
+> 其他发行版的 `/dev/uinput` 权限可能是放开的（本仓库最初在 EndeavourOS
+> 调试时未遇到此问题），但请以上面的 `ls -l` 实况为准，不要假定。
+> 本规则是**追加**，不会收紧已有配置。
 
 ## 安装
 
@@ -119,6 +144,17 @@ cd mackbind
 cargo build --release
 install -Dm755 target/release/mackbind ~/.local/bin/mackbind
 ```
+
+**Debian/Ubuntu 用户还需放开 `/dev/uinput`**（见「环境要求」）：
+
+```bash
+sudo install -m644 packaging/99-mackbind.rules /etc/udev/rules.d/99-mackbind.rules
+sudo udevadm control --reload && sudo udevadm trigger
+# 然后注销重新登录，使 input 组的新成员关系生效
+```
+
+自检：`ls -l /dev/uinput` 应显示 `root input`，且 `mackbind --list-devices`
+能列出键盘。
 
 安装到 `~/.local/bin/` 而非 `cargo install` 默认的 `~/.cargo/bin/`，是因为 **systemd user service 的 PATH 不包含 `~/.cargo/bin`**，`~/.local/bin` 则是更标准的用户级路径。
 

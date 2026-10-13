@@ -107,14 +107,28 @@ mod tests {
 
     #[test]
     fn detects_installed_terminals() {
-        // 本机应至少装有 ptyxis 与 gnome-terminal
+        // 不同发行版默认终端不同（EndeavourOS 实测有 kgx/gnome-console，
+        // Ubuntu 26.04 只有 ptyxis）。不强求某个具体终端，只断言：
+        // **凡是本机装了的**终端，都能按 Categories 认出来。
+        let candidates = [
+            "org.gnome.Ptyxis",
+            "org.gnome.Console",
+            "org.gnome.Terminal",
+            "kitty",
+            "Alacritty",
+            "com.mitchellh.ghostty",
+            "org.kde.konsole",
+        ];
+        let mut found = 0;
+        for term in candidates {
+            if find_desktop_file(term).is_some() {
+                found += 1;
+                assert!(is_terminal(term), "{term} 应被识别为终端");
+            }
+        }
         assert!(
-            is_terminal("org.gnome.Ptyxis"),
-            "ptyxis 应被识别为终端"
-        );
-        assert!(
-            is_terminal("org.gnome.Console"),
-            "gnome-console 应被识别为终端"
+            found > 0,
+            "本机未找到任何已知终端，测试无意义——请检查桌面条目查找路径"
         );
     }
 
@@ -132,10 +146,18 @@ mod tests {
     }
 
     #[test]
-    fn case_insensitive_filename_lookup() {
+    fn desktop_file_lookup_is_exact_case() {
         // wm_class 大小写需与文件名精确对应（desktop 文件名区分大小写），
-        // 但类别比较不区分大小写
-        let f = find_desktop_file("org.gnome.Ptyxis").expect("应找到 ptyxis 桌面条目");
-        assert!(f.to_string_lossy().contains("org.gnome.Ptyxis"));
+        // 但类别比较不区分大小写。
+        //
+        // 不写死 ptyxis：改用本机任一已装终端，避免依赖具体发行版的默认终端。
+        let Some(term) = ["org.gnome.Ptyxis", "org.gnome.Console", "kitty", "Alacritty"]
+            .into_iter()
+            .find(|t| find_desktop_file(t).is_some())
+        else {
+            return; // 无终端可测
+        };
+        let f = find_desktop_file(term).expect("已确认存在");
+        assert!(f.to_string_lossy().contains(term));
     }
 }

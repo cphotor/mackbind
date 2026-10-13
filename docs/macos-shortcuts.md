@@ -377,7 +377,7 @@ cycle-panels                ['<Control><Alt>Escape']
 |A 应用内通用操作|默认语义，无需列举|
 |C 终端/GVIM 特化|逐键粒度，见下|
 |`Cmd+Q` → `Alt+F4`|全局显式规则（GNOME `wm.keybindings close`）|
-|`Cmd+空格` → 概览|读取 GNOME 的 `toggle-overview` 现有绑定并发出同样的键|
+|`Cmd+空格` → 概览|读 GNOME `toggle-overview` 现有绑定并发出；该动作未绑定时（GNOME 50 起默认如此）改读 mutter `overlay-key` 发一次点按|
 |D 光标移动 / `Cmd+[` `Cmd+]`|`DEFAULT_CMD_MAP` 中 14 条|
 |Delete → `Ctrl+Delete`|`DEFAULT_CMD_MAP`|
 |`Super+l` 锁屏|用户已自设，mackbind 不介入|
@@ -473,22 +473,33 @@ Apple 快捷键表里列了四条与电源键的组合：
 
 ## 附：概览（Spotlight）的实现
 
-macOS 的 `Cmd+空格` 对应 GNOME 的活动概览。GNOME 为此提供了可绑定动作：
+macOS 的 `Cmd+空格` 对应 GNOME 的活动概览。GNOME 为此提供过可绑定动作：
 
 ```bash
 gsettings get org.gnome.shell.keybindings toggle-overview
-# ['<Shift><Control>space']
+# 旧版 GNOME / EndeavourOS 实测：['<Shift><Control>space']
+# GNOME 50 起（含 Ubuntu 26.04）：@as []（未绑定）
 ```
 
-mackbind 的做法是**读取这个现有绑定并发出同样的键**，而非改写绑定。因此：
+**GNOME 50 起该动作默认为空**，概览改由 mutter 的 `overlay-key`
+（默认 `Super`）触发——即**裸按 Super 键**。这是该版本的固定行为，
+不是「用户没绑」。
 
-- 不在用户配置（dconf）里留下任何记录
-- 不影响用户自己对该键的设置
-- 用户改了绑定，mackbind 自动跟上
+mackbind 的处理因此分两层：
 
-该组合在 macOS 中是 `Cmd+Ctrl+空格`（切换输入法），语义亦相符。
+1. 优先**读取 `toggle-overview` 现有绑定并发出同样的键**（旧版路径）
+2. 该动作未绑定时，退回读取 `org.gnome.mutter overlay-key`，发出一次
+   该修饰键的**点按**（GNOME 50 路径）
 
-注：`Super+space`（GNOME 的输入法切换）在 mackbind 模型下不会被占用——默认语义不产生 Super。二者不再冲突，无需「让位」。
+**只做追加，不覆盖**：只要 `toggle-overview` 已绑定，就永远走第 1 条，
+旧环境行为不变。两条路径都不改写用户配置，也不影响用户自己的设置。
+
+点按为什么必须「按下后立即松开」：GNOME 的 overlay-key 在**松开**时才开
+概览；若把 Super 留到物理键（空格）松开，期间 mutter 会把它当成
+`Super+空格`（输入法切换）。
+
+注：`Super+space`（GNOME 的输入法切换）在 mackbind 模型下不会被占用
+——默认语义不产生 Super。二者不再冲突，无需「让位」。
 
 ### 一度误判为不可行
 
