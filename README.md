@@ -1,5 +1,7 @@
 # mackbind
 
+[![version](https://img.shields.io/github/v/tag/cphotor/mackbind)](CHANGELOG.md)
+
 Reproduce macOS keybindings on Linux while keeping native Linux modifier semantics fully intact.
 
 ## Why it exists
@@ -467,6 +469,15 @@ cargo clippy              # static checks
 ```
 
 See [`DESIGN.md`](DESIGN.md) for architecture and design decisions.
+
+## Versioning
+
+The current version is defined in **exactly one place**: the `version` field in
+[`Cargo.toml`](Cargo.toml). Everything else derives from it rather than repeating
+it — the startup log reads it at compile time, and the badge at the top of this
+file reads it from the git tag. [`CHANGELOG.md`](CHANGELOG.md) records released
+versions, and `scripts/audit.py` fails if its newest entry disagrees with
+`Cargo.toml`, so the number cannot drift.
 
 ## License
 

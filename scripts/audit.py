@@ -21,6 +21,9 @@ The Cmd key is implicit in the internal representation -- pressing Meta itself
 emits no event; only a combo of "Meta + some main key + some modifiers" matches
 a rule. So `Cmd` in the docs is not encoded, while the other modifiers are
 encoded as usual (Shift→S, Option→A, Ctrl→C).
+
+It also guards the version number: `Cargo.toml` is the single source of truth,
+and this script fails if the newest `CHANGELOG.md` heading disagrees with it.
 """
 
 from __future__ import annotations
@@ -33,6 +36,8 @@ ROOT = Path(__file__).resolve().parent.parent
 DOC = ROOT / "docs" / "macos-shortcuts.md"
 CONFIG_RS = ROOT / "src" / "config.rs"
 MAPPER_RS = ROOT / "src" / "mapper.rs"
+CARGO_TOML = ROOT / "Cargo.toml"
+CHANGELOG = ROOT / "CHANGELOG.md"
 
 # ── Key-name mapping ──────────────────────────────────────────────────
 # Doc spelling → evdev key-name stem (without the KEY_ prefix)
@@ -320,6 +325,42 @@ def parse_fn_rules() -> set[str]:
 # ── Report ────────────────────────────────────────────────────────────
 
 
+def parse_cargo_version() -> str | None:
+    """The one authoritative version: `[package] version` in Cargo.toml."""
+    text = CARGO_TOML.read_text(encoding="utf-8")
+    m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
+    return m.group(1) if m else None
+
+
+def parse_changelog_version() -> str | None:
+    """The newest released heading in CHANGELOG.md, e.g. `## [0.1.0] - ...`."""
+    text = CHANGELOG.read_text(encoding="utf-8")
+    m = re.search(r"^##\s*\[([^\]]+)\]", text, re.M)
+    return m.group(1) if m else None
+
+
+def check_version() -> list[str]:
+    """The version number has a single source of truth: Cargo.toml.
+
+    Everything else either derives from it (the startup log reads it at compile
+    time; the README badge reads the git tag) or records it (CHANGELOG.md). This
+    check keeps that record from ever drifting away from the source.
+    """
+    errors: list[str] = []
+    cargo_v = parse_cargo_version()
+    changelog_v = parse_changelog_version()
+    if cargo_v is None:
+        errors.append(f"{CARGO_TOML.name}: no [package] version found")
+    if changelog_v is None:
+        errors.append(f"{CHANGELOG.name}: no '## [x.y.z]' heading found")
+    if cargo_v and changelog_v and cargo_v != changelog_v:
+        errors.append(
+            f"version mismatch: {CARGO_TOML.name} says {cargo_v} but "
+            f"{CHANGELOG.name}'s newest entry says {changelog_v}"
+        )
+    return errors
+
+
 def main() -> int:
     rows = parse_doc()
     implemented = (
@@ -383,11 +424,21 @@ def main() -> int:
             print(f"  {macos:<28} target {target:<22} expected {combo}")
         print()
 
-    if not missing and not misfiled:
+    version_errors = check_version()
+    if version_errors:
+        print("── Version drift: the single source of truth is Cargo.toml ──\n")
+        for e in version_errors:
+            print(f"  {e}")
+        print()
+
+    if not missing and not misfiled and not version_errors:
         print("Docs and implementation agree.")
         return 0
 
-    print(f"{len(missing)} missing, {len(misfiled)} questionable classification.")
+    print(
+        f"{len(missing)} missing, {len(misfiled)} questionable classification, "
+        f"{len(version_errors)} version error(s)."
+    )
     return 1 if "--strict" in sys.argv else 0
 
 

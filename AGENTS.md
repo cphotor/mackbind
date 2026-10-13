@@ -29,6 +29,12 @@ Consequences to keep in mind:
   question mark, and so on), not just Han characters:
   `git ls-files | xargs grep -lP '[\x{4e00}-\x{9fff}\x{3000}-\x{303f}\x{ff01}-\x{ff60}\x{ffe0}-\x{ffe6}]'`
   should print nothing.
+- **The version number has a single source of truth: `Cargo.toml`'s
+  `[package] version`.** Never hardcode it anywhere else. The startup log reads
+  it at compile time (`env!("CARGO_PKG_VERSION")`), the README badge reads the git
+  tag, and `CHANGELOG.md` records it. `scripts/audit.py` fails if the changelog's
+  newest heading disagrees with `Cargo.toml`. To cut a release: bump `Cargo.toml`,
+  add the matching changelog heading, and tag `vX.Y.Z` (taken from that same value).
 
 ## 1. Before claiming a capability does not exist, check that you are looking in the right place
 

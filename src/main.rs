@@ -184,6 +184,10 @@ fn main() {
 
     let verbose = flag("-v") || flag("--verbose") || std::env::var("MACKBIND_VERBOSE").is_ok();
 
+    // The version is defined in exactly one place: Cargo.toml's `[package]
+    // version`. Read it at compile time, so no hand-copied string can drift from it.
+    println!("[version] mackbind v{}", env!("CARGO_PKG_VERSION"));
+
     // Config: a parse failure must exit loudly, never silently run with defaults.
     let cfg = match config::load() {
         Ok(c) => c,
