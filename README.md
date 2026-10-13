@@ -29,9 +29,10 @@ Works out of the box, no configuration needed:
 
 - **CapsLock ↔ Left Ctrl swap** — both keys emit a real Ctrl in both GUI and terminal
 - **`Cmd+X` defaults to `Ctrl+X`** — no enumeration; long-tail combos just work (`Cmd+E`, `Cmd+B`, and any combo absent from the table)
-- **14 explicit rules** — for cases where the target key differs from the main key: `Cmd+Q` → `Alt+F4`, cursor movement, `Cmd+[` `Cmd+]` → `Alt+←` `Alt+→`, etc.
+- **An explicit rule table (44 rows)** — for cases where the target key differs from the main key: `Cmd+Q` → `Alt+F4`, cursor movement, `Cmd+[` `Cmd+]` → `Alt+←` `Alt+→`, etc. `mackbind --verbose` prints every row
 - **`Cmd+Space` → overview** — prefers the desktop environment's existing binding and emits the same key; since GNOME 50 that action is unbound by default, so it emits a single `overlay-key` tap (a bare Super). Never rewrites your settings
-- **Per-key terminal specialization** — inside a terminal `Cmd+C` → `Ctrl+Shift+C` (copy), while `Ctrl+C` still interrupts. GNOME-family terminals are read from their own GSettings schema, so custom bindings are followed too
+- **Per-key terminal specialization** — inside a terminal `Cmd+C` → `Ctrl+Shift+C` (copy), while `Ctrl+C` still interrupts; ptyxis and konsole use `Ctrl+Insert` instead, because with no selection they leak `Ctrl+Shift+C` to the process as SIGINT. GNOME-family terminals are read from their own GSettings schema, so custom bindings are followed too
+- **`Shift+Enter` → `Ctrl+J` where the terminal cannot report it** — VTE (gnome-terminal, ptyxis, Tilix, Terminator, Guake) implements neither the kitty keyboard protocol nor `modifyOtherKeys`, so `Shift+Enter` and `Enter` arrive as the same `\r` and an agent TUI submits instead of inserting a newline. `Ctrl+J` is a distinct control character that every terminal transmits unchanged. Scoped per terminal, so kitty/foot/WezTerm/Ghostty/Alacritty keep the real `Shift+Enter`
 - **Fn key priority** — toggles F-keys vs. brightness/media keys in user space, with no kernel parameters or root required
 
 ## Known issues
@@ -151,15 +152,16 @@ cd mackbind
 ./install.sh
 ```
 
-The script does four things in order: build the release binary → install it to `~/.local/bin` → open up `/dev/uinput` (udev rule) → add the current user to the `input` group → install and enable the systemd user service. Steps that need root use `sudo` and may prompt for your password; the script is safe to re-run (idempotent).
+The script runs the whole setup in order: build the release binary → install it to `~/.local/bin` → add the current user to the `input` group → install the udev rule that opens up `/dev/uinput` → install and enable the GNOME Shell extension the per-app rules need (GNOME sessions only) → install and enable the systemd user service. Steps that need root use `sudo` and may prompt for your password; the script is safe to re-run (idempotent).
 
-Afterward, **log out and back in once** so the new `input` group membership takes effect. The service is enabled, so it starts automatically after you log back in.
+Afterward, **log out and back in once**: the new `input` group membership applies only to a new session, and a newly installed GNOME Shell extension is loaded only when the Shell starts. The service is enabled, so it starts automatically after you log back in.
 
 |Option|Effect|
 |---|---|
 |`--no-build`|Skip building; use the existing `target/release/mackbind`|
 |`--no-udev`|Don't install the udev rule (e.g. `/dev/uinput` is already writable)|
 |`--no-group`|Don't modify the `input` group|
+|`--no-extension`|Don't install the GNOME Shell extension (skip if you already have focused-window info, or are not on GNOME)|
 |`--no-service`|Don't install the systemd user service|
 
 Self-check: `ls -l /dev/uinput` should show `root input`, and `mackbind --list-devices` should list your keyboard.
@@ -262,7 +264,7 @@ See [`config.example.toml`](config.example.toml) for an example. Main options:
 |Option|Default|Description|
 |---|---|---|
 |`remap`|CapsLock ↔ Left Ctrl|modifier remap/swap|
-|`rules`|29 rows|**the mapping source of truth**. Each row = `(app, key combo) → action`; order is priority|
+|`rules`|built-in table (44 rows)|**the mapping source of truth**. Each row = `(app, key combo) → action`; order is priority|
 |`fn_mode`|`fkeysfirst`|Fn priority: `fkeysfirst` / `fkeyslast` / `disabled`|
 |`desktop.type`|`gnome`|desktop environment: `gnome` / `kde` / `none`|
 |`desktop.spotlight`|`true`|whether `Cmd+Space` maps to overview (reads the DE's existing binding; never rewrites it)|

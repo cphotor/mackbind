@@ -11,6 +11,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > versions. `scripts/audit.py` fails if the newest heading below disagrees with
 > `Cargo.toml`, so the number cannot drift.
 
+## [0.1.1] - 2026-10-14
+
+### Added
+
+- `Shift+Enter` → `Ctrl+J` inside terminals that cannot report `Shift+Enter`.
+  VTE (gnome-terminal, ptyxis, Tilix, Terminator, Guake) implements neither the
+  kitty keyboard protocol nor `modifyOtherKeys`, so `Shift+Enter` and
+  `Ctrl+Enter` arrive as the same `\r` (0x0D) as bare `Enter`, and an agent TUI
+  submits instead of inserting a newline. `Ctrl+J` is a distinct control
+  character that every terminal transmits unchanged, and readline, vim and the
+  TUIs all read it as a newline. The row is scoped per terminal, so terminals
+  that do report `Shift+Enter` keep it.
+- `install.sh` installs the GNOME Shell focused-window extension the per-app
+  rules need, resolving the bundle from `gnome-shell --version` instead of
+  pinning one version. GNOME sessions only; skip it with `--no-extension`.
+
+### Changed
+
+- `--verbose` no longer writes `Cmd+` on the handful of rows that set
+  `cmd = false`, which read as if Cmd were required.
+
+### Fixed
+
+- Per-app rules silently never matched on a fresh GNOME install: with no
+  focused-window extension the window class is always unknown, so every
+  app-scoped rule fell through to the generic `Cmd → Ctrl` behavior — inside a
+  terminal that meant `Cmd+C` sent `Ctrl+C` (SIGINT) instead of copying.
+- `install.sh --no-service` no longer leaves the service stopped after replacing
+  the binary, which looked exactly like "the mapping is broken".
+- `--trace` now queries the focused window. Without it the window class stayed
+  empty, so trace reported pass-through for app-scoped rules that do work in
+  production — evidence that sends a diagnosis down the wrong path.
+
 ## [0.1.0] - 2026-10-14
 
 First public release.
@@ -70,4 +103,5 @@ First public release.
 - Tests that physically opened the "empty trash" dialog during `cargo test`.
 - A Python bytecode cache that had been committed by accident.
 
+[0.1.1]: https://github.com/cphotor/mackbind/releases/tag/v0.1.1
 [0.1.0]: https://github.com/cphotor/mackbind/releases/tag/v0.1.0
