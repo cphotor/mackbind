@@ -23,8 +23,12 @@ Consequences to keep in mind:
   `Brightness` / `Volume` / `Dashboard` in the macOS-combo column). If you reword
   the doc, update `audit.py` in the same commit — otherwise `audit.py --strict`
   fails.
-- Before committing, grep the tree for CJK to be sure:
-  `grep -rlP '[\x{4e00}-\x{9fff}]' $(git ls-files)` should print nothing.
+- Before committing, grep the tree for CJK to be sure. The check must cover
+  **Han ideographs *and* CJK/full-width punctuation** (U+3000–U+303F and
+  U+FF01–U+FF60: the full-width comma, period, brackets, parentheses, colon,
+  question mark, and so on), not just Han characters:
+  `git ls-files | xargs grep -lP '[\x{4e00}-\x{9fff}\x{3000}-\x{303f}\x{ff01}-\x{ff60}\x{ffe0}-\x{ffe6}]'`
+  should print nothing.
 
 ## 1. Before claiming a capability does not exist, check that you are looking in the right place
 
