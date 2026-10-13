@@ -41,6 +41,35 @@ extern "C" fn handle_signal(_sig: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
 }
 
+/// 安装信号处理：Ctrl+C、SIGTERM、SIGHUP 时置 `SHUTDOWN`，由主循环退出。
+///
+/// **必须用 `sigaction` 且 `sa_flags = 0`，不能直接用 `libc::signal()`。**
+///
+/// `signal()` 是 BSD 语义，隐含 `SA_RESTART`：处理函数返回后，内核会自动
+/// 重启被它打断的 `read()`。而主循环就阻塞在 `fetch_events()` 上，
+/// 于是 `read()` 永远不返回，循环顶部的 `SHUTDOWN` 检查永远执行不到
+/// ——只能等 systemd 90 秒后 SIGKILL，`Cleanup::drop` 也就不会执行，
+/// 虚拟设备上按着的修饰键没人松。
+///
+/// 去掉 `SA_RESTART` 后 `read()` 会返回 `EINTR`，循环才能回到顶部。
+/// 代价是主循环必须自己区分 `Interrupted`（继续）和真正的读取错误（退出）。
+fn install_signal_handlers() {
+    // 先转成函数指针再转整数：函数项直接转整数没有对应的 ABI 保证。
+    let handler: extern "C" fn(libc::c_int) = handle_signal;
+    let handler = handler as libc::sighandler_t;
+
+    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = handler;
+            libc::sigemptyset(&mut action.sa_mask);
+            // 关键：不带 SA_RESTART，让阻塞的 read() 返回 EINTR。
+            action.sa_flags = 0;
+            libc::sigaction(sig, &action, std::ptr::null_mut());
+        }
+    }
+}
+
 /// RAII guard：Drop 时释放 grab 并松开所有按下的键。
 ///
 /// 这是防止键盘失灵的最后一道防线——即使发生 panic，栈展开也会执行
@@ -237,17 +266,8 @@ fn main() {
         return;
     }
 
-    // 注册信号处理：Ctrl+C 与 SIGTERM 时优雅退出并释放 grab。
-    //
-    // 先转成 extern "C" 函数指针再转整数：直接把函数项转成整数会
-    // 被 lint 拦下（函数项与整数之间的隐式转换没有对应的 ABI 保证）。
-    let handler: extern "C" fn(libc::c_int) = handle_signal;
-    let handler = handler as libc::sighandler_t;
-    unsafe {
-        libc::signal(libc::SIGINT, handler);
-        libc::signal(libc::SIGTERM, handler);
-        libc::signal(libc::SIGHUP, handler);
-    }
+    // 注册信号处理：Ctrl+C、SIGTERM、SIGHUP 时优雅退出并释放 grab。
+    install_signal_handlers();
 
     // --trace：只观察，不接管。
     //
@@ -364,6 +384,11 @@ fn main() {
 
         let events: Vec<InputEvent> = match cleanup.device.as_mut().unwrap().fetch_events() {
             Ok(iter) => iter.collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                // 被信号打断：回顶部检查 SHUTDOWN 后再读。
+                // 不能当作致命错误 break —— 收到 SIGTERM 也会走到这里。
+                continue;
+            }
             Err(e) => {
                 eprintln!("[error] 读取事件失败: {e}");
                 break;
@@ -502,8 +527,15 @@ fn run_trace(target: &std::path::Path) -> ! {
     };
     eprintln!("[trace] 观察 {}（不 grab、不注入）", target.display());
     loop {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            eprintln!("[trace] 收到退出信号，结束");
+            // 本函数签名是 `-> !`，用 exit 而非 break 保持「永不返回」。
+            std::process::exit(0);
+        }
     let events: Vec<InputEvent> = match dev.fetch_events() {
         Ok(iter) => iter.collect(),
+        // 被信号打断：回顶部检查 SHUTDOWN 后再读（见 install_signal_handlers）
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
         Err(e) => {
             eprintln!("[fatal] 读取事件失败: {e}");
             std::process::exit(1);
