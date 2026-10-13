@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 #
-# mackbind 卸载脚本
+# mackbind uninstall script
 #
-# 默认移除：systemd 用户服务、~/.local/bin/mackbind、udev 规则。
-# 默认**不动** input 组——别的工具可能也在用，需要时用 --remove-group 显式移除。
+# By default removes: the systemd user service, ~/.local/bin/mackbind, and the udev rule.
+# By default it does **not** touch the input group — other tools may use it too; remove it
+# explicitly with --remove-group if needed.
 #
-# 用法：
-#   ./uninstall.sh                 # 常规卸载（保留 input 组）
-#   ./uninstall.sh --remove-group  # 顺便把当前用户移出 input 组
-#   ./uninstall.sh -h | --help     # 显示帮助
+# Usage:
+#   ./uninstall.sh                 # normal uninstall (keeps the input group)
+#   ./uninstall.sh --remove-group  # also remove the current user from the input group
+#   ./uninstall.sh -h | --help     # show help
 #
-# 需要 root 的步骤（删 udev 规则 / 改组）会用 sudo。
+# Steps that need root (removing the udev rule / changing the group) use sudo.
 
 set -euo pipefail
 
@@ -23,15 +24,15 @@ DO_GROUP=0
 
 usage() {
   cat <<'USAGE'
-mackbind 卸载脚本
+mackbind uninstall script
 
-用法：./uninstall.sh [选项]
+Usage: ./uninstall.sh [options]
 
-选项：
-  --remove-group   顺便把当前用户移出 input 组（默认保留）
-  -h, --help       显示本帮助
+Options:
+  --remove-group   also remove the current user from the input group (kept by default)
+  -h, --help       show this help
 
-默认移除 systemd 用户服务、~/.local/bin/mackbind、udev 规则。
+By default removes the systemd user service, ~/.local/bin/mackbind, and the udev rule.
 USAGE
 }
 
@@ -39,7 +40,7 @@ for arg in "$@"; do
   case "$arg" in
     --remove-group) DO_GROUP=1 ;;
     -h|--help)      usage; exit 0 ;;
-    *)              printf '未知参数：%s（用 --help 查看用法）\n' "$arg" >&2; exit 2 ;;
+    *)              printf 'Unknown argument: %s (use --help for usage)\n' "$arg" >&2; exit 2 ;;
   esac
 done
 
@@ -57,46 +58,46 @@ as_root() {
 }
 ME="$(id -un)"
 
-# ── 1. 停用并删除 systemd 服务 ──────────────────────────────────────────
+# ── 1. Stop and remove the systemd service ──────────────────────────────
 if [ -f "$UNIT" ] || systemctl --user cat mackbind.service >/dev/null 2>&1; then
-  info "停止并禁用服务"
+  info "Stopping and disabling the service"
   systemctl --user disable --now mackbind 2>/dev/null || true
 fi
 
 if [ -f "$UNIT" ]; then
-  info "删除服务单元 → $UNIT"
+  info "Removing service unit → $UNIT"
   rm -f "$UNIT"
 fi
 systemctl --user daemon-reload 2>/dev/null || true
 systemctl --user reset-failed mackbind 2>/dev/null || true
 
-# ── 2. 删除二进制 ───────────────────────────────────────────────────────
+# ── 2. Remove the binary ────────────────────────────────────────────────
 if [ -e "$BIN_DST" ]; then
-  info "删除二进制 → $BIN_DST"
+  info "Removing binary → $BIN_DST"
   rm -f "$BIN_DST"
 fi
 
-# ── 3. 删除 udev 规则 ───────────────────────────────────────────────────
+# ── 3. Remove the udev rule ─────────────────────────────────────────────
 if [ -f "$UDEV_DST" ]; then
-  info "删除 udev 规则 → $UDEV_DST"
+  info "Removing udev rule → $UDEV_DST"
   as_root rm -f "$UDEV_DST"
   as_root udevadm control --reload
   as_root udevadm trigger
 else
-  dim "未发现 udev 规则，跳过"
+  dim "No udev rule found, skipping"
 fi
 
-# ── 4. （可选）移出 input 组 ────────────────────────────────────────────
+# ── 4. (optional) Remove from the input group ───────────────────────────
 if [ "$DO_GROUP" -eq 1 ]; then
   if id -nG "$ME" | tr ' ' '\n' | grep -qx input; then
-    info "把 $ME 移出 input 组"
+    info "Removing $ME from the input group"
     as_root gpasswd -d "$ME" input
-    warn "组的变更要注销重登才生效。"
+    warn "Group changes take effect only after you log out and back in."
   else
-    dim "$ME 不在 input 组，跳过"
+    dim "$ME is not in the input group, skipping"
   fi
 fi
 
 echo
-info "卸载完成。"
-[ "$DO_GROUP" -eq 0 ] && dim "input 组未改动（如需移除：./uninstall.sh --remove-group）"
+info "Uninstall complete."
+[ "$DO_GROUP" -eq 0 ] && dim "The input group was not changed (to remove it: ./uninstall.sh --remove-group)"

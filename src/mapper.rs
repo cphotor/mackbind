@@ -1,35 +1,35 @@
-//! 映射核心：修饰键状态机 + remap / cmd_map 应用。
+//! Mapping core: modifier-key state machine + remap / cmd_map application.
 //!
-//! # 事件流模型
+//! # Event-flow model
 //!
-//! mackbind 抓取键盘设备，事件按以下顺序处理：
+//! mackbind grabs the keyboard device; events are processed in this order:
 //!
-//! 1. 丢弃 `MISC` / `SYNCHRONIZATION`（前者是 MacBook 背光等杂散事件，
-//!    后者由 uinput 自动补发）
-//! 2. 丢弃 `value=2`（自动重复）。修饰键按住时内核会持续发重复事件，
-//!    若不丢弃会重复触发映射，产生成对的按下/释放。
-//! 3. 修饰键按下时**抑制输出**并记入状态——因为是否翻译取决于后续
-//!    按下的是哪个键（如 `Cmd+C` 要发 `Ctrl+C`，但单独的 `Cmd` 应
-//!    原样透传）。
-//! 4. 非修饰键到达时，结合当前修饰键状态做决策，产出要注入的事件。
+//! 1. Drop `MISC` / `SYNCHRONIZATION` (the former is stray events such as the MacBook backlight,
+//!    the latter is re-emitted automatically by uinput).
+//! 2. Drop `value=2` (auto-repeat). While a modifier is held the kernel keeps sending repeat events;
+//!    if they were not dropped they would re-trigger the mapping and produce paired press/release.
+//! 3. When a modifier is pressed, **suppress the output** and record it in state — because whether it is
+//!    translated depends on which key is pressed next (e.g. `Cmd+C` must emit `Ctrl+C`, but a lone `Cmd`
+//!    should pass through as-is).
+//! 4. When a non-modifier key arrives, decide using the current modifier state and produce the events to inject.
 //!
-//! # 释放事件的对称性
+//! # Symmetry of release events
 //!
-//! 这是最容易出错的地方。若 `Cmd+C` 被翻译成 `Ctrl+C`，那么释放时
-//! 也要发 `Ctrl` 的释放。若让原始的 `Cmd` 释放事件直接透传，输出侧
-//! 会残留一个按下的 `Cmd`，导致后续组合键行为错乱。
+//! This is where mistakes happen most easily. If `Cmd+C` is translated to `Ctrl+C`, the release must
+//! likewise emit the release of `Ctrl`. If the original `Cmd` release were passed through directly, the output
+//! side would be left holding a pressed `Cmd`, which corrupts the behavior of subsequent combos.
 //!
-//! 因此按下时记录「这个键被翻译成了什么」，释放时按记录还原。
+//! So at press time we record "what this key was translated into", and on release we restore from that record.
 
 use crate::config::{Config, DesktopType, FnMode};
 use crate::keys::parse_combo;
 use evdev::{EventType, InputEvent, KeyCode};
 use std::collections::{HashMap, HashSet};
 
-/// 判断某键码是否为修饰键。
+/// Whether a keycode is a modifier.
 ///
-/// 注意：此处只列出本工具关心的修饰键。`KEY_FN` 也算在内——它是
-/// Fn 优先级逻辑的输入，不应被原样透传。
+/// Note: only the modifiers this tool cares about are listed here. `KEY_FN` is included too — it is an
+/// input to the Fn-priority logic and must not be passed through as-is.
 pub fn is_modifier(code: KeyCode) -> bool {
     matches!(
         code,
@@ -46,37 +46,37 @@ pub fn is_modifier(code: KeyCode) -> bool {
     )
 }
 
-// 特化的键集**不排除任何键**，见下方注释。
+// The specialized key set **excludes no key**; see the note below.
 //
-// 曾错误地把 Q/W/N/T 排除在外，理由是「终端没有退出/关窗口的 Ctrl
-// 绑定」。这是错的：空闲的是 Ctrl+W，而 Ctrl+Shift+W 并不空闲——它
-// 正是 Linux 终端关闭标签页的键，也正是 macOS Cmd+W 的对应物。
-// Toshy 的配置同样是 `C("RC-W"): C("C-Shift-W")`。
+// Q/W/N/T were once wrongly excluded, on the reasoning that "terminals have no Ctrl
+// binding for quitting/closing a window". That is wrong: what is idle is Ctrl+W, while Ctrl+Shift+W is not idle — it
+// is exactly the Linux terminal's close-tab key, and exactly the counterpart of macOS Cmd+W.
+// Toshy's config likewise uses `C("RC-W"): C("C-Shift-W")`.
 //
-// 特化的目的是「把 Cmd 翻译到应用认得的组合」，不是「躲开所有冲突」。
-// 逐键判断某个组合是否空闲，反而会漏掉这类对应关系。
+// The point of specialization is "translate Cmd into a combo the app recognizes", not "dodge all conflicts".
+// Judging key by key whether a combo is idle would actually miss correspondences like this.
 
-/// 已被 remap 替换的修饰键集合。
+/// The set of modifiers already replaced by remap.
 ///
-/// 这些键按下时进入 `pending` 而非直接透传，因为它们的下游行为
-/// 取决于后续组合（Cmd+C → Ctrl+C）与 Fn 优先级。
+/// These keys enter `pending` on press instead of passing through directly, because their downstream behavior
+/// depends on the following combo (Cmd+C → Ctrl+C) and Fn priority.
 
-/// 已编译规则的一行。
+/// One line of the compiled rule table.
 ///
-/// 输入侧索引由 `(主键, 修饰键集合)` 组成——不能只用主键：`"KEY_Z"`
-/// （Cmd+Z）与 `"S-KEY_Z"`（Cmd+Shift+Z）主键相同，只用主键索引会互相
-/// 覆盖，导致其中一条永远无法命中。实测症状：Cmd+Z 退化为裸 z，
-/// Cmd+Shift+Z 泄漏出裸 Shift。
+/// The input-side index is `(main key, modifier set)` — the main key alone is not enough: `"KEY_Z"`
+/// (Cmd+Z) and `"S-KEY_Z"` (Cmd+Shift+Z) share the same main key; indexing by main key alone would
+/// overwrite each other, leaving one of them un-matchable forever. Observed symptom: Cmd+Z degraded to a bare z,
+/// Cmd+Shift+Z leaked a bare Shift.
 type RuleKey = (KeyCode, Vec<KeyCode>);
 
-/// 应用选择子。
+/// App selector.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AppMatch {
-    /// 所有应用（表中省略 `apps` 时的默认）
+        /// All apps (the default when `apps` is omitted in the table)
     Any,
-    /// 终端——按 `.desktop` 的 `Categories=TerminalEmulator` 判定
+        /// Terminal — judged by the `.desktop` `Categories=TerminalEmulator`
     Terminal,
-    /// 按 wm_class 子串匹配
+        /// Matched by wm_class substring
     Contains(Vec<String>),
 }
 
@@ -100,33 +100,33 @@ impl AppMatch {
     }
 }
 
-/// 一条编译后的规则。
+/// A compiled rule.
 struct CompiledRule {
-    /// 输入侧索引
+        /// Input-side index
     key: RuleKey,
-    /// 主键通配（`keys = ["*"]`）——匹配任意主键
+        /// Main-key wildcard (`keys = ["*"]`) — matches any main key
     wildcard: bool,
-    /// 是否要求按住 Cmd
+        /// Whether Cmd must be held
     ///
-    /// 查表对所有组合生效（否则非 Cmd 组合无法配置），故须显式区分：
-    /// 不校验的话，**裸按空格也会命中 `Cmd+空格` 那条规则**，
-    /// 任何人按空格都弹出 GNOME 概览。
+        /// The lookup applies to all combos (otherwise non-Cmd combos could not be configured), so this must be explicit:
+        /// without the check, **a bare Space press would also match the `Cmd+Space` rule**,
+        /// and anyone pressing Space would pop up the GNOME overview.
     requires_cmd: bool,
-    /// 适用的应用
+        /// App it applies to
     app: AppMatch,
-    /// 动作
+        /// Action
     act: CompiledAction,
-    /// 说明，仅供日志
+        /// Description, for logging only
     desc: Option<String>,
 }
 
-/// 编译后的动作。`TerminalCtrlShift` 是唯一的条件动作——
-/// 它是否真的加 Shift，取决于目标应用运行时查得的绑定。
+/// The compiled action. `TerminalCtrlShift` is the only conditional action —
+/// whether it actually adds Shift depends on the binding looked up at runtime in the target app.
 enum CompiledAction {
     Emit(Vec<KeyCode>, KeyCode),
     DeAccel(String),
     TerminalCtrlShift,
-    /// 执行外部命令（清倒废纸篓等「本质是命令」的操作）
+        /// Run an external command (operations that are "essentially commands", such as emptying the trash)
     Exec {
         program: String,
         args: Vec<String>,
@@ -136,73 +136,73 @@ enum CompiledAction {
     },
 }
 
-/// 查表命中的结果。
+/// The result of a table lookup hit.
 enum Outcome {
-    /// 发出这组修饰键与主键
+        /// Emit this set of modifiers and the main key
     Convert(Vec<KeyCode>, KeyCode),
-    /// 立即「点按」该键（按下后马上松开），不进入输出状态跟踪
+        /// "Tap" this key immediately (press then release at once), without entering output-state tracking
     Tap(KeyCode),
-    /// 动作已产生副作用（如执行了命令），**无需发任何按键**
+        /// The action already had a side effect (e.g. ran a command); **no key needs to be emitted**
     NoOutput,
 }
 
-/// 已编译的映射规则。
+/// The compiled mapping rules.
 pub struct Mapper {
-    /// remap 规则：原键 → 目标键
+        /// remap rules: source key → target key
     remap: HashMap<KeyCode, KeyCode>,
-    /// **映射规则表**——唯一的映射真源。
+        /// **The mapping rule table** — the single source of truth for mappings.
     ///
-    /// 按声明顺序线性查找，首个命中者生效（用户配置追加在末尾，
-    /// 故天然优先）。表很小（数十行），线性扫描比建索引更简单，
-    /// 也让「声明顺序即优先级」这件事保持显式。
+        /// Looked up linearly in declaration order; the first hit wins (user config is appended at the end,
+        /// so it naturally takes priority). The table is small (a few dozen rows), and a linear scan is simpler than
+        /// building an index, and keeps "declaration order is priority" explicit.
     rules: Vec<CompiledRule>,
-    /// **物理状态**：用户当前实际按住的修饰键，按下顺序。
+        /// **Physical state**: the modifiers the user is actually holding right now, in press order.
     ///
-    /// 反映硬件事实，不因发送事件而改变。每次新键按下时据此匹配组合。
+        /// Reflects hardware fact and never changes because an event was sent. Each new key press matches combos against this.
     held: Vec<KeyCode>,
 
-    /// 被抑制（未向输出侧发送）的键。释放时也不发事件。
+        /// Keys that were suppressed (not sent to the output side). Their release is not emitted either.
     suppressed: HashSet<KeyCode>,
-    /// **输出状态**：已向系统发出按下、尚未发出释放的修饰键。
+        /// **Output state**: modifiers already sent as pressed to the system, whose release has not yet been sent.
     ///
-    /// 与 held 严格分离。组合键翻译时需要先松开这些，再按新的输出修饰键。
+        /// Strictly separate from held. When translating a combo these must be released first, then the new output modifiers pressed.
     output_down: Vec<KeyCode>,
-    /// 按下时登记的「输入键 → 实际输出键」，用于对称释放。
+        /// The "input key → actual output key" registered at press time, used for symmetric release.
     ///
-    /// 无论是否翻译都登记，使「透传」成为默认路径而非特例。
+        /// Registered whether or not it was translated, making "pass-through" the default path rather than a special case.
     pressed: HashMap<KeyCode, KeyCode>,
-    /// 为翻译而注入输出侧的修饰键，主键释放时须一并松开
+        /// Modifiers injected to the output side for translation; must be released along with the main key
     injected_mods: Vec<KeyCode>,
-    /// Fn 是否按住
+        /// Whether Fn is held
     fn_held: bool,
     fn_mode: FnMode,
-    /// F1-F12 与亮度/媒体键的对应表
+        /// Table mapping F1-F12 to brightness/media keys
     fkey_media: HashMap<KeyCode, KeyCode>,
-    /// 焦点窗口是否属于「Ctrl 已被占用」的应用（终端、GVIM）
+        /// Whether the focused window belongs to an app where "Ctrl is already taken" (terminal, GVIM)
     ctrl_busy_window: bool,
-    /// 当前焦点窗口是否为终端（`Categories=TerminalEmulator`）
+        /// Whether the current focused window is a terminal (`Categories=TerminalEmulator`)
     is_terminal: bool,
-    /// Ctrl 占用应用列表（WM_CLASS / app_id）
+        /// List of Ctrl-busy apps (WM_CLASS / app_id)
     ctrl_busy_apps: Vec<String>,
-    /// 「Ctrl 已被占用」的应用**自身**用 Ctrl+Shift 绑定的键。
+        /// Keys that the "Ctrl already taken" app **itself** binds with Ctrl+Shift.
     ///
-    /// 运行时从 GSettings 查得（见 `set_window_id`），是
-    /// `TerminalCtrlShift` 动作的判定依据。加 Shift 是为了命中它们
-    /// 已有的绑定，而非笼统「躲冲突」。
+        /// Looked up at runtime from GSettings (see `set_window_id`); it is the
+        /// basis for the `TerminalCtrlShift` action's decision. Shift is added to hit their
+        /// existing bindings, not to generically "dodge conflicts".
     terminal_bindings: Vec<KeyCode>,
-    /// 当前焦点窗口的 wm_class，用于匹配表的应用列
+        /// wm_class of the current focused window, used for the app column of the table
     wm_class: String,
-    /// 桌面环境类型，决定 `de_accel` 动作去哪张 schema 查
+        /// Desktop-environment type, decides which schema the `de_accel` action looks in
     desktop_type: DesktopType,
-    /// 是否输出调试日志
+        /// Whether to output debug logs
     verbose: bool,
 }
 
-/// 把规则表编译成可线性扫描的形式。
+/// Compile the rule table into a form suitable for linear scanning.
 ///
-/// `keys` 是键名列表，可能带修饰前缀（如 `"S-z"` 表示 Shift+Z）。
-/// 取最后一段作为主键，前缀作为输入侧修饰键。前缀修饰键排序后参与
-/// 索引，使 `(z,[])` 与 `(z,[Shift])` 成为不同条目而不互相覆盖。
+/// `keys` is a list of key names, possibly with modifier prefixes (e.g. `"S-z"` means Shift+Z).
+/// The last segment is taken as the main key, the prefixes as input-side modifiers. The prefix modifiers are sorted before
+/// being indexed, so that `(z,[])` and `(z,[Shift])` become different entries and do not overwrite each other.
 fn compile_table(
     rules: &[crate::config::Rule],
 ) -> Result<Vec<CompiledRule>, crate::keys::KeyError> {
@@ -210,8 +210,8 @@ fn compile_table(
     for r in rules {
         let mut in_mods: Vec<KeyCode> = Vec::new();
         let mut key: Option<KeyCode> = None;
-        // `keys = ["*"]` 表示主键通配——供 TerminalCtrlShift 这类
-        // 「命中与否取决于运行时状态」的动作使用。
+                // `keys = ["*"]` means a main-key wildcard — used by actions like TerminalCtrlShift
+                // whose "does it match" depends on runtime state.
         let mut wildcard = false;
         for k in &r.keys {
             if k == "*" {
@@ -224,12 +224,12 @@ fn compile_table(
         }
         let key = match key {
             Some(k) => k,
-            // 通配规则本就无固定主键，匹配时不比较主键
+                        // A wildcard rule has no fixed main key by nature; the main key is not compared when matching
             None if wildcard => KeyCode::KEY_RESERVED,
             None => {
                 return Err(crate::keys::KeyError::BadCombo(
                     r.keys.join("+"),
-                    "keys 为空".into(),
+                                        "keys is empty".into(),
                 ))
             }
         };
@@ -237,8 +237,8 @@ fn compile_table(
 
         let act = match &r.act {
             crate::config::Action::Emit { mods, key } => {
-                // `mods` 每项形如 `"C"` 或 `"C-S"`——修饰键缩写，可多个。
-                // 按组合解析会把 `A` 当成 Alt 主键而丢掉，故逐段解析。
+                                // Each entry of `mods` looks like `"C"` or `"C-S"` — modifier abbreviations, possibly several.
+                                // Parsing it as a combo would treat `A` as the Alt main key and drop it, so parse segment by segment.
                 let mut out_mods = Vec::new();
                 for m in mods {
                     for seg in m.split('-') {
@@ -247,7 +247,7 @@ fn compile_table(
                             None => {
                                 return Err(crate::keys::KeyError::BadModifier(
                                     seg.to_string(),
-                                    "emit 的 mods 只接受 C/A/S/M（可用 - 组合，如 C-S）".into(),
+                                                                        "emit's mods only accept C/A/S/M (may combine with -, e.g. C-S)".into(),
                                 ))
                             }
                         }
@@ -289,86 +289,86 @@ fn compile_table(
     Ok(out)
 }
 
-/// GTK 加速键的主键名 → evdev 键码。
+/// GTK accelerator main-key name → evdev keycode.
 ///
-/// 见 [`crate::keys::parse_external_key`]。accel.rs 解析 DE 绑定时用的是
-/// 同一个函数——曾在此另写一份，两份之间 `"space"` 一项的差异即由此而来。
+/// See [`crate::keys::parse_external_key`]. accel.rs uses the same function when parsing DE bindings —
+/// a duplicate was once written here, and the difference in the `"space"` entry between the two came from exactly that.
 fn accel_key(name: &str) -> Option<KeyCode> {
     crate::keys::parse_external_key(name)
 }
 
-/// 「功能名 → DE 中对应动作」的查找表。
+/// Lookup table for "feature name → corresponding action in the DE".
 ///
-/// 新增一个 DE 功能只需在此加一行，**不必改任何分支逻辑**：
+/// Adding a new DE feature only requires one line here, **without touching any branching logic**:
 ///
 /// ```text
-/// (功能标识, 该 DE 下的 GSettings schema, 动作键名)
+/// (feature id, GSettings schema under that DE, action key name)
 /// ```
 ///
-/// 这类映射此前是写成 `match DesktopType { Gnome => ...; _ => None }` 的
-/// 硬编码分支——每加一个 DE 功能就要动一次代码分支，也没法让用户在
-/// 配置文件里追加。改为查表后，DE 只出现在这张表里。
+/// This kind of mapping used to be hard-coded branches written as `match DesktopType { Gnome => ...; _ => None }` —
+/// every new DE feature required touching a code branch, and users could not append anything in the
+/// config file. After switching to a table, the DE only appears in this table.
 ///
-/// 查不到（DE 未提供该动作、schema 不存在、动作未绑定）一律返回
-/// `None`——**不视为错误**，其余规则照常生效。
+/// Anything not found (DE does not provide the action, schema does not exist, action not bound) returns
+/// `None` — **not treated as an error**; the other rules still apply as usual.
 fn de_action_lookup(
     dt: &DesktopType,
     feature: &str,
 ) -> Option<(String, String)> {
-    // 不用 `use DesktopType::*`：其中有 `None` 变体，会遮蔽 `Option::None`
+        // Not `use DesktopType::*`: it has a `None` variant, which would shadow `Option::None`
     use DesktopType::Gnome;
-    // schema 只在匹配到具体 DE 时才构造，避免为无关 DE 做无谓查询
+        // The schema is constructed only when a concrete DE matches, avoiding pointless queries for unrelated DEs
     let (schema, key): (&str, &str) = match (dt, feature) {
-        // 概览：GNOME 放在 shell 层 schema，不在 wm.keybindings 里
+                // Overview: GNOME puts it in a shell-level schema, not in wm.keybindings
         (Gnome, "overview") => ("org.gnome.shell.keybindings", "toggle-overview"),
-        // 锁屏：在 media-keys 的 `screensaver`，**不在** wm.keybindings。
+                // Lock screen: in media-keys' `screensaver`, **not** in wm.keybindings.
         //
-        // 曾因只 grep wm.keybindings 而断言「GNOME 无锁屏绑定」——
-        // 与「概览在另一个 schema」「D-Bus dest 写错」同源的第三次误判。
-        // 断言某能力不存在前，先在整个 GNOME 域内搜一遍。
+                // We once asserted "GNOME has no lock-screen binding" after only grepping wm.keybindings —
+                // the third misjudgment of the same origin as "overview is in another schema" and "D-Bus dest written wrong".
+                // Before asserting a capability does not exist, search the whole GNOME domain once.
         (Gnome, "lock-screen") => (
             "org.gnome.settings-daemon.plugins.media-keys",
             "screensaver",
         ),
-        // 显示桌面：动作存在但默认未绑定，需用户自行绑定后此条才生效
+                // Show desktop: the action exists but is unbound by default; the user must bind it for this entry to take effect
         (Gnome, "show-desktop") => ("org.gnome.desktop.wm.keybindings", "show-desktop"),
-        // 截图三件套：全部在 shell 的 keybindings，不在 wm.keybindings
+                // The screenshot trio: all in the shell keybindings, not in wm.keybindings
         (Gnome, "screenshot-ui") => ("org.gnome.shell.keybindings", "show-screenshot-ui"),
         (Gnome, "screenshot") => ("org.gnome.shell.keybindings", "screenshot"),
         (Gnome, "screenshot-window") => ("org.gnome.shell.keybindings", "screenshot-window"),
-        // 退出登录：在 media-keys（与锁屏同一 schema），不在 wm.keybindings
+                // Log out: in media-keys (same schema as lock screen), not in wm.keybindings
         (Gnome, "logout") => ("org.gnome.settings-daemon.plugins.media-keys", "logout"),
-        // KDE 与裸 WM 的对应机制不同，暂未实现。
-        // 「不可查」不等于「不存在」——见 docs/macos-shortcuts.md。
+                // KDE and bare WMs use a different mechanism; not implemented yet.
+                // "Cannot be looked up" does not mean "does not exist" — see docs/macos-shortcuts.md.
         _ => return None,
     };
     Some((schema.to_string(), key.to_string()))
 }
 
-/// 桌面环境动作的求值结果。
+/// Evaluation result of a desktop-environment action.
 ///
-/// 多数动作是「修饰键 + 主键」的组合，但 GNOME 的概览不是：GNOME 50 起
-/// `toggle-overview` 默认为空（`@as []`），概览改由 mutter 的
-/// `overlay-key`（默认 `Super`）触发——即**裸按 Super 键**。裸按是一次
-/// 「点按」而非组合，无法塞进 `(mods, key)`，故单独表达。
+/// Most actions are a "modifier + main key" combo, but GNOME's overview is not: as of GNOME 50
+/// `toggle-overview` defaults to empty (`@as []`), and the overview is triggered instead by mutter's
+/// `overlay-key` (default `Super`) — i.e. a **bare Super key press**. A bare press is a
+/// "tap" rather than a combo and cannot be squeezed into `(mods, key)`, so it is expressed separately.
 enum DeKeys {
-    /// 按下这些修饰键后按下主键（物理键松开时一并释放）。
+        /// Press these modifiers and then the main key (released together when the physical key is released).
     Combo(Vec<KeyCode>, KeyCode),
-    /// 该键的一次「点按」：按下后立即松开。
+        /// A single "tap" of this key: press then release immediately.
     Tap(KeyCode),
 }
 
-/// 把某个 DE 功能解析为要发出的组合。
+/// Resolve a DE feature into the combo to emit.
 ///
-/// 步骤统一为：查表拿 schema 与动作键名 → 读该动作的现有加速键 →
-/// 解析成修饰键与主键。因此**读 DE 现有绑定**这一行为由函数本身保证，
-/// 不必由每个调用点各自实现。
+/// The steps are uniform: look up the schema and action key name → read that action's current accelerator →
+/// parse into modifiers and main key. Thus the behavior of **reading the DE's current binding** is guaranteed by the function itself,
+/// and need not be implemented by each call site.
 ///
-/// 输入侧（哪个 macOS 组合触发它）由规则表的 `keys` 列决定，
-/// 不在此硬编码——否则 `Ctrl+Cmd+Q` 锁屏这类非空格触发就无从表达。
+/// The input side (which macOS combo triggers it) is decided by the `keys` column of the rule table,
+/// not hard-coded here — otherwise non-Space triggers such as the `Ctrl+Cmd+Q` lock screen could not be expressed.
 ///
-/// DE 未绑定该动作时退回 [`de_feature_fallback`]，而不是直接判定
-/// 该功能不可用。
+/// When the DE has not bound that action it falls back to [`de_feature_fallback`], rather than
+/// directly declaring the feature unavailable.
 fn de_feature_accel(dt: &DesktopType, feature: &str) -> Option<DeKeys> {
     if let Some((schema, action)) = de_action_lookup(dt, feature) {
         if let Some(accel) = crate::accel::action_accel(&schema, &action) {
@@ -383,15 +383,15 @@ fn de_feature_accel(dt: &DesktopType, feature: &str) -> Option<DeKeys> {
     de_feature_fallback(dt, feature)
 }
 
-/// DE 动作未绑定时的兜底。
+/// Fallback for when a DE action is unbound.
 ///
-/// GNOME 50 起 `toggle-overview` 默认未绑定，概览改由 mutter 的
-/// `overlay-key`（默认 `Super`）触发。这不是「读用户现有绑定」，而是
-/// 该版本 GNOME 的**固定行为**，故单独处理。
+/// As of GNOME 50 `toggle-overview` is unbound by default, and the overview is triggered instead by mutter's
+/// `overlay-key` (default `Super`). This is not "reading the user's current binding" but
+/// **fixed behavior** of that GNOME version, so it is handled separately.
 ///
-/// **只在 `toggle-overview` 确实未绑定时才走这里。** 用户或发行版若
-/// 绑定了它（旧版 GNOME / EndeavourOS 实测为 `Ctrl+Shift+空格`），仍以
-/// 绑定为准——平台差异只做**追加**，不覆盖既有行为。
+/// **This is only reached when `toggle-overview` is genuinely unbound.** If the user or a distro has
+/// bound it (older GNOME / EndeavourOS observed as `Ctrl+Shift+Space`), the binding still wins —
+/// platform differences are only **appended**, never overriding existing behavior.
 fn de_feature_fallback(dt: &DesktopType, feature: &str) -> Option<DeKeys> {
     use DesktopType::Gnome;
     match (dt, feature) {
@@ -404,44 +404,44 @@ fn de_feature_fallback(dt: &DesktopType, feature: &str) -> Option<DeKeys> {
     }
 }
 
-/// DE 功能是否可用。启动时据此剔除表中的 `de_accel` 行，
-/// 避免运行时反复查询。
+/// Whether a DE feature is available. At startup this is used to drop the `de_accel` rows from the table,
+/// avoiding repeated queries at runtime.
 fn de_feature_ready(dt: &DesktopType, feature: &str) -> bool {
     de_feature_accel(dt, feature).is_some()
 }
 
-/// 默认语义的结果：要么转换，要么放行。
+/// Result of the default semantics: either convert, or pass through.
 enum Default {
     /// `Cmd+X` → `Ctrl+X`
     Convert(Vec<KeyCode>, KeyCode),
-    /// Cmd 组合但无从转换，原样放行（须补发被抑制的 Meta）
+        /// A Cmd combo with no way to convert; pass through as-is (must re-emit the suppressed Meta)
     Passthrough,
-    /// 非 Cmd 组合且表里无规则，原样透传（无 Meta 可补）
+        /// A non-Cmd combo with no rule in the table; pass through as-is (no Meta to re-emit)
     PassthroughPlain,
 }
 
-/// 默认语义：`Cmd+X` → `Ctrl+X`。
+/// Default semantics: `Cmd+X` → `Ctrl+X`.
 ///
-/// **仅在查表落空后适用**——表里有规则的一律以表为准。
+/// **Only applies after a table lookup misses** — anything with a rule in the table is governed by the table.
 ///
-/// 不做穷举：macOS 的 Cmd 组合是长尾的，固定表覆盖不全。实测 GNOME 的
-/// 28 个 Super 绑定中仅 `Super+h` 涉及字母，`Super+字母` 基本空闲——
-/// 保留 Super 会让绝大多数组合什么也不发生。
+/// No exhaustive enumeration: macOS's Cmd combos are long-tailed and a fixed table cannot cover them. On a real GNOME,
+/// of the 28 Super bindings only `Super+h` involves a letter, and `Super+letter` is mostly idle —
+/// keeping Super would make the vast majority of combos do nothing.
 ///
-/// # 何时放行而非转换
+/// # When to pass through instead of converting
 ///
-/// 前提是「Cmd 映射为 Ctrl」。若用户已按住 Ctrl，Cmd 再变 Ctrl 就成了
-/// `Ctrl+Ctrl+X`——同一个槽位，组合退化。故此时不能转换。
+/// The premise is "Cmd maps to Ctrl". If the user is already holding Ctrl, turning Cmd into Ctrl again would give
+/// `Ctrl+Ctrl+X` — the same slot, a degenerate combo. So it must not convert in that case.
 ///
-/// 但也不能把它当 `Cmd+X` 处理：`Ctrl+Cmd+X` 在 macOS 上是**另一个
-/// 组合键**（`Ctrl+Cmd+Q` 锁屏、`Ctrl+Cmd+F` 全屏），有自己的含义。
-/// 表里没有它，只说明我们没配，不等于它等于 `Cmd+X`。
+/// But it must not be treated as `Cmd+X` either: `Ctrl+Cmd+X` on macOS is **another
+/// combo** (`Ctrl+Cmd+Q` lock screen, `Ctrl+Cmd+F` fullscreen) with its own meaning.
+/// The fact that the table lacks it only means we did not configure it, not that it equals `Cmd+X`.
 ///
-/// 故放行：把用户按的原样交给应用，由应用自己解释。这比替它编一个
-/// `Ctrl+X` 可预测——表里有就按表走，没有就透传。
+/// So pass through: hand what the user pressed to the app as-is and let the app interpret it. That is more
+/// predictable than inventing a `Ctrl+X` for it — go by the table when it has an entry, pass through when it does not.
 ///
-/// 注意物理 Ctrl 经 remap 后是 CapsLock（见 `handle_press`），
-/// 故冲突判定须把 CapsLock 一并计入。
+/// Note physical Ctrl becomes CapsLock after remap (see `handle_press`),
+/// so the conflict check must count CapsLock as well.
 fn default_semantics(cur_mods: &[KeyCode], code: KeyCode) -> Default {
     let ctrl_taken = cur_mods.iter().any(|m| {
         matches!(
@@ -453,7 +453,7 @@ fn default_semantics(cur_mods: &[KeyCode], code: KeyCode) -> Default {
         return Default::Passthrough;
     }
 
-    // 其余修饰键（Shift/Alt）保留后追加 Ctrl：
+        // The remaining modifiers (Shift/Alt) are kept and Ctrl appended:
     // `Shift+Cmd+X` → `Shift+Ctrl+X`
     let mut mods = cur_mods.to_vec();
     mods.push(KeyCode::KEY_LEFTCTRL);
@@ -463,8 +463,8 @@ fn default_semantics(cur_mods: &[KeyCode], code: KeyCode) -> Default {
 }
 
 impl Mapper {
-    /// 从配置构建。键名解析失败会立即返回错误——配置写错时
-    /// 必须大声失败，不能静默忽略。
+        /// Build from config. A key-name parse failure returns an error immediately — a mis-written config
+        /// must fail loudly, not be ignored silently.
     pub fn new(cfg: &Config, verbose: bool) -> Result<Self, crate::keys::KeyError> {
         let mut remap = HashMap::new();
         for r in &cfg.remap {
@@ -475,19 +475,19 @@ impl Mapper {
 
         let rules = compile_table(&cfg.rules)?;
 
-        // DE 相关规则：读取 DE 现有的绑定，不改写绑定。
+                // DE-related rules: read the DE's current bindings; do not rewrite them.
         //
-        // macOS 的 `Cmd+空格`（Spotlight）在 GNOME 对应概览，而 GNOME
-        // 已把该动作绑在 `toggle-overview` 上（本机为 `Ctrl+Shift+空格`）。
-        // 直接发出同样的键即可，无需在用户配置里留下任何记录——
-        // 也不会覆盖用户自己对该键的设置。
+                // macOS's `Cmd+Space` (Spotlight) corresponds to the overview in GNOME, and GNOME
+                // already binds that action to `toggle-overview` (on this machine `Ctrl+Shift+Space`).
+                // Emitting the same keys directly is enough, with no record left in the user's config —
+                // and it never overwrites the user's own setting for that key.
         //
-        // 表里已有一条 `DeAccel{overview}` 行，此处只做可用性检查：
-        // 查得到则该行生效，查不到则整条规则无动作可做。
-        // 表中所有 `de_accel` 行逐个检查可用性。
+                // The table already has a `DeAccel{overview}` row; here we only do an availability check:
+                // if it is findable the row takes effect, otherwise the whole rule has no action to perform.
+                // All `de_accel` rows in the table are checked for availability one by one.
         //
-        // `overview` 受 `spotlight` 开关控制；锁屏等其余功能无条件启用。
-        // 查不到的行在此剔除，避免运行时反复查询失败的功能。
+                // `overview` is controlled by the `spotlight` switch; other features such as lock screen are enabled unconditionally.
+                // Rows that cannot be found are dropped here, avoiding features that repeatedly fail at runtime.
         let mut de_report: Vec<(String, bool)> = Vec::new();
         let rules = rules
             .into_iter()
@@ -505,9 +505,9 @@ impl Mapper {
         if verbose {
             for (feature, ok) in &de_report {
                 if *ok {
-                    eprintln!("[de] {feature}：读 DE 现有绑定后发出");
+                                        eprintln!("[de] {feature}: emits after reading the DE's current binding");
                 } else {
-                    eprintln!("[de] {feature}：DE 未提供或已关闭，跳过");
+                                        eprintln!("[de] {feature}: not provided by the DE or disabled, skipping");
                 }
             }
         }
@@ -536,19 +536,19 @@ impl Mapper {
         })
     }
 
-    /// 设置当前焦点窗口的 WM_CLASS / app_id。
+        /// Set the WM_CLASS / app_id of the current focused window.
     ///
-    /// 判定「Ctrl 已被占用」有两条途径：
+        /// There are two ways to decide "Ctrl is already taken":
     ///
-    /// 1. `.desktop` 条目的 `Categories` 含 `TerminalEmulator` —— 按
-    ///    freedesktop 规范判定，自动覆盖新装的终端，不受大小写或前缀
-    ///    差异影响。硬编码名单曾因写成 `ptyxis` 而实际 wm_class 是
-    ///    `org.gnome.Ptyxis` 导致漏判。
-    /// 2. 命中 `ctrl_busy_apps` 配置名单 —— 用于独立窗口的编辑器等
-    ///    非终端特例。
+        /// 1. The `.desktop` entry's `Categories` contains `TerminalEmulator` — judged by the
+        ///    freedesktop spec, automatically covering newly installed terminals, unaffected by case or prefix
+        ///    differences. A hard-coded list once missed because it was written as `ptyxis` while the actual wm_class is
+        ///    `org.gnome.Ptyxis`.
+        /// 2. A hit on the `ctrl_busy_apps` config list — for non-terminal special cases such as
+        ///    standalone-window editors.
     ///
-    /// 命中时 Cmd 映射为 Ctrl+Shift，避开这些应用内 Ctrl 的既定含义
-    /// （终端 Ctrl+C 中断、GVIM Ctrl+V 块选择）。
+        /// On a hit, Cmd maps to Ctrl+Shift, avoiding the established meaning of Ctrl inside these apps
+        /// (terminal Ctrl+C interrupt, GVIM Ctrl+V block selection).
     pub fn set_window_id(&mut self, id: &str) {
         self.wm_class = id.to_string();
         let is_term = crate::desktop::is_terminal(id);
@@ -557,11 +557,11 @@ impl Mapper {
         self.ctrl_busy_window = is_term || in_list;
 
         if is_term {
-            // 优先问终端自己：它用 Ctrl+Shift 绑定了哪些键。
+                        // Ask the terminal itself first: which keys does it bind with Ctrl+Shift.
             //
-            // 手写白名单漏过 `n`（新窗口），也误判过 close-window 的
-            // 绑定键。凡是走 GSettings 声明快捷键的终端（GNOME 系），
-            // 直接读它的 schema——用户改过绑定也能自动跟上。
+                        // A hand-written whitelist missed `n` (new window) and also misjudged the close-window
+                        // binding key. For any terminal that declares shortcuts via GSettings (GNOME family),
+                        // read its schema directly — if the user changed the binding we keep up automatically.
             let queried = crate::accel::ctrl_shift_keys(id);
             if !queried.is_empty() {
                 let parsed: Vec<KeyCode> = queried.iter().filter_map(|k| accel_key(k)).collect();
@@ -572,59 +572,59 @@ impl Mapper {
         }
 
         if self.verbose && self.ctrl_busy_window {
-            let via = if is_term { "TerminalEmulator" } else { "配置名单" };
+                        let via = if is_term { "TerminalEmulator" } else { "config list" };
             let n = self.terminal_bindings.len();
             eprintln!(
-                "[mapper] 命中 Ctrl 占用应用: {id}（{via}）→ {n} 个键映射为 Ctrl+Shift"
+                                "[mapper] Ctrl-busy app matched: {id} ({via}) → {n} keys mapped to Ctrl+Shift"
             );
         }
     }
 
-    /// 测试专用：不查 `.desktop`，直接把窗口标记为「Ctrl 被占用」。
+        /// Test-only: skip the `.desktop` lookup and mark the window directly as "Ctrl is taken".
     ///
-    /// 终端特化的**行为**（Cmd→Ctrl+Shift）与终端的**检测**是两回事：
-    /// 检测由 `desktop::is_terminal` 负责，已有独立测试覆盖。这里要验的
-    /// 是「已判定为终端之后」的映射，故不应受本机装没装某个终端影响——
-    /// 各发行版默认终端不同（Ubuntu 26.04 只有 ptyxis，而它恰好属
-    /// 「漏发 SIGINT」名单，走 Ctrl+Insert 而非 Ctrl+Shift）。
+        /// The terminal specialization's **behavior** (Cmd→Ctrl+Shift) and the terminal **detection** are two
+        /// different things: detection is `desktop::is_terminal`'s job and already has its own tests. What we verify here
+        /// is the mapping "after it has been decided to be a terminal", so it must not depend on whether this machine has a
+        /// given terminal installed — distros differ in default terminal (Ubuntu 26.04 only has ptyxis, which happens to be on
+        /// the "leaks SIGINT" list and goes through Ctrl+Insert rather than Ctrl+Shift).
     #[cfg(test)]
     pub fn force_ctrl_busy_window(&mut self, id: &str) {
         self.wm_class = id.to_string();
         self.is_terminal = true;
         self.ctrl_busy_window = true;
-        // 保留默认白名单，不查 GSettings：让测试结果与本机装的终端无关。
+                // Keep the default whitelist and do not query GSettings: so test results do not depend on the machine's terminal.
     }
 
-    /// 处理一个输入事件，产出要注入输出的事件序列（可能为空）。
+        /// Handle one input event and produce the sequence of events to inject (possibly empty).
     pub fn translate(&mut self, ev: &InputEvent) -> Vec<InputEvent> {
-        // 1) 透传非按键事件，保持与真实设备一致的时间流
+                // 1) Pass through non-key events, keeping the time flow consistent with the real device
         //
-        // MacBook 的「键盘/触控板」是同一个 evdev 设备，触控板活动会以
-        // MISC/MSC 事件的形式混入。直接丢弃它们有两个问题：
+                // The MacBook "keyboard/trackpad" is the same evdev device, and trackpad activity comes in as
+                // MISC/MSC events. Dropping them outright has two problems:
         //
-        //   a) 触控板彻底失灵（点击、滚动、多指手势均依赖这些事件）
-        //   b) 更隐蔽的：触控板事件同样会带来 SYN 边界，打断按键批次。
-        //      输入法依赖事件间隔聚合按键（如双拼 f+a 合成一个音节），
-        //      节奏被打断后会逐字母提交，表现为「只出拼音、漏字母」。
+                //   a) the trackpad stops working entirely (clicks, scrolling, multi-finger gestures all rely on these events)
+                //   b) more subtly: trackpad events also bring SYN boundaries that break up key batches.
+                //      Input methods aggregate keys by event spacing (e.g. Shuangpin f+a merges into one syllable);
+                //      when the rhythm is broken they commit letter by letter, showing as "only pinyin comes out, letters are lost".
         //
-        // 因此原样转发这类事件——不做任何映射，但保留它们在时间轴上的
-        // 位置，使下游看到的节奏与真实键盘+触控板完全一致。
+                // So forward such events as-is — no mapping at all, but keep their position
+                // on the timeline so downstream sees the exact rhythm of a real keyboard + trackpad.
         //
-        // SYNCHRONIZATION 例外：uinput 的 emit() 会自动补 SYN_REPORT，
-        // 若再转发原始 SYN，一个批次就会被拆成多个同步报告。
+                // Exception for SYNCHRONIZATION: uinput's emit() adds SYN_REPORT automatically,
+                // so forwarding the original SYN would split one batch into multiple sync reports.
         if ev.event_type() != EventType::KEY {
-            // MISC/MSC 等非按键事件一律丢弃，交给原设备处理。
+                        // MISC/MSC and other non-key events are dropped entirely; the original device handles them.
             //
-            // 试过转发它们以保留触控板活动，但失败：转发会把 ABS 多点
-            // 触控事件一并送到虚拟设备，而虚拟设备未声明 EV_ABS 能力，
-            // 导致触控板与按键都异常（打字漏字母）。
+                        // Forwarding them was tried, to keep trackpad activity, but it failed: forwarding sends the ABS multi-touch
+                        // events to the virtual device too, and the virtual device does not declare EV_ABS capability,
+                        // causing both the trackpad and the keys to misbehave (dropped letters when typing).
             return vec![];
         }
 
         let code = KeyCode(ev.code());
         let value = ev.value();
 
-        // 2) 丢弃自动重复
+                // 2) Drop auto-repeat
         if value == 2 {
             return vec![];
         }
@@ -633,7 +633,7 @@ impl Mapper {
 
         if code == KeyCode::KEY_FN {
             self.fn_held = pressed;
-            // Fn 本身不注入输出（内核多数机型本就不暴露它）
+                        // Fn itself is not injected to the output (on most machines the kernel does not expose it anyway)
             return vec![];
         }
 
@@ -648,51 +648,51 @@ impl Mapper {
         }
     }
 
-    /// 按下处理。
+        /// Press handling.
     fn handle_press(&mut self, code: KeyCode) -> Vec<InputEvent> {
-        // 应用 remap，得到「逻辑键」
+                // Apply remap to get the "logical key"
         let logical = self.remap.get(&code).copied().unwrap_or(code);
 
-        // 修饰键：记录状态，抑制输出
-        // 只有 Cmd 需要「按下时抑制、待组合确定后再决定」。
+                // Modifier: record state, suppress output
+                // Only Cmd needs "suppress on press, decide once the combo is known".
         //
-        // 其他修饰键（Shift、Alt、Ctrl）本身就应当原样输出：它们不参与
-        // Cmd 查表，抑制会导致下游（如 fcitx5 监听裸 Shift_L 切换输入法）
-        // 收不到按键事件。
+                // The other modifiers (Shift, Alt, Ctrl) should be output as-is: they do not participate in
+                // the Cmd lookup, and suppressing them would leave downstream (e.g. fcitx5 watching a bare Shift_L to switch input method)
+                // with no key event.
         //
-        // remap 过的修饰键（如 CapsLock→LEFTCTRL）需输出目标键而非原键。
+                // A remapped modifier (e.g. CapsLock→LEFTCTRL) must output the target key, not the original.
         if logical != code {
             self.held_push(logical);
             self.output_down.push(logical);
             return self.press_as(code, logical);
         }
 
-        // 未被 remap 的 Cmd：抑制，等后续组合决定。
-        // 记入 suppressed，使释放时也不发事件——我们从未按下过它，
-        // 不应发出一个无对应的释放。
+                // Cmd not remapped: suppress it and wait for the following combo to decide.
+                // Record it in suppressed so the release emits nothing either — we never pressed it,
+                // so we must not emit a release with no matching press.
         if code == KeyCode::KEY_LEFTMETA || code == KeyCode::KEY_RIGHTMETA {
             self.held_push(logical);
             self.suppressed.insert(code);
             return vec![];
         }
 
-        // 其余修饰键（Shift / Alt / Ctrl）原样透传，但**仍需记入 held**。
+                // The remaining modifiers (Shift / Alt / Ctrl) pass through as-is, but **must still be recorded in held**.
         //
-        // held 在此有两个用途，二者并不冲突：
-        //   1. 判断 Cmd 组合是否命中（cmd_map 条目可声明附加修饰键，
-        //      如 Cmd+Shift+Z 的 "S-z"）
-        //   2. 组合键翻译时，先松开这些输入侧修饰键
+                // held has two uses here, and they do not conflict:
+                //   1. deciding whether a Cmd combo hits (cmd_map entries may declare extra modifiers,
+                //      e.g. "S-z" for Cmd+Shift+Z)
+                //   2. on combo translation, releasing these input-side modifiers first
         //
-        // 透传不等于不可见——输出侧照常收到事件，只是内部也要记住。
+                // Pass-through does not mean invisible — the output side still receives the event; it just must also be remembered internally.
         self.held_push(logical);
         self.output_down.push(logical);
         self.press_as(code, code)
     }
 
-    /// 按下并登记：记录「这个输入键实际输出成了什么」。
+        /// Press and register: record "what this input key actually output as".
     ///
-    /// 释放时按此记录还原，无需再判断「是否被翻译过」。
-    /// 统一登记也让「透传」成为默认值而非特例。
+        /// On release we restore from this record, with no need to re-decide "was it translated".
+        /// Registering uniformly also makes "pass-through" the default value rather than a special case.
     fn press_as(&mut self, input: KeyCode, output: KeyCode) -> Vec<InputEvent> {
         self.pressed.insert(input, output);
         if !self.output_down.contains(&output) {
@@ -701,29 +701,29 @@ impl Mapper {
         self.emit_key(output, 1)
     }
 
-    /// Fn 键预处理：F1–F12 在当前 Fn 状态与模式下，实际代表哪个键。
+        /// Fn-key preprocessing: which key F1–F12 actually represent under the current Fn state and mode.
     ///
-    /// 只做**替换**，绝不提前返回——调用方须继续走正常的组合流程。
+        /// Only **substitution**, never an early return — the caller must continue through the normal combo flow.
     ///
-    /// 早期实现在此直接 `return emit_key(media, 1)`，绕过了整个 Cmd
-    /// 查表。后果是 `Fn+Meta+Shift+F1`（macOS 上取功能键的组合）会
-    /// 泄漏出 Meta 按下——Meta 此前已被抑制、此处却原样发出——同时
-    /// Ctrl/Shift 丢失。实测输出为 `Meta + 媒体键`，明显不对。
+        /// An early implementation returned `emit_key(media, 1)` right here, bypassing the whole Cmd
+        /// lookup. The consequence was that `Fn+Meta+Shift+F1` (the macOS combo for function keys)
+        /// leaked a Meta press — Meta had been suppressed earlier, yet here it was emitted as-is — while
+        /// Ctrl/Shift were lost. The observed output was `Meta + media key`, clearly wrong.
     ///
-    /// 方向由 [`FnMode`] 决定：
-    /// - `Fkeysfirst`：Fn 未按时出 F 键，按下出媒体键
-    /// - `Fkeyslast`：反之
+        /// The direction is decided by [`FnMode`]:
+        /// - `Fkeysfirst`: F keys when Fn is not held, media keys when it is
+        /// - `Fkeyslast`: the reverse
     fn resolve_fn(&self, code: KeyCode) -> KeyCode {
         if self.fn_mode == FnMode::Disabled {
             return code;
         }
-        // 只需正向查表，无需反向。反向（「媒体键 → F 键」）在内核
-        // fnmode=1 时不会发生：那时内核直接上报 F 键码，F1 进来就
-        // 该原样输出。
+                // Only a forward lookup is needed, no reverse. The reverse ("media key → F key") does not
+                // occur when the kernel's fnmode=1: then the kernel reports F keycodes directly, and F1 coming in
+                // should just be output as-is.
         //
-        // 内核 `fnmode=2`（本机当前值）下的分工：
-        //   F1 → KEY_F1、Fn+F1 → KEY_BRIGHTNESSDOWN  ← 内核已翻译
-        // 此时 `fkey_media` 查得到媒体键才转换，查不到即原样透传。
+                // Division of labor under the kernel's `fnmode=2` (this machine's current value):
+                //   F1 → KEY_F1, Fn+F1 → KEY_BRIGHTNESSDOWN  ← already translated by the kernel
+                // So here, only when `fkey_media` finds a media key do we convert; otherwise pass through as-is.
         match (self.fn_held, self.fn_mode) {
             (true, FnMode::Fkeysfirst) | (false, FnMode::Fkeyslast) => {
                 self.fkey_media.get(&code).copied().unwrap_or(code)
@@ -733,10 +733,10 @@ impl Mapper {
     }
 
 
-    /// 查表。返回 `(输出修饰键, 输出主键)`，未命中则 `None`。
+        /// Table lookup. Returns `(output modifiers, output main key)`, or `None` on a miss.
     ///
-    /// 线性扫描，按声明顺序取首个命中者。表很小（数十行），
-    /// 且这样「声明顺序即优先级」是显式的，不需额外的排序或索引。
+        /// Linear scan, taking the first hit in declaration order. The table is small (a few dozen rows),
+        /// and this keeps "declaration order is priority" explicit, with no extra sorting or indexing.
     fn lookup(
         &self,
         code: KeyCode,
@@ -758,7 +758,7 @@ impl Mapper {
             }
             if self.verbose {
                 if let Some(d) = &r.desc {
-                    eprintln!("[mapper] 命中规则: Cmd+{:?} — {d}", code);
+                                        eprintln!("[mapper] rule hit: Cmd+{:?} — {d}", code);
                 }
             }
             match &r.act {
@@ -766,9 +766,9 @@ impl Mapper {
                     return Some(Outcome::Convert(mods.clone(), *key))
                 }
                 CompiledAction::DeAccel(feature) => {
-                    // 读 DE 现有的绑定，发出同样的键。不改写用户配置，
-                    // 用户改了绑定则自动跟上。启动时已剔除不可用的行，
-                    // 此处仍以 `match` 兜底——DE 绑定可能在运行中改变。
+                                        // Read the DE's current binding and emit the same keys. It does not rewrite the user's config,
+                                        // and if the user changed the binding we follow automatically. Unavailable rows were dropped at
+                                        // startup; here a `match` still backs it up — the DE binding may change at runtime.
                     match de_feature_accel(&self.desktop_type, feature) {
                         Some(DeKeys::Combo(mods, key)) => {
                             return Some(Outcome::Convert(mods, key))
@@ -778,13 +778,13 @@ impl Mapper {
                     }
                 }
                 CompiledAction::TerminalCtrlShift => {
-                    // 条件动作：仅当目标应用**自己**用 Ctrl+Shift 绑定了
-                    // 这个键时才加 Shift。加 Shift 是为了命中它已有的
-                    // 绑定，而不是笼统躲冲突。
+                                        // Conditional action: add Shift only when the target app **itself** binds
+                                        // this key with Ctrl+Shift. Shift is added to hit its existing
+                                        // binding, not to generically dodge conflicts.
                     //
-                    // 未绑定则落到默认语义——这正是「逐键」而非「整体
-                    // 换语义」的意义：`Cmd+Q` 不在此白名单里，故仍是
-                    // 全局的 Alt+F4，而不会变成谁也不认的 Ctrl+Shift+Q。
+                                        // If unbound it falls to the default semantics — this is exactly the point of "per key" rather than
+                                        // "swap the semantics wholesale": `Cmd+Q` is not on this whitelist, so it stays
+                                        // the global Alt+F4, and does not become a Ctrl+Shift+Q nobody recognizes.
                     if self.ctrl_busy_window && self.terminal_bindings.contains(&code) {
                         let mut mods = cur_mods.to_vec();
                         mods.push(KeyCode::KEY_LEFTCTRL);
@@ -802,10 +802,10 @@ impl Mapper {
                     prompt,
                     ok_label,
                 } => {
-                    // 本质是命令而非组合键的操作。
+                                        // An operation that is essentially a command rather than a combo.
                     //
-                    // 返回 `Some(空修饰键, 空主键)` 表示「已处理，但无需发按键」——
-                    // 调用方据此跳过整个输出流程，只跑副作用。
+                                        // Returning `Some(empty modifiers, empty main key)` means "handled, but no key to emit" —
+                                        // the caller uses that to skip the whole output flow and run only the side effect.
                     let key_desc = format!(
                         "Cmd+{}",
                         r.key
@@ -829,7 +829,7 @@ impl Mapper {
                         confirm_key: Some(&key_desc),
                         scoped: !matches!(r.app, AppMatch::Any),
                     });
-                    // 已产生副作用，无需发出任何按键
+                                        // Side effect already produced; no key needs to be emitted
                     return Some(Outcome::NoOutput);
                 }
             }
@@ -837,35 +837,35 @@ impl Mapper {
         None
     }
 
-    /// 非修饰键的按下处理。
+        /// Press handling for a non-modifier key.
     fn handle_key_press(&mut self, physical: KeyCode) -> Vec<InputEvent> {
-        // Fn 预处理：只替换键本身，之后统一走下方流程。
+                // Fn preprocessing: substitute only the key itself, then go through the flow below uniformly.
         //
-        // `pressed` 仍以**物理键**为键——`handle_release` 拿物理键直接
-        // 查表即可拿到当时的输出，无需重新推断 Fn 状态（Fn 可能已先于
-        // F 键松开，重新推断会得到错误结果）。invariant 2 依赖这一点。
+                // `pressed` is still keyed by the **physical key** — `handle_release` can look up the physical key directly
+                // to get the output at the time, without re-inferring the Fn state (Fn may have been released before
+                // the F key, and re-inferring would give the wrong result). Invariant 2 relies on this.
         let code = self.resolve_fn(physical);
 
-        // Cmd 组合处理
+                // Cmd-combo handling
         let cmd_held = self
             .held
             .iter()
             .any(|m| *m == KeyCode::KEY_LEFTMETA || *m == KeyCode::KEY_RIGHTMETA);
 
         {
-            // 当前除 Cmd 外还按住的修饰键。
+                        // Modifiers currently held besides Cmd.
             //
-            // 两份，用途不同，**不可混用**：
-            // - `held_mods`：**真实**按下的键，用于发事件与释放配平
-            // - `cur_mods`：**归一化**后的键，仅用于查表
+                        // Two copies, different uses, **must not be mixed**:
+                        // - `held_mods`: the **real** pressed keys, used for emitting events and balancing releases
+                        // - `cur_mods`: the **normalized** keys, used only for the table lookup
             //
-            // 归一化的原因：物理 Ctrl 经 remap 变成 CapsLock，但语义上仍是
-            // Ctrl，而规则表里写 `C-`（= KEY_LEFTCTRL）。不归一化则
-            // `Ctrl+Cmd+Q` 这类规则永远匹配不上。
+                        // Why normalize: physical Ctrl becomes CapsLock via remap, but is still semantically
+                        // Ctrl, while the rule table writes `C-` (= KEY_LEFTCTRL). Without normalization
+                        // rules like `Ctrl+Cmd+Q` would never match.
             //
-            // 但**发事件必须用真实的**：用归一化值发，输出侧按下的是
-            // LeftCtrl，而释放路径按 pressed 表还原的是 CapsLock——
-            // 两者对不上，LeftCtrl 永久卡在按下态。
+                        // But **emitting must use the real ones**: emitting a normalized value would press LeftCtrl
+                        // on the output side, while the release path restores CapsLock per the pressed table —
+                        // they would not match, and LeftCtrl would stay stuck down forever.
             let held_mods: Vec<KeyCode> = self
                 .held
                 .iter()
@@ -883,72 +883,72 @@ impl Mapper {
             cur_mods.sort();
             cur_mods.dedup();
 
-            // 查表：**对所有组合**生效，不只 Cmd 组合。
+                        // Table lookup: **applies to all combos**, not just Cmd combos.
             //
-            // 早期版本把查表放在 `if cmd_held` 分支内，于是不含 Cmd 的
-            // 组合（如 macOS 的 `Option+Delete`）永远查不到规则——
-            // 表里写了也没用。现已提到分支外。
+                        // An early version put the lookup inside the `if cmd_held` branch, so combos without Cmd
+                        // (such as macOS's `Option+Delete`) could never find a rule —
+                        // writing it in the table was useless. Now it is outside the branch.
             //
-            // 查表优先；表里没有才轮到默认语义（非 Cmd 组合则原样透传）。
+                        // The table takes priority; only on a miss do the default semantics apply (non-Cmd combos pass through as-is).
             let decision = match self.lookup(code, &cur_mods, cmd_held) {
                 Some(Outcome::Convert(m, k)) => Default::Convert(m, k),
                 Some(Outcome::Tap(k)) => {
-                    // 「点按」：先把输出侧仍按着的键全部松开，再按下并立即
-                    // 松开目标键，随后立即返回。
+                                        // "Tap": first release all keys still held on the output side, then press and immediately
+                                        // release the target key, then return immediately.
                     //
-                    // 先松开是必须的：`Ctrl+↑` 触发概览时，用户物理上仍按着
-                    // Ctrl，它作为透传修饰键已在输出侧按下。若不清掉，mutter
-                    // 看到的是 `Ctrl+Super` 而非裸 Super，overlay-key 不会触发。
-                    // 组合转换路径（`Default::Convert`）同样先排空 output_down，
-                    // 这里保持一致。
+                                        // Releasing first is mandatory: when `Ctrl+↑` triggers the overview the user is still physically holding
+                                        // Ctrl, which has already been pressed on the output side as a pass-through modifier. If it is not cleared, mutter
+                                        // sees `Ctrl+Super` rather than a bare Super, and overlay-key does not trigger.
+                                        // The combo-convert path (`Default::Convert`) likewise drains output_down first,
+                                        // so this stays consistent.
                     //
-                    // 之所以必须**立即**松开目标键：GNOME 的 overlay-key 在
-                    // 松开时才开概览；若把 Super 留到物理键（空格）松开，期间
-                    // mutter 会把它当成 `Super+空格`（输入法切换）。
+                                        // The target key must be released **immediately** because GNOME's overlay-key opens the
+                                        // overview on release; if Super were left until the physical key (Space) is released, mutter would
+                                        // treat it as `Super+Space` (input-method switch) in the meantime.
                     //
-                    // 该物理键不进入 `pressed` 的状态跟踪——它不产生持续输出，
-                    // 故其释放事件（handle_release）会因「输出侧未按下」而
-                    // 自然地无输出。
+                                        // This physical key does not enter `pressed` state tracking — it produces no lasting output,
+                                        // so its release event (`handle_release`) will naturally produce nothing because "the output side is not pressed".
+                    // naturally produce nothing.
                     let mut out = Vec::new();
                     for h in self.output_down.drain(..).collect::<Vec<_>>() {
                         out.extend(self.emit_key(h, 0));
                     }
-                    // 上面已把注入的修饰键随 output_down 一并释放，清空记录，
-                    // 避免其释放事件在后续路径里重复发出。
+                                        // The injected modifiers have already been released along with output_down above, so clear the record,
+                                        // to avoid their release events being emitted again on a later path.
                     self.injected_mods.clear();
                     out.extend(self.emit_key(k, 1));
                     out.extend(self.emit_key(k, 0));
                     return out;
                 }
-                // 动作已执行完，不该再发按键
+                                // The action has already run; no key should be emitted
                 Some(Outcome::NoOutput) => return Vec::new(),
                 None if cmd_held => default_semantics(&cur_mods, code),
-                // 非 Cmd 组合且表里没有：原样透传
+                                // A non-Cmd combo with no table entry: pass through as-is
                 None => Default::PassthroughPlain,
             };
 
-            // 放行：把用户按的原样交给应用。
+                        // Pass through: hand what the user pressed to the app as-is.
             //
-            // Cmd 此前被抑制（未输出），故这里需显式补上——
-            // 它从未进入 output_down，不在此处补就会丢失，
-            // 发出一个缺 Cmd 的残缺组合。
+                        // Cmd was suppressed earlier (not output), so it must be explicitly re-added here —
+                        // it never entered output_down, and not adding it here would lose it,
+                        // emitting a crippled combo missing Cmd.
             let converted = match decision {
                 Default::PassthroughPlain => {
-                    // 非 Cmd 组合且表里无规则：原样透传。
+                                        // A non-Cmd combo with no rule in the table: pass through as-is.
                     //
-                    // 修饰键（Shift/Alt/Ctrl）按下时已透传过，此处**不得**
-                    // 重新按下或松开它们——否则每按一个键都会产生
-                    // 「松开 Shift 再按下 Shift」的抖动，
-                    // fcitx5 之类的输入法会因此漏字母。
+                                        // The modifiers (Shift/Alt/Ctrl) were already passed through on press, so here they must **not**
+                                        // be pressed or released again — otherwise every key press would produce a
+                                        // "release Shift then press Shift" jitter,
+                                        // and input methods like fcitx5 would drop letters because of it.
                     self.output_down.push(code);
                     self.pressed.insert(physical, code);
                     if self.verbose {
-                        eprintln!("[mapper] {:?}+{:?} 表中无规则 → 透传", cur_mods, code);
+                                                eprintln!("[mapper] {:?}+{:?} has no rule in the table → pass-through", cur_mods, code);
                     }
                     return self.emit_key(code, 1);
                 }
                 Default::Passthrough => {
-                    // Cmd 组合但无从转换：把用户按的原样交给应用。
+                                        // A Cmd combo with no way to convert: hand what the user pressed to the app as-is.
                     let mut out = Vec::new();
                     for h in self.output_down.drain(..).collect::<Vec<_>>() {
                         out.extend(self.emit_key(h, 0));
@@ -957,15 +957,15 @@ impl Mapper {
                         out.extend(self.emit_key(*m, 1));
                         self.output_down.push(*m);
                     }
-                    // Cmd 以真实 Super 身份发出。
+                                        // Cmd is emitted as a real Super.
                 //
-                // 必须同时把它从 `suppressed` 移除：Meta 按下时已被抑制，
-                // 从未进入 output_down。若不移除，释放路径会走
-                // `suppressed.remove()` 分支直接返回、不发释放——
-                // 于是这个注入的 Super 永久卡在按下态。
+                                // It must also be removed from `suppressed`: Meta was suppressed on press and
+                                // never entered output_down. If it is not removed, the release path takes
+                                // the `suppressed.remove()` branch, returns directly and emits no release —
+                                // leaving this injected Super stuck down forever.
                 //
-                // 后果是实机级的：锁屏后输密码，每个键都带着 Super，
-                // 数字 9 等输入不进去，只能硬关机。
+                                // The consequence is real-machine level: after locking the screen, when entering a password every key carries Super,
+                                // digits like 9 cannot be typed, and the only way out is a hard power-off.
                 self.suppressed.remove(&KeyCode::KEY_LEFTMETA);
                 out.extend(self.emit_key(KeyCode::KEY_LEFTMETA, 1));
                 self.output_down.push(KeyCode::KEY_LEFTMETA);
@@ -974,7 +974,7 @@ impl Mapper {
                 self.pressed.insert(physical, code);
                 if self.verbose {
                     eprintln!(
-                        "[mapper] Cmd+{:?}{:?} 无规则且无法转换 → 放行",
+                                                "[mapper] Cmd+{:?}{:?} has no rule and cannot be converted → pass through",
                         code, cur_mods
                     );
                 }
@@ -990,15 +990,15 @@ impl Mapper {
                     code,
                     out_mods,
                     out_key,
-                    if self.ctrl_busy_window { " (Ctrl 占用应用)" } else { "" }
+                                        if self.ctrl_busy_window { " (Ctrl-busy app)" } else { "" }
                 );
             }
 
             let mut out = Vec::new();
-            // 松开输出侧仍按下的修饰键，再按新的输出修饰键。
+                        // Release the modifiers still down on the output side, then press the new output modifiers.
             //
-            // 操作的是 output_down（输出状态），而非 held（物理状态）——
-            // 用户仍按着 Cmd 时，held 不得因发送事件而改变。
+                        // This operates on output_down (output state), not held (physical state) —
+                        // while the user is still holding Cmd, held must not change because events were sent.
             let down_now: Vec<KeyCode> = self.output_down.drain(..).collect();
             for h in down_now {
                 out.extend(self.emit_key(h, 0));
@@ -1015,20 +1015,20 @@ impl Mapper {
         }
     }
 
-    /// 释放处理。按下时做了翻译，这里必须还原。
+        /// Release handling. The press translated, so this must restore.
     fn handle_release(&mut self, code: KeyCode) -> Vec<InputEvent> {
-        // 1) 更新物理状态。held 存的是 remap 后的**逻辑键**，事件里是
-        //    **物理键**，两者都要清理。
+                // 1) Update physical state. held stores the remapped **logical key**, while the event carries the
+                //    **physical key**; both must be cleared.
         self.held_retain(|m| m != code);
         if let Some(&logical) = self.remap.get(&code) {
             self.held_retain(|m| m != logical);
         }
 
-        // 2) 查输出状态：该键若仍处于按下态，移除并准备发释放。
+                // 2) Check output state: if the key is still down, remove it and prepare to emit its release.
         //
-        // 若已不在 output_down 中，说明它此前已被组合键翻译提前松开
-        // （如 Cmd+Shift+Z 翻译时松开了透传的 Shift）。此时输出侧
-        // 早已无此键，再发一次释放就是多余的，可能被应用误读。
+                // If it is no longer in output_down, it was already released early by a combo translation
+                // (e.g. the pass-through Shift was released when translating Cmd+Shift+Z). The output side
+                // then has no such key anymore, and emitting a release again would be superfluous and might be misread by the app.
         let out_key = self.pressed.remove(&code);
         let still_down = out_key
             .map(|ok| {
@@ -1040,29 +1040,29 @@ impl Mapper {
             })
             .unwrap_or(false);
 
-        // 3) 抑制过的键：若输出侧确实没有它，也不发出释放。
+                // 3) Suppressed key: if the output side genuinely does not have it, emit no release either.
         //
-        // 判据是「输出侧是否仍按着」，**不是**「是否曾被抑制」。
-        // 曾被抑制的键也可能在后续路径里被主动发出——如
-        // `Ctrl+Cmd+Q` 锁屏会发出 `Super+L`，其中的 Super 就是
-        // 原本被抑制的 Meta。此时若按「曾被抑制」提前返回，
-        // 释放事件被吞掉，Super 永久卡在按下态：
-        // 之后空格变成 Cmd+空格、W 变成 Cmd+W。
+                // The criterion is "is it still down on the output side", **not** "was it ever suppressed".
+                // A key that was once suppressed may still be emitted deliberately on a later path — e.g.
+                // `Ctrl+Cmd+Q` lock screen emits `Super+L`, where the Super is exactly
+                // the Meta that was originally suppressed. In that case, returning early on "was suppressed"
+                // swallows the release, and Super stays stuck down forever:
+                // afterwards Space becomes Cmd+Space and W becomes Cmd+W.
         let was_suppressed = self.suppressed.remove(&code);
         if was_suppressed && !self.output_down.contains(&code) {
             return vec![];
         }
 
-        // 4) 若按下时有登记，则必须对称释放——但仅当输出侧确实仍处于按下态。
-        // 若 still_down 为 false，说明该键已被组合键翻译提前松开，
-        // 输出侧早已无它，此时再发释放就是多余事件。
+                // 4) If a registration exists from press time, the release must be symmetric — but only if the output side is genuinely still down.
+                // If still_down is false, the key was already released early by a combo translation,
+                // and the output side has long had no such key; emitting a release here would be a superfluous event.
         if let Some(output) = out_key {
             if !still_down {
                 return vec![];
             }
             let mut out = Vec::new();
             out.extend(self.emit_key(output, 0));
-            // 翻译时注入的修饰键在此一并松开，否则会残留在按下状态
+                        // The modifiers injected during translation are released here as well, otherwise they would remain down
             for m in std::mem::take(&mut self.injected_mods) {
                 out.extend(self.emit_key(m, 0));
                 self.output_down.retain(|x| *x != m);
@@ -1070,12 +1070,12 @@ impl Mapper {
             return out;
         }
 
-        // 无需在此重复 Fn 翻译：按下时已把「物理键 → 输出键」记入
-        // `pressed`（以物理键为键），上面的 `out_key` 分支直接对称释放。
-        // 若在此再翻译，一旦 Fn 先于 F 键松开就会得到错误的键。
+                // No need to repeat the Fn translation here: on press the "physical key → output key" was recorded in
+                // `pressed` (keyed by physical key), and the `out_key` branch above releases symmetrically directly.
+                // Translating again here would give the wrong key once Fn is released before the F key.
 
-        // 兜底：未登记的键。输出侧不处于按下态时不应发释放
-        // （那是一个无对应按下的多余事件）。
+                // Fallback: an unregistered key. When the output side is not down it must not emit a release
+                // (that would be a superfluous event with no matching press).
         if !self.output_down.contains(&code) {
             return vec![];
         }
@@ -1102,10 +1102,10 @@ impl Mapper {
         vec![InputEvent::new(EventType::KEY.0, code.0, value)]
     }
 }
-/// F1-F12 与亮度/媒体键的对应表。
+/// Table mapping F1-F12 to brightness/media keys.
 ///
-/// macBook 键盘顶排是双功能键。裸按时给 F 键，按住 Fn 时给亮度/音量/
-/// 播放控制。此表在用户态完成该切换，不依赖 `hid_apple` 的 `fnmode`。
+/// The MacBook keyboard's top row has dual-function keys. A bare press gives the F key, holding Fn gives brightness/volume/
+/// playback control. This table does the switch in user space, without relying on `hid_apple`'s `fnmode`.
 fn build_fkey_media_table() -> HashMap<KeyCode, KeyCode> {
     let pairs = [
         (KeyCode::KEY_F1, KeyCode::KEY_BRIGHTNESSDOWN),
@@ -1142,14 +1142,14 @@ mod tests {
 
     fn terminal_mapper() -> Mapper {
         let mut m = default_mapper();
-        // 注入「已判定为终端」的上下文，而非依赖某台机器上装没装 ghostty
-        // （不同发行版默认终端不同）。终端检测本身由 desktop 的测试覆盖。
-        // 用不会漏发 SIGINT 的终端作代表（ptyxis 有单独的规则，见下）
+                // Inject a "decided to be a terminal" context, rather than depending on whether some machine has ghostty installed
+                // (distros differ in default terminal). Terminal detection itself is covered by desktop's tests.
+                // Use a terminal that does not leak SIGINT as the representative (ptyxis has its own rule, see below)
         m.force_ctrl_busy_window("com.mitchellh.ghostty");
         m
     }
 
-    /// 终端里 Cmd 组合映射为 Ctrl+Shift，避开 Ctrl+C 中断等既有含义。
+        /// In a terminal, Cmd combos map to Ctrl+Shift, avoiding established meanings such as Ctrl+C interrupt.
     #[test]
     fn terminal_cmd_becomes_ctrl_shift() {
         let mut m = terminal_mapper();
@@ -1159,20 +1159,20 @@ mod tests {
             out.contains(&(KeyCode::KEY_LEFTCTRL.0, 1))
                 && out.contains(&(KeyCode::KEY_LEFTSHIFT.0, 1))
                 && out.contains(&(KeyCode::KEY_C.0, 1)),
-            "终端里 Cmd+C 应为 Ctrl+Shift+C（复制），实际 {out:?}"
+                        "in a terminal Cmd+C should be Ctrl+Shift+C (copy), actual {out:?}"
         );
     }
 
-    /// 终端里 Cmd+W → Ctrl+Shift+W（关标签页），Cmd+T → Ctrl+Shift+T。
+        /// In a terminal, Cmd+W → Ctrl+Shift+W (close tab), Cmd+T → Ctrl+Shift+T.
     ///
-    /// 这不是「躲冲突」而是「找对应」：空闲的是 Ctrl+W，而
-    /// Ctrl+Shift+W 恰是 Linux 终端关闭标签页的键。Toshy 的配置
-    /// 同为 `C("RC-W"): C("C-Shift-W")`。
+        /// This is not "dodging a conflict" but "finding the correspondence": what is idle is Ctrl+W, while
+        /// Ctrl+Shift+W is precisely the Linux terminal's close-tab key. Toshy's config
+        /// likewise uses `C("RC-W"): C("C-Shift-W")`.
     #[test]
     fn terminal_cmd_w_closes_tab() {
         for (key, why) in [
-            (KeyCode::KEY_W, "关标签页"),
-            (KeyCode::KEY_T, "新标签页"),
+                        (KeyCode::KEY_W, "close tab"),
+                        (KeyCode::KEY_T, "new tab"),
         ] {
             let mut m = terminal_mapper();
             m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
@@ -1181,26 +1181,26 @@ mod tests {
                 out.contains(&(KeyCode::KEY_LEFTCTRL.0, 1))
                     && out.contains(&(KeyCode::KEY_LEFTSHIFT.0, 1))
                     && out.contains(&(key.0, 1)),
-                "终端里 Cmd+{key:?}（{why}）应为 Ctrl+Shift+{key:?}，实际 {out:?}"
+                                "in a terminal Cmd+{key:?} ({why}) should be Ctrl+Shift+{key:?}, actual {out:?}"
             );
         }
     }
 
-    /// 概览（macOS 的 `Cmd+空格`）随 GNOME 版本有两种形态：
+        /// The overview (macOS's `Cmd+Space`) has two forms depending on the GNOME version:
     ///
-    /// - 旧版：`toggle-overview` 已绑定（EndeavourOS 实测 `Ctrl+Shift+空格`）
-    /// - GNOME 50 起：该动作默认未绑定（`@as []`），概览改由 mutter 的
-    ///   `overlay-key`（裸按 `Super`）触发，对应一次 Super 点按
+        /// - older: `toggle-overview` is bound (EndeavourOS observed `Ctrl+Shift+Space`)
+        /// - as of GNOME 50: the action is unbound by default (`@as []`), and the overview is triggered by mutter's
+        ///   `overlay-key` (a bare `Super` press), corresponding to a single Super tap
     ///
-    /// 两者都必须让 `Cmd+空格` 产出与动作一致的输出。
+        /// Both must make `Cmd+Space` produce output consistent with the action.
     #[test]
     fn cmd_space_maps_to_gnome_overview() {
         let Some(feature) = de_feature_accel(&DesktopType::Gnome, "overview") else {
-            // 本机未装 GNOME，或两种机制都查不到，跳过而非误判
+                        // GNOME is not installed on this machine, or neither mechanism can be found: skip rather than misjudge
             return;
         };
 
-        // 端到端：Cmd+空格 应产生该动作对应的键
+                // End-to-end: Cmd+Space should produce the keys corresponding to that action
         let mut m = default_mapper();
         m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
         let out = desc(&m.translate(&k(KeyCode::KEY_SPACE.0, 1)));
@@ -1208,34 +1208,34 @@ mod tests {
         match feature {
             DeKeys::Combo(mods, key) => {
                 for m in &mods {
-                    assert!(out.contains(&(m.0, 1)), "修饰键 {m:?} 未输出: {out:?}");
+                                        assert!(out.contains(&(m.0, 1)), "modifier {m:?} not emitted: {out:?}");
                 }
-                assert!(out.contains(&(key.0, 1)), "主键 {key:?} 未输出: {out:?}");
+                                assert!(out.contains(&(key.0, 1)), "main key {key:?} not emitted: {out:?}");
             }
             DeKeys::Tap(key) => {
                 assert!(
                     out.contains(&(key.0, 1)) && out.contains(&(key.0, 0)),
-                    "overlay-key 应被点按（按下后立即松开），实际 {out:?}"
+                                        "overlay-key should be tapped (pressed then immediately released), actual {out:?}"
                 );
-                // 点按必须干净：不得留下任何按下态的输出键，否则 mutter
-                // 看到的是带修饰键的组合，overlay-key 不触发。
+                                // The tap must be clean: no output key may be left down, otherwise mutter
+                                // sees a combo with modifiers and overlay-key does not trigger.
                 assert!(
                     m.output_down.is_empty(),
-                    "点按后输出侧仍残留按下态: {:?}",
+                                        "output side still has a pressed key after the tap: {:?}",
                     m.output_down
                 );
             }
         }
     }
 
-    /// `Ctrl+↑`（`cmd = false`）也必须能触发概览。
+        /// `Ctrl+↑` (`cmd = false`) must also be able to trigger the overview.
     ///
-    /// 关键差异：Ctrl 是用户物理按住的**透传**修饰键，落在 output_down 里。
-    /// 若点按前不清掉它，mutter 收到的是 `Ctrl+Super` 而非裸 Super，
-    /// overlay-key 不会开概览。本测试专门覆盖这一点——比 Cmd+空格 更严格。
+        /// Key difference: Ctrl is a **pass-through** modifier the user physically holds, and it lands in output_down.
+        /// If it is not cleared before the tap, mutter receives `Ctrl+Super` rather than a bare Super,
+        /// and overlay-key does not open the overview. This test specifically covers that — stricter than Cmd+Space.
     #[test]
     fn ctrl_up_overview_is_a_clean_tap() {
-        // 仅当概览走「点按」路径时才有意义（旧版为组合，已在上面覆盖）
+                // Only meaningful when the overview goes the "tap" path (older versions use a combo, covered above)
         if !matches!(
             de_feature_accel(&DesktopType::Gnome, "overview"),
             Some(DeKeys::Tap(_))
@@ -1248,26 +1248,26 @@ mod tests {
         let out = desc(&m.translate(&k(KeyCode::KEY_UP.0, 1)));
         assert!(
             m.output_down.is_empty(),
-            "点按前须释放透传的 Ctrl，实际残留 {:?}：{out:?}",
+                        "the pass-through Ctrl must be released before the tap; actual residual {:?}: {out:?}",
             m.output_down
         );
     }
 
-    /// KDE / 裸 WM 暂无对应实现，但不应 panic。
+        /// KDE / bare WM have no corresponding implementation yet, but must not panic.
     ///
-    /// 「不可查」不等于「不存在」——DE 只出现在 `de_action_lookup` 的表里，
-    /// 新增支持只需加一行，不必改任何分支逻辑。
+        /// "Cannot be looked up" does not mean "does not exist" — the DE only appears in the `de_action_lookup` table,
+        /// and adding support only requires one line, without touching any branching logic.
     #[test]
     fn unknown_desktop_skips_overview_gracefully() {
         assert!(de_action_lookup(&DesktopType::Kde, "overview").is_none());
         assert!(de_action_lookup(&DesktopType::None, "overview").is_none());
     }
 
-    /// 动态数据（DE 绑定、终端 schema）里的键名解析必须与配置用同一套规则。
+        /// Key-name parsing in dynamic data (DE bindings, terminal schemas) must use the same rules as config.
     ///
-    /// 此前 mapper 与 accel 各写一份 `plus`/`minus` 映射，已产生过分歧——
-    /// 一份有 `"space"` 特例而另一份没有，只因 `KEY_SPACE` 恰能被兜底
-    /// 分支解析出来才没暴露。
+        /// mapper and accel once each had their own `plus`/`minus` mapping, which already diverged —
+        /// one had a `"space"` special case and the other did not, and it only stayed hidden because `KEY_SPACE`
+        /// happened to be parsed by the fallback branch.
     #[test]
     fn external_key_parsing_is_consistent() {
         use crate::keys::parse_external_key as p;
@@ -1277,17 +1277,17 @@ mod tests {
         assert_eq!(p("F4"), Some(KeyCode::KEY_F4));
         assert_eq!(p("w"), Some(KeyCode::KEY_W));
         assert_eq!(p("KEY_A"), Some(KeyCode::KEY_A));
-        // GNOME 的 `overlay-key` 值是字符串 `Super`，概览兜底要能解析它
+                // GNOME's `overlay-key` value is the string `Super`; the overview fallback must be able to parse it
         assert_eq!(p("Super"), Some(KeyCode::KEY_LEFTMETA));
         assert_eq!(p(""), None);
         assert_eq!(p("NotAKey"), None);
     }
 
-    /// ptyxis 的新窗口/关窗口键由它自己的 GSettings 决定，不靠猜。
+        /// ptyxis's new-window/close-window keys are decided by its own GSettings, not by guessing.
     ///
-    /// ptyxis 声明 `new-window = Ctrl+Shift+N`。手写白名单曾漏掉 `n`，
-    /// 导致 `Cmd+N` 退化为 `Ctrl+N`（readline 的「下一行」），开不了
-    /// 新窗口。此处直接读它的 schema，用户改过绑定也能跟上。
+        /// ptyxis declares `new-window = Ctrl+Shift+N`. A hand-written whitelist once missed `n`,
+        /// making `Cmd+N` degrade to `Ctrl+N` (readline's "next line") and fail to open a
+        /// new window. Here we read its schema directly, so a changed binding is followed too.
     #[test]
     fn ptyxis_new_window_comes_from_its_own_schema() {
         let mut m = default_mapper();
@@ -1298,13 +1298,13 @@ mod tests {
             out.contains(&(KeyCode::KEY_LEFTCTRL.0, 1))
                 && out.contains(&(KeyCode::KEY_LEFTSHIFT.0, 1))
                 && out.contains(&(KeyCode::KEY_N.0, 1)),
-            "ptyxis 的 Cmd+N 应为 Ctrl+Shift+N（新窗口），实际 {out:?}"
+                        "ptyxis Cmd+N should be Ctrl+Shift+N (new window), actual {out:?}"
         );
     }
 
-    /// ptyxis 的关窗口键是 Ctrl+Shift+Q（其 schema 所声明），
-    /// 但全局规则 Cmd+Q → Alt+F4 优先——Alt+F4 是 GNOME 的 close
-    /// 绑定，跨应用一致，不该被终端特化吞掉。
+        /// ptyxis's close-window key is Ctrl+Shift+Q (as its schema declares),
+        /// but the global rule Cmd+Q → Alt+F4 takes priority — Alt+F4 is GNOME's close
+        /// binding, consistent across apps, and must not be swallowed by the terminal specialization.
     #[test]
     fn cmd_q_stays_alt_f4_in_ptyxis() {
         let mut m = default_mapper();
@@ -1314,18 +1314,18 @@ mod tests {
         assert!(
             out.contains(&(KeyCode::KEY_LEFTALT.0, 1))
                 && out.contains(&(KeyCode::KEY_F4.0, 1)),
-            "ptyxis 的 Cmd+Q 应为 Alt+F4，实际 {out:?}"
+                        "ptyxis Cmd+Q should be Alt+F4, actual {out:?}"
         );
     }
 
-    /// ptyxis / konsole 的复制键改走 Ctrl+Insert。
+        /// ptyxis / konsole's copy key goes through Ctrl+Insert instead.
     ///
-    /// 这两个终端在**无选中文本**时会把 `Ctrl+Shift+C` 穿透给子进程
-    /// 当作 SIGINT ——「复制」会杀掉正在跑的任务。`Ctrl+Insert` 是
-    /// X11 传统复制键，终端都支持且不会被当作控制字符发送。
+        /// With **no selected text**, these two terminals pass `Ctrl+Shift+C` through to the child process
+        /// as SIGINT — "copy" would kill the running task. `Ctrl+Insert` is
+        /// the traditional X11 copy key; all terminals support it and it is not sent as a control character.
     ///
-    /// 而 wezterm / ghostty / gnome-terminal 无此问题（无条件吞掉该
-    /// 组合），故不受影响。
+        /// Whereas wezterm / ghostty / gnome-terminal do not have this problem (they swallow the
+        /// combo unconditionally), so they are unaffected.
     #[test]
     fn sigint_leaky_terminals_use_ctrl_insert() {
         for wm in ["org.gnome.Ptyxis", "org.kde.konsole"] {
@@ -1336,19 +1336,19 @@ mod tests {
             assert!(
                 out.contains(&(KeyCode::KEY_LEFTCTRL.0, 1))
                     && out.contains(&(KeyCode::KEY_INSERT.0, 1)),
-                "{wm} 的 Cmd+C 应为 Ctrl+Insert（避免 SIGINT），实际 {out:?}"
+                                "{wm} Cmd+C should be Ctrl+Insert (avoid SIGINT), actual {out:?}"
             );
             assert!(
                 !out.iter().any(|(c, _)| *c == KeyCode::KEY_LEFTSHIFT.0),
-                "{wm} 的 Cmd+C 不应带 Shift: {out:?}"
+                                "{wm} Cmd+C must not carry Shift: {out:?}"
             );
         }
     }
 
-    /// 不漏发 SIGINT 的终端仍走普通终端路径（Ctrl+Shift+C）。
+        /// Terminals that do not leak SIGINT still take the normal terminal path (Ctrl+Shift+C).
     ///
-    /// 若一律改用 Ctrl+Insert，会让这些终端失去标准复制键——所以
-    /// 该规则必须按应用区分，不能全局套用。
+        /// Switching them all to Ctrl+Insert would cost these terminals their standard copy key — so
+        /// the rule must be per-app and cannot be applied globally.
     #[test]
     fn safe_terminals_keep_ctrl_shift_c() {
         let mut m = terminal_mapper();
@@ -1358,7 +1358,7 @@ mod tests {
         assert!(out.contains(&(KeyCode::KEY_C.0, 1)), "{out:?}");
     }
 
-    /// 普通应用里 Cmd+C 不受该规则影响，仍是 Ctrl+C。
+        /// In an ordinary app, Cmd+C is unaffected by that rule and stays Ctrl+C.
     #[test]
     fn normal_app_cmd_c_is_plain_ctrl() {
         let mut m = default_mapper();
@@ -1372,18 +1372,18 @@ mod tests {
         );
     }
 
-    /// Cmd+Q → Alt+F4，且**终端与普通应用一致**。
+        /// Cmd+Q → Alt+F4, and **the same for terminals and ordinary apps**.
     ///
-    /// 这是「逐键白名单」相对「整体换语义」的关键区别：macOS 的
-    /// Cmd+Q（退出应用）对应 Linux 的 Alt+F4（GNOME 的
-    /// wm.keybindings close），这是跨应用的通用绑定。若终端里把 Cmd
-    /// 一律变成 Ctrl+Shift，Cmd+Q 会退化成谁也不认的 Ctrl+Shift+Q。
+        /// This is the key difference of the "per-key whitelist" versus "swap the semantics wholesale": macOS's
+        /// Cmd+Q (quit app) corresponds to Linux's Alt+F4 (GNOME's
+        /// wm.keybindings close), a universal cross-app binding. If a terminal turned Cmd
+        /// uniformly into Ctrl+Shift, Cmd+Q would degrade to a Ctrl+Shift+Q nobody recognizes.
     #[test]
     fn cmd_q_is_alt_f4_everywhere() {
         for (wm, label) in [
-            ("org.gnome.Nautilus", "普通应用"),
-            ("org.gnome.Ptyxis", "终端"),
-            ("com.mitchellh.ghostty", "终端"),
+                        ("org.gnome.Nautilus", "ordinary app"),
+                        ("org.gnome.Ptyxis", "terminal"),
+                        ("com.mitchellh.ghostty", "terminal"),
         ] {
             let mut m = default_mapper();
             m.set_window_id(wm);
@@ -1392,15 +1392,15 @@ mod tests {
             assert!(
                 out.contains(&(KeyCode::KEY_LEFTALT.0, 1))
                     && out.contains(&(KeyCode::KEY_F4.0, 1)),
-                "{label}（{wm}）Cmd+Q 应为 Alt+F4，实际 {out:?}"
+                                "{label} ({wm}) Cmd+Q should be Alt+F4, actual {out:?}"
             );
         }
     }
 
-    /// 终端里未列入白名单的键仍走默认语义（Ctrl），不被特化。
+        /// In a terminal, keys not on the whitelist still take the default semantics (Ctrl), not specialized.
     ///
-    /// 例如 Cmd+N：终端的 Ctrl+N 通常空闲，无需变成 Ctrl+Shift+N。
-    /// 笼统地「终端里一律加 Shift」会毁掉这类键。
+        /// For example Cmd+N: the terminal's Ctrl+N is usually idle, so no need to become Ctrl+Shift+N.
+        /// Blanket "always add Shift in a terminal" would ruin keys like this.
     #[test]
     fn terminal_unlisted_key_stays_plain_ctrl() {
         let mut m = terminal_mapper();
@@ -1410,14 +1410,14 @@ mod tests {
         assert!(out.contains(&(KeyCode::KEY_N.0, 1)), "{out:?}");
         assert!(
             !out.iter().any(|(c, v)| *c == KeyCode::KEY_LEFTSHIFT.0 && *v == 1),
-            "白名单外的键不应加 Shift: {out:?}"
+                        "a key off the whitelist must not add Shift: {out:?}"
         );
     }
 
     #[test]
     fn capslock_becomes_leftctrl() {
         let mut m = default_mapper();
-        // 按下 CapsLock(58) 应输出 LEFTCTRL(29)
+                // Pressing CapsLock (58) should output LEFTCTRL (29)
         let out = m.translate(&k(KeyCode::KEY_CAPSLOCK.0, 1));
         assert_eq!(desc(&out), vec![(KeyCode::KEY_LEFTCTRL.0, 1)]);
     }
@@ -1432,27 +1432,27 @@ mod tests {
     #[test]
     fn cmd_c_becomes_ctrl_c() {
         let mut m = default_mapper();
-        m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1)); // 按下 Cmd，应无输出
+                m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1)); // press Cmd, should produce no output
         let out = m.translate(&k(KeyCode::KEY_C.0, 1));
-        // 期望: 按下 Ctrl(29,1) → 按下 c(46,1)
-        // Cmd 从未向输出侧按下，故不应出现它的释放事件。
+                // Expected: press Ctrl (29,1) → press c (46,1)
+                // Cmd was never pressed to the output side, so its release must not appear.
         let d = desc(&out);
         assert!(
             !d.contains(&(KeyCode::KEY_LEFTMETA.0, 0)),
-            "Cmd 从未按下，不应有释放: {d:?}"
+                        "Cmd was never pressed, so there should be no release: {d:?}"
         );
-        assert!(d.contains(&(KeyCode::KEY_LEFTCTRL.0, 1)), "应按下 Ctrl: {d:?}");
-        assert!(d.contains(&(KeyCode::KEY_C.0, 1)), "应按下 c: {d:?}");
+                assert!(d.contains(&(KeyCode::KEY_LEFTCTRL.0, 1)), "should press Ctrl: {d:?}");
+                assert!(d.contains(&(KeyCode::KEY_C.0, 1)), "should press c: {d:?}");
     }
 
     #[test]
     fn cmd_not_in_table_passes_through() {
         let mut m = default_mapper();
         m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
-        // Cmd+E 不在默认表里，应原样透传
+                // Cmd+E is not in the default table, so it should pass through as-is
         let out = m.translate(&k(KeyCode::KEY_E.0, 1));
         let d = desc(&out);
-        assert!(d.contains(&(KeyCode::KEY_E.0, 1)), "E 应原样输出: {d:?}");
+                assert!(d.contains(&(KeyCode::KEY_E.0, 1)), "E should be output as-is: {d:?}");
         assert!(!d.iter().any(|(_, v)| *v == 1 && false));
     }
 
@@ -1460,74 +1460,74 @@ mod tests {
     fn repeat_events_filtered() {
         let mut m = default_mapper();
         let out = m.translate(&k(KeyCode::KEY_CAPSLOCK.0, 2)); // value=2
-        assert!(out.is_empty(), "自动重复事件应被丢弃");
+                assert!(out.is_empty(), "auto-repeat events should be dropped");
     }
 
-    /// MISC 等非按键事件必须丢弃。
+        /// Non-key events such as MISC must be dropped.
     ///
-    /// 曾尝试原样转发以保留触控板活动，但转发会把 ABS 多点触控事件一并
-    /// 送到未声明 EV_ABS 能力的虚拟设备，导致触控板与按键双双异常。
-    /// 触控板交由原设备处理，mackbind 只负责键盘。
+        /// Forwarding them as-is to keep trackpad activity was tried, but forwarding sends the ABS multi-touch events
+        /// to a virtual device that does not declare EV_ABS capability, making both the trackpad and the keys misbehave.
+        /// The trackpad is left to the original device; mackbind only handles the keyboard.
     #[test]
     fn misc_events_filtered() {
         let mut m = default_mapper();
         let ev = InputEvent::new(EventType::MISC.0, 4, 0);
-        assert!(m.translate(&ev).is_empty(), "MISC 应丢弃");
+                assert!(m.translate(&ev).is_empty(), "MISC should be dropped");
     }
 
-    /// SYNCHRONIZATION 例外：uinput 的 emit() 会自动补 SYN_REPORT，
-    /// 再转发原始 SYN 会把一个批次拆成多个同步报告。
+        /// Exception for SYNCHRONIZATION: uinput's emit() adds SYN_REPORT automatically,
+        /// so forwarding the original SYN splits one batch into multiple sync reports.
     #[test]
     fn sync_events_filtered() {
         let mut m = default_mapper();
         let ev = InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0);
-        assert!(m.translate(&ev).is_empty(), "SYN 应由 uinput 自动补，不转发");
+                assert!(m.translate(&ev).is_empty(), "SYN is added automatically by uinput, not forwarded");
     }
 
     #[test]
     fn ctrl_v_after_capslock_is_real_ctrl() {
-        // 核心场景：CapsLock 位置的 Ctrl 在终端里应产生真正的 Ctrl+V。
-        // 注意 Ctrl 是在 CapsLock 按下时就已注入输出的，因此 V 本身
-        // 只需输出自身——输出侧此刻已处于 Ctrl 按下状态。
+                // Core scenario: the Ctrl at the CapsLock position should produce a real Ctrl+V in a terminal.
+                // Note Ctrl is already injected to the output when CapsLock is pressed, so V itself
+                // only needs to output itself — the output side is already in the Ctrl-down state.
         let mut m = default_mapper();
         m.set_window_id("org.gnome.Console");
 
         let first = m.translate(&k(KeyCode::KEY_CAPSLOCK.0, 1));
-        assert_eq!(desc(&first), vec![(KeyCode::KEY_LEFTCTRL.0, 1)], "Caps 应输出真 Ctrl");
+                assert_eq!(desc(&first), vec![(KeyCode::KEY_LEFTCTRL.0, 1)], "Caps should output a real Ctrl");
 
         let second = m.translate(&k(KeyCode::KEY_V.0, 1));
-        assert_eq!(desc(&second), vec![(KeyCode::KEY_V.0, 1)], "V 自身原样输出");
+                assert_eq!(desc(&second), vec![(KeyCode::KEY_V.0, 1)], "V itself is output as-is");
 
-        // 全程不应出现 Cmd（Super）
+                // Cmd (Super) must not appear anywhere in the sequence
         let mut all = first;
         all.extend(second);
         assert!(
             desc(&all).iter().all(|(c, _)| *c != KeyCode::KEY_LEFTMETA.0),
-            "Ctrl+V 路径中不应出现 Cmd: {:?}",
+                        "Cmd must not appear in the Ctrl+V path: {:?}",
             desc(&all)
         );
     }
 
     #[test]
     fn cmd_c_output_is_released_symmetrically() {
-        // Cmd+C → Ctrl+C，之后松开所有键，输出侧应回到无修饰键状态
+                // Cmd+C → Ctrl+C; then release all keys; the output side should return to no modifiers
         let mut m = default_mapper();
         m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
         let press = m.translate(&k(KeyCode::KEY_C.0, 1));
 
-        // 释放主键
+                // Release the main key
         let rel_c = m.translate(&k(KeyCode::KEY_C.0, 0));
         assert!(desc(&rel_c).contains(&(KeyCode::KEY_C.0, 0)));
 
-        // 释放 Cmd：Cmd 全程被抑制，从未按下，故不产生任何事件
+                // Release Cmd: it was suppressed throughout and never pressed, so it produces no events
         let rel_meta = m.translate(&k(KeyCode::KEY_LEFTMETA.0, 0));
         assert!(
             desc(&rel_meta).is_empty(),
-            "Cmd 被抑制，释放应无输出: {:?}",
+                        "Cmd was suppressed, so its release should produce no output: {:?}",
             desc(&rel_meta)
         );
 
-        // 全序列末尾：所有修饰键都必须已释放，不得有残留的按下状态
+                // End of the whole sequence: every modifier must have been released, with no residual pressed state
         let all: Vec<InputEvent> = press
             .into_iter()
             .chain(rel_c)
@@ -1535,10 +1535,10 @@ mod tests {
             .collect();
         assert!(
             all.last().is_some_and(|e| e.value() == 0),
-            "序列应以释放事件收尾: {:?}",
+                        "the sequence should end with a release event: {:?}",
             desc(&all)
         );
-        // Ctrl 的按下与释放必须成对出现
+                // Ctrl's press and release must occur in pairs
         let ctrl_down = all
             .iter()
             .filter(|e| e.code() == KeyCode::KEY_LEFTCTRL.0 && e.value() == 1)
@@ -1547,7 +1547,7 @@ mod tests {
             .iter()
             .filter(|e| e.code() == KeyCode::KEY_LEFTCTRL.0 && e.value() == 0)
             .count();
-        assert_eq!(ctrl_down, ctrl_up, "Ctrl 按下/释放次数应相等: {:?}", desc(&all));
+                assert_eq!(ctrl_down, ctrl_up, "Ctrl press/release count should be equal: {:?}", desc(&all));
     }
 
     #[test]
@@ -1570,41 +1570,41 @@ mod regression {
         evs.iter().map(|e| (e.code(), e.value())).collect()
     }
 
-    /// 回归：CapsLock 按下又松开后，不应残留在 held 中。
-    /// 实测 bug：Cmd+C 的输出里混入了 KEY_CAPSLOCK 0。
+        /// Regression: after CapsLock is pressed and released, it must not remain in held.
+        /// Observed bug: KEY_CAPSLOCK 0 was mixed into the output of Cmd+C.
     #[test]
     fn remapped_modifier_does_not_persist_in_held() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
 
-        // 按下并松开 CapsLock（逻辑上变LEFTCTRL）
+                // Press and release CapsLock (logically becomes LEFTCTRL)
         m.translate(&k(KeyCode::KEY_CAPSLOCK.0, 1));
         m.translate(&k(KeyCode::KEY_CAPSLOCK.0, 0));
 
-        // 再按物理左 Ctrl 并松开
+                // Then press physical left Ctrl and release it
         m.translate(&k(KeyCode::KEY_LEFTCTRL.0, 1));
         m.translate(&k(KeyCode::KEY_LEFTCTRL.0, 0));
 
         assert!(
             m.held.is_empty(),
-            "held 应为空，实际残留 {:?}",
+                        "held should be empty, actual residual {:?}",
             m.held
         );
 
-        // 随后按 Cmd+C，输出不应包含任何 CAPSLOCK 事件
+                // Then press Cmd+C; the output must not contain any CAPSLOCK event
         m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
         let out = m.translate(&k(KeyCode::KEY_C.0, 1));
         let d = desc(&out);
         assert!(
             !d.iter().any(|(c, _)| *c == KeyCode::KEY_CAPSLOCK.0),
-            "Cmd+C 输出不应含 CAPSLOCK: {d:?}"
+                        "Cmd+C output must not contain CAPSLOCK: {d:?}"
         );
         assert!(
             d.iter().any(|(c, _)| *c == KeyCode::KEY_LEFTCTRL.0),
-            "应输出 Ctrl: {d:?}"
+                        "should output Ctrl: {d:?}"
         );
     }
 
-    /// 回归：先按 CapsLock 位置(实为Ctrl)再按 Cmd，不应误判为组合。
+        /// Regression: pressing the CapsLock position (actually Ctrl) then Cmd must not be mistaken for a combo.
     #[test]
     fn caps_then_cmd_does_not_leak() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
@@ -1613,7 +1613,7 @@ mod regression {
         m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
         let out = m.translate(&k(KeyCode::KEY_C.0, 1));
         let d = desc(&out);
-        // 只应有一个 LEFTCTRL（来自Cmd+C），不能有 CAPSLOCK 释放
+                // There should be only one LEFTCTRL (from Cmd+C), and no CAPSLOCK release
         assert!(!d.iter().any(|(c, _)| *c == KeyCode::KEY_CAPSLOCK.0), "{d:?}");
     }
 }
@@ -1630,16 +1630,16 @@ mod modifier_passthrough_tests {
         evs.iter().map(|e| (e.code(), e.value())).collect()
     }
 
-    /// 回归：Shift 必须原样输出。
-    /// 实测 bug：Shift 被抑制，fcitx5 监听裸 Shift_L 切换输入法失效。
+        /// Regression: Shift must be output as-is.
+        /// Observed bug: Shift was suppressed, breaking fcitx5's watching of a bare Shift_L to switch input method.
     #[test]
     fn shift_is_passed_through() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
         let down = m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 1));
-        assert_eq!(desc(&down), vec![(KeyCode::KEY_LEFTSHIFT.0, 1)], "Shift 按下必须输出");
+                assert_eq!(desc(&down), vec![(KeyCode::KEY_LEFTSHIFT.0, 1)], "Shift press must be output");
 
         let up = m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 0));
-        assert_eq!(desc(&up), vec![(KeyCode::KEY_LEFTSHIFT.0, 0)], "Shift 释放必须输出");
+                assert_eq!(desc(&up), vec![(KeyCode::KEY_LEFTSHIFT.0, 0)], "Shift release must be output");
     }
 
     #[test]
@@ -1652,26 +1652,26 @@ mod modifier_passthrough_tests {
         ] {
             let mut m2 = Mapper::new(&Config::with_defaults(), false).unwrap();
             let d = m2.translate(&k(code.0, 1));
-            assert_eq!(desc(&d), vec![(code.0, 1)], "{code:?} 应原样输出");
+                        assert_eq!(desc(&d), vec![(code.0, 1)], "{code:?} should be output as-is");
         }
         let _ = &mut m;
     }
 
-    /// Cmd 仍须抑制——这是设计核心。
+        /// Cmd must still be suppressed — this is the core of the design.
     #[test]
     fn cmd_is_still_suppressed() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
         let down = m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
-        assert!(down.is_empty(), "Cmd 按下应抑制（表外组合需保持 Super 语义）");
+                assert!(down.is_empty(), "Cmd press should be suppressed (off-table combos must keep Super semantics)");
     }
 
-    /// Cmd+Shift+a 应输出 Shift+a（Cmd 在表外，Shift 需真实存在）
+        /// Cmd+Shift+a should output Shift+a (Cmd is off-table, Shift must really exist)
     #[test]
     fn cmd_shift_combo_keeps_shift() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
         m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
         let out = m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 1));
-        assert_eq!(desc(&out), vec![(KeyCode::KEY_LEFTSHIFT.0, 1)], "Shift 应输出");
+                assert_eq!(desc(&out), vec![(KeyCode::KEY_LEFTSHIFT.0, 1)], "Shift should be output");
     }
 }
 
@@ -1686,8 +1686,8 @@ mod press_release_symmetry {
         evs.iter().map(|e| (e.code(), e.value())).collect()
     }
 
-    /// 每一个透传的键，按下与释放必须成对出现且键码一致。
-    /// 这直接对应用户问题：Shift 释放了为什么没透传出去。
+        /// Every pass-through key's press and release must occur in pairs with matching keycodes.
+        /// This maps directly to the user's question: Shift was released, why was it not passed through.
     #[test]
     fn every_passthrough_modifier_is_symmetric() {
         for code in [
@@ -1700,12 +1700,12 @@ mod press_release_symmetry {
             let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
             let down = desc(&m.translate(&k(code.0, 1)));
             let up = desc(&m.translate(&k(code.0, 0)));
-            assert_eq!(down, vec![(code.0, 1)], "{code:?} 按下应原样输出");
-            assert_eq!(up, vec![(code.0, 0)], "{code:?} 释放应原样输出");
+                        assert_eq!(down, vec![(code.0, 1)], "{code:?} press should be output as-is");
+                        assert_eq!(up, vec![(code.0, 0)], "{code:?} release should be output as-is");
         }
     }
 
-    /// 普通字符键同样必须对称
+        /// Plain character keys must be symmetric too
     #[test]
     fn plain_keys_are_symmetric() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
@@ -1713,17 +1713,17 @@ mod press_release_symmetry {
         assert_eq!(desc(&m.translate(&k(KeyCode::KEY_A.0, 0))), vec![(KeyCode::KEY_A.0, 0)]);
     }
 
-    /// remap 过的键：按下输出目标键，释放也输出目标键
+        /// A remapped key: press outputs the target key, release also outputs the target key
     #[test]
     fn remapped_key_release_uses_target() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
         let down = desc(&m.translate(&k(KeyCode::KEY_CAPSLOCK.0, 1)));
         let up = desc(&m.translate(&k(KeyCode::KEY_CAPSLOCK.0, 0)));
         assert_eq!(down, vec![(KeyCode::KEY_LEFTCTRL.0, 1)]);
-        assert_eq!(up, vec![(KeyCode::KEY_LEFTCTRL.0, 0)], "释放须用目标键");
+                assert_eq!(up, vec![(KeyCode::KEY_LEFTCTRL.0, 0)], "release must use the target key");
     }
 
-    /// 连续多次 Shift 时不应有状态残留
+        /// Repeated Shift cycles must leave no residual state
     #[test]
     fn repeated_shift_cycles_clean() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
@@ -1731,8 +1731,8 @@ mod press_release_symmetry {
             m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 1));
             m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 0));
         }
-        assert!(m.pressed.is_empty(), "残留: {:?}", m.pressed);
-        assert!(m.held.is_empty(), "held 残留: {:?}", m.held);
+                assert!(m.pressed.is_empty(), "residual: {:?}", m.pressed);
+                assert!(m.held.is_empty(), "held residual: {:?}", m.held);
     }
 }
 
@@ -1747,8 +1747,8 @@ mod cmd_shift_combo {
         evs.iter().map(|e| (e.code(), e.value())).collect()
     }
 
-    /// 新模型下，Cmd+Shift+Z 不再走白名单，而是由默认语义处理：
-    /// 保留 Shift，输出 Ctrl+Shift+Z。Linux 上 Ctrl+Shift+Z 正是重做。
+        /// Under the new model, Cmd+Shift+Z no longer goes through a whitelist but is handled by the default
+        /// semantics: keep Shift and output Ctrl+Shift+Z. On Linux Ctrl+Shift+Z is exactly redo.
     #[test]
     fn cmd_shift_z_keeps_shift() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
@@ -1759,19 +1759,19 @@ mod cmd_shift_combo {
         assert!(
             d.contains(&(KeyCode::KEY_LEFTCTRL.0, 1)) && d.contains(&(KeyCode::KEY_LEFTSHIFT.0, 1))
                 && d.contains(&(KeyCode::KEY_Z.0, 1)),
-            "Cmd+Shift+Z 应输出 Ctrl+Shift+Z，实际: {d:?}"
+                        "Cmd+Shift+Z should output Ctrl+Shift+Z, actual: {d:?}"
         );
     }
 
-    /// 反向验证：只按 Cmd（无 Shift）时不应命中 Shift+Z 条目
+        /// Reverse check: pressing only Cmd (no Shift) must not hit the Shift+Z entry
     #[test]
     fn cmd_z_without_shift_is_undo() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
         m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
         let out = m.translate(&k(KeyCode::KEY_Z.0, 1));
         let d = desc(&out);
-        assert!(d.contains(&(KeyCode::KEY_Z.0, 1)), "应输出 z（撤销），实际: {d:?}");
-        assert!(!d.contains(&(KeyCode::KEY_Y.0, 1)), "不应输出 y: {d:?}");
+                assert!(d.contains(&(KeyCode::KEY_Z.0, 1)), "should output z (undo), actual: {d:?}");
+                assert!(!d.contains(&(KeyCode::KEY_Y.0, 1)), "must not output y: {d:?}");
     }
 }
 
@@ -1786,25 +1786,25 @@ mod key_ordering {
         evs.iter().map(|e| (e.code(), e.value())).collect()
     }
 
-    /// 用户实测：Cmd+Z 应撤销（输出 z），但曾变成裸 z（Cmd 丢失）。
-    /// 说明命中翻译后，Cmd 的释放事件没有被正确处理。
+        /// User-observed: Cmd+Z should undo (output z) but once became a bare z (Cmd lost).
+        /// This means that after a translation hit, Cmd's release event was not handled correctly.
     #[test]
     fn cmd_z_releases_cmd_and_emits_z() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
         m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
         let out = m.translate(&k(KeyCode::KEY_Z.0, 1));
         let d = desc(&out);
-        assert!(d.contains(&(KeyCode::KEY_Z.0, 1)), "必须按下 z: {d:?}");
-        assert!(d.contains(&(KeyCode::KEY_LEFTCTRL.0, 1)), "必须按下 Ctrl: {d:?}");
-        // Cmd 被抑制，从未按下，故无释放事件
+                assert!(d.contains(&(KeyCode::KEY_Z.0, 1)), "must press z: {d:?}");
+                assert!(d.contains(&(KeyCode::KEY_LEFTCTRL.0, 1)), "must press Ctrl: {d:?}");
+                // Cmd was suppressed and never pressed, so there is no release event
         assert!(
             !d.contains(&(KeyCode::KEY_LEFTMETA.0, 0)),
-            "Cmd 未按下，不应发释放: {d:?}"
+                        "Cmd was not pressed, so no release should be emitted: {d:?}"
         );
     }
 
-    /// 用户实测：Cmd+Shift+Z 曾触发输入法切换，说明 Shift 被单独输出。
-    /// 正确行为：Shift 应在翻译后被松开，不应残留为裸 Shift。
+        /// User-observed: Cmd+Shift+Z once triggered an input-method switch, meaning Shift was output alone.
+        /// Correct behavior: Shift should be released after translation, and must not remain as a bare Shift.
     #[test]
     fn cmd_shift_z_does_not_leak_shift() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
@@ -1812,12 +1812,12 @@ mod key_ordering {
         m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 1));
         let out = m.translate(&k(KeyCode::KEY_Z.0, 1));
         let d = desc(&out);
-        // Shift 此前已透传按下，翻译时必须松开，否则会残留为裸 Shift
+                // Shift was previously passed through as pressed; it must be released on translation, otherwise a bare Shift remains
         assert!(
             d.contains(&(KeyCode::KEY_LEFTSHIFT.0, 0)),
-            "Shift 透传按下过，翻译时必须松开: {d:?}"
+                        "Shift was passed through as pressed; it must be released on translation: {d:?}"
         );
-        assert!(d.contains(&(KeyCode::KEY_Z.0, 1)), "应输出 z: {d:?}");
+                assert!(d.contains(&(KeyCode::KEY_Z.0, 1)), "should output z: {d:?}");
     }
 }
 
@@ -1831,10 +1831,10 @@ mod collision_tests {
         evs.iter().map(|e| (e.code(), e.value())).collect()
     }
 
-    /// 显式规则优先于默认语义。
+        /// An explicit rule takes priority over the default semantics.
     ///
-    /// Cmd+[ 在 macOS 是「上一个文件夹」，Linux 上对应 Alt+←，与默认的
-    /// Ctrl+[ 不同——这正是需要显式规则的情形。
+        /// Cmd+[ on macOS is "previous folder", corresponding to Alt+← on Linux, unlike the default
+        /// Ctrl+[ — this is exactly the case that needs an explicit rule.
     #[test]
     fn explicit_rule_overrides_default() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
@@ -1842,12 +1842,12 @@ mod collision_tests {
         let out = desc(&m.translate(&k(KeyCode::KEY_LEFTBRACE.0, 1)));
         assert!(
             out.contains(&(KeyCode::KEY_LEFTALT.0, 1)) && out.contains(&(KeyCode::KEY_LEFT.0, 1)),
-            "Cmd+[ 应输出 Alt+←: {out:?}"
+                        "Cmd+[ should output Alt+←: {out:?}"
         );
-        assert!(!out.contains(&(KeyCode::KEY_LEFTCTRL.0, 1)), "不应含 Ctrl: {out:?}");
+                assert!(!out.contains(&(KeyCode::KEY_LEFTCTRL.0, 1)), "must not contain Ctrl: {out:?}");
     }
 
-    /// 同样覆盖 Cmd+S / Cmd+Shift+S
+        /// Likewise covers Cmd+S / Cmd+Shift+S
     #[test]
     fn save_and_saveas_coexist() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
@@ -1856,9 +1856,9 @@ mod collision_tests {
         assert!(save.contains(&(KeyCode::KEY_S.0, 1)), "Cmd+S → Ctrl+S: {save:?}");
     }
 
-    /// 未登记的组合走默认语义：输出 Ctrl+Shift+T。
+        /// An unmapped combo goes through the default semantics: output Ctrl+Shift+T.
     ///
-    /// 这正是新模型的意义——长尾组合无需穷举即可正确映射。
+        /// This is exactly the point of the new model — long-tail combos map correctly without exhaustive enumeration.
     #[test]
     fn unmapped_combo_gets_default_translation() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
@@ -1867,7 +1867,7 @@ mod collision_tests {
         let out = desc(&m.translate(&k(KeyCode::KEY_T.0, 1)));
         assert!(
             out.contains(&(KeyCode::KEY_LEFTCTRL.0, 1)) && out.contains(&(KeyCode::KEY_T.0, 1)),
-            "Cmd+Shift+T 应输出 Ctrl+Shift+T: {out:?}"
+                        "Cmd+Shift+T should output Ctrl+Shift+T: {out:?}"
         );
     }
 }
@@ -1879,27 +1879,27 @@ mod state_separation {
         InputEvent::new(EventType::KEY.0, c, v)
     }
 
-    /// 核心不变量：**held 只反映物理状态，永不因发送事件而改变。**
+        /// Core invariant: **held reflects physical state only and never changes because an event was sent.**
     ///
-    /// 用户报告的 bug（Cmd+Z 变裸 z）根因正是一次组合翻译把 held
-    /// drain 掉了——Cmd 其实还按着，内部却以为已松开。
+        /// The root cause of the bug the user reported (Cmd+Z became a bare z) was exactly that one combo
+        /// translation drained held — Cmd was in fact still held, but internally it was thought released.
     #[test]
     fn held_survives_combo_translation() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
         m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
         assert!(m.held.contains(&KeyCode::KEY_LEFTMETA));
 
-        // 触发一次组合翻译
+                // Trigger one combo translation
         m.translate(&k(KeyCode::KEY_C.0, 1));
 
         assert!(
             m.held.contains(&KeyCode::KEY_LEFTMETA),
-            "翻译后 held 必须仍含 Cmd（用户还按着）: {:?}",
+                        "held must still contain Cmd after translation (the user is still holding it): {:?}",
             m.held
         );
     }
 
-    /// 连续两次组合键都应正常命中
+        /// Two consecutive combos should both hit normally
     #[test]
     fn consecutive_combos_both_work() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
@@ -1911,17 +1911,17 @@ mod state_separation {
         }
     }
 
-    /// Shift 按住期间连续按多个字母，都应保持 Shift 按下
+        /// Pressing several letters in a row while Shift is held should keep Shift down
     #[test]
     fn shift_held_across_multiple_keys() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
         m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 1));
         for c in [KeyCode::KEY_A, KeyCode::KEY_B, KeyCode::KEY_C] {
             let out = m.translate(&k(c.0, 1));
-            assert_eq!(desc2(&out), vec![(c.0, 1)], "{c:?} 应原样输出且不干扰 Shift");
+                        assert_eq!(desc2(&out), vec![(c.0, 1)], "{c:?} should be output as-is and not disturb Shift");
             m.translate(&k(c.0, 0));
         }
-        assert!(m.held.contains(&KeyCode::KEY_LEFTSHIFT), "Shift 仍按住");
+                assert!(m.held.contains(&KeyCode::KEY_LEFTSHIFT), "Shift is still held");
     }
 
     fn desc2(evs: &[InputEvent]) -> Vec<(u16, i32)> {
@@ -1941,8 +1941,8 @@ mod release_symmetry {
         evs.iter().map(|e| e.code()).collect()
     }
 
-    /// 核心不变量：输出侧每个键的按下与释放必须严格配对。
-    /// 多余的释放事件（无对应按下）会让应用误判按键状态。
+        /// Core invariant: every key's press and release on the output side must pair strictly.
+        /// A superfluous release event (no matching press) makes the app misjudge the key state.
     #[test]
     fn no_orphan_release_events() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
@@ -1952,31 +1952,31 @@ mod release_symmetry {
             (KeyCode::KEY_LEFTMETA, 1), (KeyCode::KEY_LEFTSHIFT, 1),
             (KeyCode::KEY_Z, 1), (KeyCode::KEY_Z, 0),
             (KeyCode::KEY_LEFTSHIFT, 0), (KeyCode::KEY_LEFTMETA, 0),
-            // 再来一轮
+                        // Another round
             (KeyCode::KEY_LEFTMETA, 1), (KeyCode::KEY_C, 1),
             (KeyCode::KEY_C, 0), (KeyCode::KEY_LEFTMETA, 0),
         ];
 
         for (code, v) in seq {
-            // 注意：必须按**输出事件自身的 value** 判断按下/释放，
-            // 不能用输入事件的 value——组合键翻译时，输入是「按下」，
-            // 输出却可能包含若干「释放」（如 Cmd+Shift+Z 需先松 Shift）。
+                        // Note: press/release must be judged by the **output event's own value**,
+                        // not the input event's value — when translating a combo the input is a "press",
+                        // while the output may contain several "releases" (e.g. Cmd+Shift+Z must release Shift first).
             for e in m.translate(&k(code.0, v)) {
                 let c = e.code();
                 if e.value() == 1 {
-                    assert!(!pressed.contains(&c), "重复按下 {c}");
+                                        assert!(!pressed.contains(&c), "duplicate press {c}");
                     pressed.push(c);
                 } else {
                     let p = pressed.iter().position(|x| *x == c);
-                    assert!(p.is_some(), "孤立释放事件，键码 {c}");
+                                        assert!(p.is_some(), "orphan release event, keycode {c}");
                     pressed.remove(p.unwrap());
                 }
             }
         }
-        assert!(pressed.is_empty(), "结束时仍有未释放: {pressed:?}");
+                assert!(pressed.is_empty(), "still unreleased at the end: {pressed:?}");
     }
 
-    /// 用户实测问题：Cmd+Shift+Z 曾多发一对 Shift 释放
+        /// User-observed problem: Cmd+Shift+Z once emitted an extra pair of Shift releases
     #[test]
     fn cmd_shift_z_emits_no_extra_shift() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
@@ -1984,19 +1984,19 @@ mod release_symmetry {
         m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 1));
         m.translate(&k(KeyCode::KEY_Z.0, 1));
         m.translate(&k(KeyCode::KEY_Z.0, 0));
-        // Shift 物理释放时，输出侧不应再有任何事件
+                // On physical Shift release the output side should have no more events
         let out = m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 0));
-        assert!(out.is_empty(), "Shift 已被翻译时松开，不应再有输出: {:?}", codes(&out));
+                assert!(out.is_empty(), "Shift was already released during translation; there should be no more output: {:?}", codes(&out));
     }
 
-    /// `Ctrl+Cmd+Q` 必须区别于 `Cmd+Q`——这是本项目修过的一个真实缺陷。
+        /// `Ctrl+Cmd+Q` must be distinguished from `Cmd+Q` — a real defect this project fixed.
     ///
-    /// 曾因 remap 把物理 Ctrl 变成 CapsLock，查表匹配不上 `Cmd+Q` 规则，
-    /// 于是落进默认语义发出 `Ctrl+Q`。实机观感与 `Cmd+Q` 相同（都关窗口），
-    /// 但语义完全错：`Ctrl+Cmd+Q` 在 macOS 上是**锁屏**。
+        /// Because remap turned physical Ctrl into CapsLock, the lookup could not match the `Cmd+Q` rule,
+        /// so it fell into the default semantics and emitted `Ctrl+Q`. On the real machine it felt the same as `Cmd+Q` (both close the window),
+        /// but the semantics were completely wrong: `Ctrl+Cmd+Q` on macOS is **lock screen**.
     ///
-    /// 现表中有锁屏规则，且查表前把 CapsLock 归一化为 Ctrl
-    /// （物理 Ctrl 经 remap 后是 CapsLock，但语义上仍是 Ctrl）。
+        /// Now the table has a lock-screen rule, and CapsLock is normalized to Ctrl before the lookup
+        /// (physical Ctrl is CapsLock after remap, but semantically still Ctrl).
     #[test]
     fn ctrl_cmd_q_is_not_same_as_cmd_q() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
@@ -2007,22 +2007,22 @@ mod release_symmetry {
 
         assert!(
             !codes.contains(&KeyCode::KEY_F4.0),
-            "Ctrl+Cmd+Q 不应命中 Cmd+Q 的 Alt+F4: {:?}",
+                        "Ctrl+Cmd+Q must not hit Cmd+Q's Alt+F4: {:?}",
             codes
         );
         assert!(
             !codes.contains(&KeyCode::KEY_Q.0),
-            "Ctrl+Cmd+Q 不应退化成裸 Ctrl+Q: {:?}",
+                        "Ctrl+Cmd+Q must not degrade to a bare Ctrl+Q: {:?}",
             codes
         );
     }
 
-    /// `Ctrl+Cmd+X` 的处理：能转换则转换，不能则放行。
+        /// Handling of `Ctrl+Cmd+X`: convert when possible, pass through otherwise.
 ///
-/// 背景：默认语义把 Cmd 变 Ctrl。若用户已按住 Ctrl，Cmd 再变 Ctrl 就是
-/// `Ctrl+Ctrl` ——同一槽位，组合退化，故不能转换。但也**不能**当 `Cmd+X`
-/// 处理：`Ctrl+Cmd+X` 在 macOS 上是另一个组合键，有自己的含义。
-/// 表里有规则就按表走，没有的原样放行。
+/// Background: the default semantics turn Cmd into Ctrl. If the user is already holding Ctrl, turning Cmd into Ctrl again
+/// gives `Ctrl+Ctrl` — the same slot, a degenerate combo, so it must not convert. But it also must **not** be treated as
+/// `Cmd+X`: `Ctrl+Cmd+X` on macOS is another combo with its own meaning.
+/// Go by the table when it has a rule, pass through as-is when it does not.
 #[cfg(test)]
 mod ctrl_cmd_semantics {
     use super::*;
@@ -2043,7 +2043,7 @@ mod ctrl_cmd_semantics {
         codes(&out)
     }
 
-    /// `Ctrl+Cmd+Q` 命中表里的锁屏规则 → 发 DE 现有的 Super+L
+        /// `Ctrl+Cmd+Q` hits the table's lock-screen rule → emit the DE's current Super+L
     #[test]
     fn ctrl_cmd_q_locks_screen() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
@@ -2057,17 +2057,17 @@ mod ctrl_cmd_semantics {
         );
         assert!(
             out.contains(&KeyCode::KEY_LEFTMETA.0) && out.contains(&KeyCode::KEY_L.0),
-            "Ctrl+Cmd+Q 应发 Super+L（读 DE 的 screensaver 绑定），实际 {:?}",
+                        "Ctrl+Cmd+Q should emit Super+L (reading the DE's screensaver binding), actual {:?}",
             out
         );
         assert!(
             !out.contains(&KeyCode::KEY_F4.0),
-            "不应退回 Cmd+Q 的 Alt+F4：{:?}",
+                        "must not fall back to Cmd+Q's Alt+F4: {:?}",
             out
         );
     }
 
-    /// `Ctrl+Cmd+F` 全屏 → F11
+        /// `Ctrl+Cmd+F` fullscreen → F11
     #[test]
     fn ctrl_cmd_f_fullscreen() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
@@ -2081,17 +2081,17 @@ mod ctrl_cmd_semantics {
         );
         assert!(
             out.contains(&KeyCode::KEY_F11.0),
-            "Ctrl+Cmd+F 应为 F11（全屏），实际 {:?}",
+                        "Ctrl+Cmd+F should be F11 (fullscreen), actual {:?}",
             out
         );
         assert!(
             !out.contains(&KeyCode::KEY_F.0),
-            "不应退回查找 Ctrl+F：{:?}",
+                        "must not fall back to find Ctrl+F: {:?}",
             out
         );
     }
 
-    /// 表里没有的 `Ctrl+Cmd+W` → 原样放行，不得编造 `Ctrl+W`
+        /// `Ctrl+Cmd+W` not in the table → pass through as-is; must not invent `Ctrl+W`
     #[test]
     fn unmapped_ctrl_cmd_passes_through() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
@@ -2105,17 +2105,17 @@ mod ctrl_cmd_semantics {
         );
         assert!(
             out.contains(&KeyCode::KEY_LEFTMETA.0),
-            "放行时须发出真实的 Meta，否则应用收到残缺组合：{:?}",
+                        "when passing through, a real Meta must be emitted, otherwise the app receives a crippled combo: {:?}",
             out
         );
         assert!(
             out.contains(&KeyCode::KEY_W.0),
-            "放行时主键须原样发出：{:?}",
+                        "when passing through, the main key must be emitted as-is: {:?}",
             out
         );
     }
 
-    /// `Shift+Cmd+X` 仍走默认语义 → `Shift+Ctrl+X`（不冲突，可转换）
+        /// `Shift+Cmd+X` still goes through the default semantics → `Shift+Ctrl+X` (no conflict, convertible)
     #[test]
     fn shift_cmd_still_converts() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
@@ -2131,19 +2131,19 @@ mod ctrl_cmd_semantics {
             out.contains(&KeyCode::KEY_LEFTCTRL.0)
                 && out.contains(&KeyCode::KEY_LEFTSHIFT.0)
                 && out.contains(&KeyCode::KEY_Z.0),
-            "Shift+Cmd+Z 应为 Shift+Ctrl+Z，实际 {:?}",
+                        "Shift+Cmd+Z should be Shift+Ctrl+Z, actual {:?}",
             out
         );
     }
 }
 
-/// 防呆：任何键序列走完后，输出侧不得残留按住的修饰键。
+/// Guard: after any key sequence completes, no modifier may remain pressed on the output side.
 ///
-/// 这条不变量的破坏后果极重：曾因放行路径发出 Meta 却未把它从
-/// `suppressed` 移除，释放被吞掉，Super 永久卡在按下态。实机表现是
-/// **锁屏后输密码时每个键都带 Super，数字 9 输不进去，只能硬关机**。
+/// Breaking this invariant has severe consequences: once the pass-through path emitted Meta but did not
+/// remove it from `suppressed`, the release was swallowed and Super stayed stuck down forever. On the real machine
+/// the symptom was **after locking the screen, every key typed at the password prompt carried Super, digits like 9 could not be entered, and the only way out was a hard power-off**.
 ///
-/// 与其逐个组合测，不如断言不变量本身——任何路径违反都会被抓到。
+/// Rather than testing combo by combo, assert the invariant itself — any path that violates it is caught.
 #[cfg(test)]
 mod no_stuck_modifiers {
     use super::*;
@@ -2162,14 +2162,14 @@ mod no_stuck_modifiers {
         KeyCode::KEY_CAPSLOCK,
     ];
 
-    /// 跑完一串事件后，输出侧不应有任何修饰键仍处于按下态。
+        /// After running a sequence of events, no modifier may remain down on the output side.
     fn assert_clean(seq: &[(KeyCode, i32)], label: &str) {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
         let mut out = vec![];
         for (c, v) in seq {
             out.extend(m.translate(&k(c.0, *v)));
         }
-        // 逐键核对按下/释放配平
+                // Check press/release balance key by key
         for mod_key in MODS {
             let downs = out
                 .iter()
@@ -2182,7 +2182,7 @@ mod no_stuck_modifiers {
             assert_eq!(
                 downs,
                 ups,
-                "{label}: {:?} 事件不配平（{downs} 次按下 / {ups} 次释放）",
+                                "{label}: {:?} events not balanced ({downs} presses / {ups} releases)",
                 mod_key
             );
         }
@@ -2190,7 +2190,7 @@ mod no_stuck_modifiers {
 
     #[test]
     fn passthrough_releases_meta() {
-        // 放行路径曾漏发 Meta 释放，导致 Super 卡住
+                // The pass-through path once missed the Meta release, leaving Super stuck
         assert_clean(
             &[
                 (KeyCode::KEY_LEFTCTRL, 1),
@@ -2200,7 +2200,7 @@ mod no_stuck_modifiers {
                 (KeyCode::KEY_LEFTMETA, 0),
                 (KeyCode::KEY_LEFTCTRL, 0),
             ],
-            "放行 Ctrl+Cmd+W",
+                        "pass through Ctrl+Cmd+W",
         );
     }
 
@@ -2228,7 +2228,7 @@ mod no_stuck_modifiers {
                 (KeyCode::KEY_LEFTMETA, 0),
                 (KeyCode::KEY_LEFTCTRL, 0),
             ],
-            "Ctrl+Cmd+Q 锁屏",
+                        "Ctrl+Cmd+Q lock screen",
         );
     }
 
@@ -2248,11 +2248,11 @@ mod no_stuck_modifiers {
     }
 }
 
-/// 系统性排查：任何「按下若干修饰键 + 主键，再全部松开」的序列，
-/// 结束后内部状态与输出侧都必须是干净的。
+/// Systematic sweep: for any sequence of "press some modifiers + a main key, then release everything",
+/// both the internal state and the output side must be clean afterwards.
 ///
-/// 症状是 Meta 卡在按下态——空格变成 Cmd+空格、W 变成 Cmd+W。
-/// 这类 bug 靠逐个组合手写测试很容易漏，故穷举。
+/// The symptom is Meta stuck down — Space becomes Cmd+Space, W becomes Cmd+W.
+/// Such bugs are easy to miss with hand-written per-combo tests, so we exhaust.
 #[cfg(test)]
 mod exhaustive_clean {
     use super::*;
@@ -2278,7 +2278,7 @@ mod exhaustive_clean {
         KeyCode::KEY_LEFT,
     ];
 
-    /// Meta 是罪魁：它按下时被抑制，最容易卡住
+        /// Meta is the culprit: it is suppressed on press and is the easiest to get stuck
     const META: KeyCode = KeyCode::KEY_LEFTMETA;
 
     fn check(seq_down: &[KeyCode], label: &str) {
@@ -2287,22 +2287,22 @@ mod exhaustive_clean {
         for c in seq_down {
             out.extend(m.translate(&k(c.0, 1)));
         }
-        // 逆序松开
+                // Release in reverse order
         for c in seq_down.iter().rev() {
             out.extend(m.translate(&k(c.0, 0)));
         }
 
         assert!(
             m.held.is_empty(),
-            "{label}: 结束后 held 仍非空: {:?}",
+                        "{label}: held still non-empty after finish: {:?}",
             m.held
         );
         assert!(
             m.output_down.is_empty(),
-            "{label}: 结束后 output_down 仍非空: {:?}",
+                        "{label}: output_down still non-empty after finish: {:?}",
             m.output_down
         );
-        // 输出侧每个键的按下/释放必须配平
+                // Every key's press/release on the output side must balance
         let mut seen: Vec<(u16, i32)> = Vec::new();
         for e in &out {
             seen.push((e.code(), e.value()));
@@ -2310,7 +2310,7 @@ mod exhaustive_clean {
         for key in [META, KeyCode::KEY_LEFTCTRL, KeyCode::KEY_LEFTSHIFT, KeyCode::KEY_LEFTALT] {
             let d = seen.iter().filter(|(c, v)| *c == key.0 && *v == 1).count();
             let u = seen.iter().filter(|(c, v)| *c == key.0 && *v == 0).count();
-            assert_eq!(d, u, "{label}: {:?} 输出不配平 {d}下/{u}up", key);
+                        assert_eq!(d, u, "{label}: {:?} output not balanced {d} down/{u} up", key);
         }
     }
 
@@ -2332,7 +2332,7 @@ mod exhaustive_clean {
 
     #[test]
     fn meta_alone_is_clean() {
-        check(&[META], "Meta 单独");
+                check(&[META], "Meta alone");
     }
 
     #[test]
@@ -2350,10 +2350,10 @@ mod exhaustive_clean {
     }
 }
 
-/// 松开顺序无关。
+/// Release order does not matter.
 ///
-/// 上一个测试固定逆序松开，但真人不按顺序松——尤其是**先松修饰键、
-/// 后松主键**（手指自然抬起顺序）。这正是 Meta 卡死的土壤。
+/// The previous test fixed reverse order, but real people do not release in order — especially **releasing the
+/// modifier first, then the main key** (the natural order fingers lift). This is exactly the soil for Meta getting stuck.
 #[cfg(test)]
 mod release_order {
     use super::*;
@@ -2363,7 +2363,7 @@ mod release_order {
         InputEvent::new(EventType::KEY.0, c, v)
     }
 
-    /// 按下全部，然后按 `order` 给出的下标顺序松开
+        /// Press everything, then release in the index order given by `order`
     fn check(down: &[KeyCode], order: &[usize], label: &str) {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
         let mut out = vec![];
@@ -2375,12 +2375,12 @@ mod release_order {
         }
         assert!(
             m.held.is_empty(),
-            "{label}: held 残留 {:?}",
+                        "{label}: held residual {:?}",
             m.held
         );
         assert!(
             m.output_down.is_empty(),
-            "{label}: output_down 残留 {:?}",
+                        "{label}: output_down residual {:?}",
             m.output_down
         );
         for key in [
@@ -2391,11 +2391,11 @@ mod release_order {
         ] {
             let d = out.iter().filter(|e| e.code() == key.0 && e.value() == 1).count();
             let u = out.iter().filter(|e| e.code() == key.0 && e.value() == 0).count();
-            assert_eq!(d, u, "{label}: {:?} 不配平 {d}下/{u}up", key);
+                        assert_eq!(d, u, "{label}: {:?} not balanced {d} down/{u} up", key);
         }
     }
 
-    /// Meta 先松、主键后松 —— 最常见也最危险
+        /// Meta released first, main key after — the most common and most dangerous
     #[test]
     fn meta_released_before_key() {
         let keys = [
@@ -2406,16 +2406,16 @@ mod release_order {
             KeyCode::KEY_LEFT,
         ];
         for key in keys {
-            // 下标 0=Meta, 1=主键；先松 0
+                        // index 0=Meta, 1=main key; release 0 first
             check(
                 &[KeyCode::KEY_LEFTMETA, key],
                 &[0, 1],
-                "Meta 先松",
+                                "Meta released first",
             );
         }
     }
 
-    /// 三键，穷举全部 6 种松开顺序
+        /// Three keys, exhaustively all 6 release orders
     #[test]
     fn all_release_orders_for_meta_mod_key() {
         let perms: [[usize; 3]; 6] = [
@@ -2438,10 +2438,10 @@ mod release_order {
     }
 }
 
-/// 「先松修饰键、主键未松、又按新键」——真实输入里极常见。
+/// "Release the modifier first, main key still down, then press a new key" — extremely common in real input.
 ///
-/// 症状：输出侧残留按下的修饰键，之后每个键都带上它
-/// （空格变成 Cmd+空格、W 变成 Cmd+W）。
+/// Symptom: a pressed modifier remains on the output side, and every key afterwards carries it
+/// (Space becomes Cmd+Space, W becomes Cmd+W).
 #[cfg(test)]
 mod mid_release_interleave {
     use super::*;
@@ -2460,9 +2460,9 @@ mod mid_release_interleave {
 
         out.extend(m.translate(&k(META.0, 1)));
         out.extend(m.translate(&k(KeyCode::KEY_Q.0, 1)));
-        // 先松 Meta，主键 Q 还按着
+                // Release Meta first; main key Q is still held
         out.extend(m.translate(&k(META.0, 0)));
-        // 此时又按空格
+                // Now press Space
         out.extend(m.translate(&k(KeyCode::KEY_SPACE.0, 1)));
 
         let d: Vec<String> = out
@@ -2471,13 +2471,13 @@ mod mid_release_interleave {
             .collect();
         assert!(
             m.output_down.is_empty() || !m.output_down.contains(&META),
-            "输出侧 Meta 仍处于按下态: output_down={:?} 事件={:?}",
+                        "Meta is still down on the output side: output_down={:?} events={:?}",
             m.output_down,
             d
         );
     }
 
-    /// 同上，但走「放行」路径（表里无规则且 Ctrl 槽位被占）
+        /// Same as above but through the "pass-through" path (no rule in the table and the Ctrl slot is taken)
     #[test]
     fn meta_lifted_after_passthrough_then_new_key() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
@@ -2490,24 +2490,24 @@ mod mid_release_interleave {
 
         assert!(
             !m.output_down.contains(&META),
-            "放行后先松 Meta 再按空格：Meta 残留 output_down={:?}",
+                        "after pass-through, releasing Meta then pressing Space: Meta residual output_down={:?}",
             m.output_down
         );
     }
 }
 
-/// 锁屏路径的特有陷阱：`Ctrl+Cmd+Q` 的输出是 `Super+L`，**含 Meta**。
+/// A pitfall specific to the lock-screen path: `Ctrl+Cmd+Q` outputs `Super+L`, **which contains Meta**.
 ///
-/// 早期版本测不出问题，因为 `Cmd+Q` 的输出是 `Alt+F4`（不含 Meta）。
-/// 只有当**转换结果本身含 Meta** 时，下面的缺陷才会暴露：
+/// Early versions could not detect the problem because `Cmd+Q` outputs `Alt+F4` (no Meta).
+/// Only when **the translation result itself contains Meta** does the defect below surface:
 ///
-/// 1. 按下时 Meta 被抑制（`suppressed`），从未进入 output_down
-/// 2. 转换后主动发出 Meta（作为 `Super+L` 的一部分），并记入 injected_mods
-/// 3. 用户先松开 Cmd → 释放路径走 `suppressed.remove()` 分支**提前返回**，
-///    不发释放——但 Meta 此时**确实**在 output_down 里
-/// 4. 之后每个键都带着这个残留的 Super
+/// 1. On press Meta is suppressed (`suppressed`) and never enters output_down
+/// 2. After translation Meta is emitted actively (as part of `Super+L`) and recorded in injected_mods
+/// 3. The user releases Cmd first → the release path takes the `suppressed.remove()` branch and **returns early**,
+///    emitting no release — but Meta is **indeed** in output_down at that moment
+/// 4. Afterwards every key carries this residual Super
 ///
-/// 实机症状：锁屏后空格变成 Cmd+空格（开概览）、W 变成 Cmd+W。
+/// Real-machine symptom: after locking the screen, Space becomes Cmd+Space (opens the overview), W becomes Cmd+W.
 #[cfg(test)]
 mod lock_screen_meta_leak {
     use super::*;
@@ -2519,7 +2519,7 @@ mod lock_screen_meta_leak {
 
     const META: KeyCode = KeyCode::KEY_LEFTMETA;
 
-    /// 先松 Cmd（Q 仍按着），再按空格 —— Meta 不得残留在输出侧
+        /// Release Cmd first (Q still held), then press Space — Meta must not remain on the output side
     #[test]
     fn lifting_cmd_after_lock_leaves_no_stuck_super() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
@@ -2528,9 +2528,9 @@ mod lock_screen_meta_leak {
         out.extend(m.translate(&k(KeyCode::KEY_LEFTCTRL.0, 1)));
         out.extend(m.translate(&k(META.0, 1)));
         out.extend(m.translate(&k(KeyCode::KEY_Q.0, 1)));
-        // 用户先松开 Cmd
+                // The user releases Cmd first
         out.extend(m.translate(&k(META.0, 0)));
-        // Q 还按着，此时按空格
+                // Q is still held; now press Space
         out.extend(m.translate(&k(KeyCode::KEY_SPACE.0, 1)));
 
         let d: Vec<String> = out
@@ -2540,52 +2540,52 @@ mod lock_screen_meta_leak {
 
         assert!(
             !m.output_down.contains(&META),
-            "输出侧 Super 残留：output_down={:?}\n事件序列: {:?}",
+                        "Super residual on the output side: output_down={:?}\nevent sequence: {:?}",
             m.output_down,
             d
         );
     }
 
-    /// 完整键入一段，确认没有修饰键被带进后续按键
+        /// Type a whole stretch and confirm no modifier is carried into later keys
     #[test]
     fn typing_after_lock_is_clean() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
         let mut out = vec![];
-        // 锁屏
+                // Lock the screen
         for c in [KeyCode::KEY_LEFTCTRL, META, KeyCode::KEY_Q] {
             out.extend(m.translate(&k(c.0, 1)));
         }
-        // 松开全部（各种顺序）
+                // Release everything (various orders)
         for c in [META, KeyCode::KEY_Q, KeyCode::KEY_LEFTCTRL] {
             out.extend(m.translate(&k(c.0, 0)));
         }
-        // 输密码
+                // Type the password
         for c in [KeyCode::KEY_A, KeyCode::KEY_1, KeyCode::KEY_B, KeyCode::KEY_9] {
             out.extend(m.translate(&k(c.0, 1)));
             out.extend(m.translate(&k(c.0, 0)));
         }
         assert!(
             m.output_down.is_empty(),
-            "输密码后输出侧应无残留: {:?}",
+                        "after typing the password the output side should have no residual: {:?}",
             m.output_down
         );
-        // 数字键不得携带修饰键
+                // Digit keys must not carry modifiers
         for e in &out {
             if e.code() == KeyCode::KEY_9.0 && e.value() == 1 {
-                // 它前面紧邻的按下事件不应有修饰键
+                                // The immediately preceding press event should not have a modifier
             }
         }
     }
 }
 
-/// Cmd 规则必须**要求按住 Cmd**。
+/// Cmd rules must **require Cmd to be held**.
 ///
-/// 回归测试：查表曾被移出 `if cmd_held` 分支（为支持非 Cmd 组合），
-/// 但规则本身不校验 Meta 是否按住——于是**裸按空格也命中
-/// `Cmd+空格` 那条规则**，任何人按空格都弹出 GNOME 概览。
+/// Regression test: the lookup was once moved out of the `if cmd_held` branch (to support non-Cmd combos),
+/// but the rule itself did not check whether Meta was held — so **a bare Space press also hit the
+/// `Cmd+Space` rule**, and anyone pressing Space popped up the GNOME overview.
 ///
-/// 现场证据（--trace 抓到的真实输入输出）：
-///   IN KEY_SPACE 按下 -> OUT [SHIFT+, CTRL+, SPACE+]
+/// Field evidence (real input/output captured with --trace):
+///   IN KEY_SPACE press -> OUT [SHIFT+, CTRL+, SPACE+]
 #[cfg(test)]
 mod cmd_required {
     use super::*;
@@ -2598,7 +2598,7 @@ mod cmd_required {
         evs.iter().map(|e| e.code()).collect()
     }
 
-    /// 裸空格必须原样透传，绝不能变成 Ctrl+Shift+空格
+        /// A bare Space must pass through as-is and must never become Ctrl+Shift+Space
     #[test]
     fn bare_space_is_not_overview() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
@@ -2606,49 +2606,49 @@ mod cmd_required {
         assert_eq!(
             out,
             vec![KeyCode::KEY_SPACE.0],
-            "裸空格不应触发概览规则"
+                        "a bare Space must not trigger the overview rule"
         );
     }
 
-    /// `Cmd+空格` 仍须命中概览规则
+        /// `Cmd+Space` must still hit the overview rule
     #[test]
     fn cmd_space_still_maps_to_overview() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
         m.translate(&k(KeyCode::KEY_LEFTMETA.0, 1));
         let out = codes(&m.translate(&k(KeyCode::KEY_SPACE.0, 1)));
-        // 概览的形态随 GNOME 版本而异：旧版是组合（Ctrl+Shift+空格），
-        // GNOME 50 起是裸 Super 的一次点按。这里只断言「确实命中了概览」，
-        // 具体形态由 `cmd_space_maps_to_gnome_overview` 覆盖。
+                // The overview's form varies with the GNOME version: older is a combo (Ctrl+Shift+Space),
+                // as of GNOME 50 it is a single tap of a bare Super. Here we only assert "the overview was indeed hit";
+                // the concrete form is covered by `cmd_space_maps_to_gnome_overview`.
         match de_feature_accel(&DesktopType::Gnome, "overview")
-            .expect("本机 GNOME 的概览应可解析")
+                        .expect("this machine's GNOME overview should be resolvable")
         {
             DeKeys::Combo(mods, key) => {
                 for mm in &mods {
-                    assert!(out.contains(&mm.0), "概览修饰键 {mm:?} 缺失: {out:?}");
+                                        assert!(out.contains(&mm.0), "overview modifier {mm:?} missing: {out:?}");
                 }
-                assert!(out.contains(&key.0), "概览主键 {key:?} 缺失: {out:?}");
+                                assert!(out.contains(&key.0), "overview main key {key:?} missing: {out:?}");
             }
             DeKeys::Tap(key) => {
                 assert!(
                     out.contains(&key.0),
-                    "Cmd+空格 应点按 {key:?}，实际 {out:?}"
+                                        "Cmd+Space should tap {key:?}, actual {out:?}"
                 );
             }
         }
     }
 
-    /// 裸 A 不得变成 Ctrl+A（默认语义只在 Cmd 组合下生效）
+        /// A bare A must not become Ctrl+A (the default semantics only apply under a Cmd combo)
     #[test]
     fn bare_letter_is_not_translated() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
         let out = codes(&m.translate(&k(KeyCode::KEY_A.0, 1)));
-        assert_eq!(out, vec![KeyCode::KEY_A.0], "裸 A 应原样输出");
+                assert_eq!(out, vec![KeyCode::KEY_A.0], "a bare A should be output as-is");
     }
 
-    /// 不含 Cmd 的规则仍须生效：`Option+Delete` → `Ctrl+Backspace`
+        /// Rules without Cmd must still take effect: `Option+Delete` → `Ctrl+Backspace`
     ///
-    /// 本机（MacBook 键盘）的「Delete」键在 evdev 里是 KEY_BACKSPACE，
-    /// 两个键码都要覆盖。
+        /// On this machine (MacBook keyboard) the "Delete" key is KEY_BACKSPACE in evdev,
+        /// so both keycodes must be covered.
     #[test]
     fn non_cmd_rule_still_works() {
         for del_key in [KeyCode::KEY_BACKSPACE, KeyCode::KEY_DELETE] {
@@ -2659,15 +2659,15 @@ mod cmd_required {
             assert!(
                 c.contains(&KeyCode::KEY_LEFTCTRL.0)
                     && c.contains(&KeyCode::KEY_BACKSPACE.0),
-                "Option+{del_key:?} 应为 Ctrl+Backspace，实际 {:?}",
+                                "Option+{del_key:?} should be Ctrl+Backspace, actual {:?}",
                 c
             );
-            // Alt 只能被**释放**（转换时排空 output_down），不得再按下
+                        // Alt may only be **released** (output_down is drained on conversion); it must not be pressed again
             assert!(
                 !evs
                     .iter()
                     .any(|e| e.code() == KeyCode::KEY_LEFTALT.0 && e.value() == 1),
-                "Alt 不应被再次按下: {:?}",
+                                "Alt must not be pressed again: {:?}",
                 evs.iter()
                     .map(|e| format!("{:?}{}", e.code(), e.value()))
                     .collect::<Vec<_>>()
@@ -2676,21 +2676,21 @@ mod cmd_required {
     }
 }
 
-/// 裸 Shift 仍须正常输出按下与释放（fcitx5 依赖）
-/// DE 动作全部可解析。
+/// A bare Shift must still output press and release normally (fcitx5 depends on it)
+/// All DE actions are resolvable.
 ///
-/// 曾因别名表缺 `print`（evdev 里叫历史名 `KEY_SYSRQ`），
-/// 三条截图规则被**静默剔除**——启动日志只说「DE 未提供」，
-/// 看不出是键名解析失败。这类问题必须用测试兜住。
+/// Because the alias table lacked `print` (called the historical name `KEY_SYSRQ` in evdev),
+/// the three screenshot rules were **silently dropped** — the startup log only said "DE does not provide it",
+/// with no hint that key-name parsing had failed. Problems like this must be caught by tests.
 #[cfg(test)]
 mod de_accels_all_resolvable {
     use super::*;
 
     #[test]
     fn every_bound_gnome_feature_resolves() {
-        // 只测 GNOME 默认已绑定的动作。
-        // `show-desktop` 默认未绑定（@as []），需用户自行绑定后
-        // 才生效——那是设计如此，不是解析失败。
+                // Only test actions GNOME binds by default.
+                // `show-desktop` is unbound by default (@as []); the user must bind it
+                // for it to take effect — that is by design, not a parse failure.
         for feature in [
             "overview",
             "lock-screen",
@@ -2701,67 +2701,67 @@ mod de_accels_all_resolvable {
         ] {
             assert!(
                 de_feature_accel(&DesktopType::Gnome, feature).is_some(),
-                "GNOME 动作 {feature} 无法解析——查 DE 绑定失败或键名不认识"
+                                "GNOME action {feature} cannot be resolved — DE binding lookup failed or the key name is unknown"
             );
         }
     }
 
-    /// 表里每条 `de_accel` 规则，其功能都必须能解析——
-    /// 否则该行会被静默剔除，启动日志只说「DE 未提供」，看不出真相。
+        /// Every `de_accel` rule in the table must have a resolvable feature —
+        /// otherwise the row is silently dropped and the startup log only says "DE does not provide it", hiding the truth.
     #[test]
     fn no_rule_is_silently_dropped() {
         let cfg = Config::with_defaults();
-        let compiled = compile_table(&cfg.rules).expect("规则表应能编译");
+                let compiled = compile_table(&cfg.rules).expect("the rule table should compile");
         for r in &compiled {
             if let CompiledAction::DeAccel(f) = &r.act {
                 assert!(
                     de_feature_accel(&DesktopType::Gnome, f).is_some(),
-                    "规则 {f} 无法解析，该行会被静默剔除"
+                                        "rule {f} cannot be resolved; the row will be silently dropped"
                 );
             }
         }
     }
 
-    /// Print 必须能解析（GNOME 截图绑在它上面）
+        /// Print must be resolvable (GNOME's screenshot is bound to it)
     #[test]
     fn print_alias_resolves() {
         assert_eq!(
             crate::keys::parse_external_key("Print"),
             Some(evdev::KeyCode::KEY_SYSRQ),
-            "GNOME 绑定里的 `Print` 须解析为 KEY_SYSRQ"
+                        "the `Print` in GNOME bindings must resolve to KEY_SYSRQ"
         );
     }
 }
 
-/// `exec` 动作：产生副作用，但**不发出任何按键**。
+/// The `exec` action: produces a side effect but **emits no key at all**.
 #[cfg(test)]
 mod exec_action {
     use super::*;
     use crate::config::Config;
 
-    // 已删除 `exec_emits_no_key_events` 与 `exec_release_is_silent`：
+        // `exec_emits_no_key_events` and `exec_release_is_silent` were removed:
     //
-    // `exec` 动作的副作用在 `lookup()` 里触发（见该处 `crate::exec::run`），
-    // 而 `exec::run` 对「需确认」的规则会**弹出 zenity 模态框并等它关闭**。
-    // 于是这两个测试每次都会在屏幕上弹出「确认清倒回收站」对话框，
-    // 必须人工点掉——`cargo test` 因此被卡住。单元测试不应产生真实副作用。
+        // the `exec` action's side effect is triggered in `lookup()` (see `crate::exec::run` there),
+        // and `exec::run` for rules that "need confirmation" **pops up a zenity modal and waits for it to close**.
+        // So these two tests popped up a "confirm empty trash" dialog on screen every time,
+        // which had to be dismissed by hand — `cargo test` got stuck on it. Unit tests must not produce real side effects.
     //
-    // 「清倒废纸篓只在 Nautilus 内生效」等**安全不变量**仍由下方
-    // `trash_confirmation_matches_macos` 与 `trash_scoped_to_nautilus::
-    // trash_rules_target_nautilus_only` 覆盖——它们只检查编译后的规则表，
-    // 不执行任何命令。
+        // Safety invariants such as "empty trash only takes effect inside Nautilus" are still covered by
+        // `trash_confirmation_matches_macos` and `trash_scoped_to_nautilus::
+        // trash_rules_target_nautilus_only` below — they only inspect the compiled rule table
+        // and run no command.
 
-    /// 两条清倒废纸篓规则的确认策略须与 macOS 一致。
+        /// The confirmation policy of the two empty-trash rules must match macOS.
     ///
-    /// macOS：`Shift+Cmd+Delete` 有确认，`Option+Shift+Cmd+Delete`
-    /// 免确认（Option 就是「跳过确认」）。本工具照搬。
+        /// macOS: `Shift+Cmd+Delete` has confirmation, `Option+Shift+Cmd+Delete`
+        /// skips confirmation (Option means "skip confirmation"). This tool copies that.
     ///
-    /// 免确认仅在规则**限定应用**时才允许——两条都必须限定在
-    /// Nautilus 内，全局免确认不可接受。
+        /// Skipping confirmation is only allowed when the rule is **app-scoped** — both must be scoped
+        /// to Nautilus; a global no-confirm is unacceptable.
     #[test]
     fn trash_confirmation_matches_macos() {
         let cfg = Config::with_defaults();
-        let rules = compile_table(&cfg.rules).expect("规则表应能编译");
+                let rules = compile_table(&cfg.rules).expect("the rule table should compile");
 
         let with_option: Vec<_> = rules
             .iter()
@@ -2774,39 +2774,39 @@ mod exec_action {
             .filter(|r| !r.key.1.contains(&KeyCode::KEY_LEFTALT))
             .collect();
 
-        assert_eq!(with_option.len(), 2, "Option 版应有两个键码各一条");
-        assert_eq!(without.len(), 2, "非 Option 版应有两个键码各一条");
+                assert_eq!(with_option.len(), 2, "there should be one Option entry for each of the two keycodes");
+                assert_eq!(without.len(), 2, "there should be one non-Option entry for each of the two keycodes");
 
         for r in with_option {
             let confirm = match &r.act {
                 CompiledAction::Exec { confirm, .. } => *confirm,
-                _ => panic!("应为 exec 动作"),
+                                _ => panic!("should be an exec action"),
             };
             assert!(
                 !confirm,
-                "Option+Shift+Cmd+Delete 应免确认（与 macOS 一致）"
+                                "Option+Shift+Cmd+Delete should skip confirmation (consistent with macOS)"
             );
             assert!(
                 !matches!(r.app, AppMatch::Any),
-                "免确认的破坏性规则必须限定应用"
+                                "a no-confirm destructive rule must be app-scoped"
             );
         }
         for r in without {
             let confirm = match &r.act {
                 CompiledAction::Exec { confirm, .. } => *confirm,
-                _ => panic!("应为 exec 动作"),
+                                _ => panic!("should be an exec action"),
             };
-            assert!(confirm, "Shift+Cmd+Delete 应有确认");
+                        assert!(confirm, "Shift+Cmd+Delete should have confirmation");
         }
     }
 }
 
-/// 裸 Shift 仍须正常输出按下与释放（fcitx5 依赖）
-/// 清倒废纸篓必须限定在 Nautilus 内。
+/// A bare Shift must still output press and release normally (fcitx5 depends on it)
+/// Emptying the trash must be scoped to Nautilus.
 ///
-/// macOS 上这两个是 Finder 的菜单项（桌面也归 Finder 管），不是系统级
-/// 快捷键。做成全局有两个实际风险：终端是删除操作最容易出事的场景，
-/// 而写密码时误按会直接弹确认框。
+/// On macOS these two are Finder menu items (the desktop is also Finder's), not system-level
+/// shortcuts. Making them global has two real risks: the terminal is where a delete operation is most likely to
+/// go wrong, and a mistyped key while entering a password would pop up the confirmation dialog directly.
 #[cfg(test)]
 mod trash_scoped_to_nautilus {
     use super::*;
@@ -2814,52 +2814,52 @@ mod trash_scoped_to_nautilus {
     #[test]
     fn trash_rules_target_nautilus_only() {
         let cfg = Config::with_defaults();
-        let rules = compile_table(&cfg.rules).expect("规则表应能编译");
+                let rules = compile_table(&cfg.rules).expect("the rule table should compile");
         for r in &rules {
             if let CompiledAction::Exec { program, .. } = &r.act {
                 if program == "gio" {
                     assert_eq!(
                         r.app,
                         AppMatch::Contains(vec!["org.gnome.Nautilus".to_string()]),
-                        "清倒废纸篓必须限定在 Nautilus"
+                                                "emptying the trash must be scoped to Nautilus"
                     );
                 }
             }
         }
     }
 
-    // 已删除 `trash_only_fires_in_nautilus`：它同样在 Nautilus 里按
-    // `Cmd+Shift+⌫`，会经 `lookup()` 真正执行 `exec::run`，弹出 zenity
-    // 确认框（见上方 `exec_action` 模块的说明）。
+        // `trash_only_fires_in_nautilus` was removed: it likewise presses
+        // `Cmd+Shift+⌫` inside Nautilus, which really runs `exec::run` via `lookup()` and pops up the zenity
+        // confirmation dialog (see the note in the `exec_action` module above).
     //
-    // 规则作用域本身由上面的 `trash_rules_target_nautilus_only` 断言，
-    // 不执行任何命令。
+        // The rule scope itself is asserted by `trash_rules_target_nautilus_only` above,
+        // which runs no command.
 }
 
-/// `exec` 的确认判定本身。
+/// The confirmation decision of `exec` itself.
 ///
-/// 回归测试：`needs_confirm` 曾写成 `confirm || risk == Destructive`，
-/// 使 `confirm: false` 完全失效——弹窗照弹，而单元测试只检查规则表
-/// 里 `confirm` 字段的值，从不真正调用 `run()`，故漏过。
+/// Regression test: `needs_confirm` was once written as `confirm || risk == Destructive`,
+/// which made `confirm: false` completely ineffective — the dialog still popped up, while the unit test only checked
+/// the value of the `confirm` field in the rule table, never actually calling `run()`, so it was missed.
 ///
-/// 这里直接验证判定逻辑：免确认 + 限定应用 → 不弹；
-/// 免确认 + 全局 → 拒绝执行。
+/// Here the decision logic itself is verified: no-confirm + app-scoped → no dialog;
+/// no-confirm + global → execution refused.
 #[cfg(test)]
 mod exec_confirm_logic {
     use super::*;
     use crate::config::Config;
 
-    /// 从规则表取清倒废纸篓规则，构造 ExecRequest
+        /// Take the empty-trash rule from the rule table and build an ExecRequest
     fn trash_request(confirm: bool) -> crate::exec::ExecRequest<'static> {
         let cfg = Config::with_defaults();
-        let rules = compile_table(&cfg.rules).expect("应能编译");
+                let rules = compile_table(&cfg.rules).expect("should compile");
         let r = rules
             .iter()
             .find(|r| {
                 matches!(&r.act, CompiledAction::Exec { program, .. } if program == "gio")
                     && r.desc.as_deref().unwrap_or("").contains("Option")
             })
-            .expect("应有 Option 版清倒废纸篓规则");
+                        .expect("there should be an Option version of the empty-trash rule");
 
         let (program, args, c) = match &r.act {
             CompiledAction::Exec {
@@ -2872,70 +2872,70 @@ mod exec_confirm_logic {
         };
         assert_eq!(
             c, confirm,
-            "规则表的 confirm 应为 {confirm}——测试前提不成立"
+                        "the rule table's confirm should be {confirm} — test premise does not hold"
         );
 
         let args: &'static [String] = Box::leak(args.into_boxed_slice());
         crate::exec::ExecRequest {
             program: Box::leak(program.into_boxed_str()),
             args,
-            label: Some("测试"),
+                        label: Some("Test"),
             confirm,
-            prompt: Some("测试".into()),
-            ok_label: Some("测试".into()),
+                        prompt: Some("Test".into()),
+                        ok_label: Some("Test".into()),
             confirm_key: Some("Cmd+Shift+⌫"),
             scoped: !matches!(r.app, AppMatch::Any),
         }
     }
 
-    /// `gio trash --empty` 必须被判为破坏性
+        /// `gio trash --empty` must be judged destructive
     #[test]
     fn gio_trash_empty_is_flagged_destructive() {
         let args = vec!["trash".to_string(), "--empty".to_string()];
         assert!(crate::exec::is_destructive("gio", &args));
     }
 
-    /// 免确认 + 限定应用 → 允许执行（不弹框、不拒绝）
+        /// no-confirm + app-scoped → allowed to run (no dialog, no refusal)
     #[test]
     fn scoped_no_confirm_is_allowed() {
         let req = trash_request(false);
         assert!(
             !crate::exec::should_confirm(&req),
-            "免确认规则不应弹框——此前 `confirm || risk==Destructive` 会让它恒真"
+                        "a no-confirm rule should not pop up a dialog — previously `confirm || risk==Destructive` made it always true"
         );
         assert!(
             !crate::exec::refuse(&req),
-            "限定应用的免确认不应被拒绝"
+                        "an app-scoped no-confirm should not be refused"
         );
     }
 
-    /// 免确认 + 全局 → 必须拒绝执行
+        /// no-confirm + global → execution must be refused
     #[test]
     fn global_no_confirm_is_refused() {
         let mut req = trash_request(false);
         req.scoped = false;
         assert!(
             crate::exec::refuse(&req),
-            "全局破坏性命令免确认必须被拒绝"
+                        "a global destructive no-confirm command must be refused"
         );
     }
 }
 
-/// 裸 Shift 仍须正常输出按下与释放（fcitx5 依赖）
+/// A bare Shift must still output press and release normally (fcitx5 depends on it)
 #[test]
 fn bare_shift_still_works() {
         let mut m = Mapper::new(&Config::with_defaults(), false).unwrap();
         let d = m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 1));
         assert_eq!(codes(&d), vec![KeyCode::KEY_LEFTSHIFT.0]);
         let u = m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 0));
-        assert_eq!(codes(&u), vec![KeyCode::KEY_LEFTSHIFT.0], "裸 Shift 释放须透传");
+                assert_eq!(codes(&u), vec![KeyCode::KEY_LEFTSHIFT.0], "a bare Shift release must pass through");
     }
 }
 
-/// Fn 键预处理的回归测试。
+/// Regression tests for the Fn-key preprocessing.
 ///
-/// 对应一个已修复的真实 bug：Fn 分支曾用 `return` 短路，绕过整个 Cmd
-/// 查表流程。见 `resolve_fn` 的文档注释。
+/// Corresponds to a real bug that was fixed: the Fn branch once short-circuited with `return`, bypassing the whole Cmd
+/// lookup flow. See the doc comment on `resolve_fn`.
 #[cfg(test)]
 mod fn_resolve {
     use super::*;
@@ -2955,7 +2955,7 @@ mod fn_resolve {
         Mapper::new(&cfg, false).unwrap()
     }
 
-    /// fkeysfirst：F1 单独 → F1
+        /// fkeysfirst: F1 alone → F1
     #[test]
     fn fkeysfirst_bare_f1_stays_f1() {
         let mut m = mapper(FnMode::Fkeysfirst);
@@ -2963,7 +2963,7 @@ mod fn_resolve {
         assert_eq!(codes(&d), vec![KeyCode::KEY_F1.0]);
     }
 
-    /// fkeysfirst：Fn+F1 → 亮度减
+        /// fkeysfirst: Fn+F1 → brightness down
     #[test]
     fn fkeysfirst_fn_f1_becomes_media() {
         let mut m = mapper(FnMode::Fkeysfirst);
@@ -2972,11 +2972,11 @@ mod fn_resolve {
         assert_eq!(
             codes(&d),
             vec![KeyCode::KEY_BRIGHTNESSDOWN.0],
-            "Fn+F1 应为亮度减"
+                        "Fn+F1 should be brightness down"
         );
     }
 
-    /// fkeyslast 方向相反：F1 单独 → 亮度减，Fn+F1 → F1
+        /// fkeyslast is the opposite direction: F1 alone → brightness down, Fn+F1 → F1
     #[test]
     fn fkeyslast_inverts_both_directions() {
         let mut m = mapper(FnMode::Fkeyslast);
@@ -2989,10 +2989,10 @@ mod fn_resolve {
         assert_eq!(codes(&with_fn), vec![KeyCode::KEY_F1.0]);
     }
 
-    /// 核心回归：Fn+Meta+Shift+F1 不得泄漏 Meta（invariant 3）。
+        /// Core regression: Fn+Meta+Shift+F1 must not leak Meta (invariant 3).
     ///
-    /// 修复前输出为 `Meta+媒体键`——Meta 被原样发出，而它本应被抑制；
-    /// 且 Ctrl/Shift 丢失。修复后应与裸 `Meta+Shift+F1` 同形，仅主键不同。
+        /// Before the fix the output was `Meta+media key` — Meta was emitted as-is when it should have been
+        /// suppressed, and Ctrl/Shift were lost. After the fix it should match a bare `Meta+Shift+F1` in shape, with only the main key differing.
     #[test]
     fn fn_with_other_mods_does_not_leak_meta() {
         let mut m = mapper(FnMode::Fkeysfirst);
@@ -3002,28 +3002,28 @@ mod fn_resolve {
         let out = m.translate(&k(KeyCode::KEY_F1.0, 1));
         let c = codes(&out);
 
-        // Meta 若泄漏，会出现按下后无对应释放的孤立事件，
-        // 故其出现次数应为偶数（press/release 配对）。
+                // If Meta leaks there would be an orphan event with a press and no matching release,
+                // so its occurrence count should be even (press/release paired).
         let meta_count = c.iter().filter(|x| **x == KeyCode::KEY_LEFTMETA.0).count();
         assert_eq!(
             meta_count % 2,
             0,
-            "Meta 出现次数应为偶数（按下与释放配对）: {:?}",
+                        "Meta occurrences should be even (press/release paired): {:?}",
             c
         );
 
-        // 且必须真正走到 Cmd 查表：注入 Ctrl，而非只发裸媒体键
+                // And it must really reach the Cmd lookup: inject Ctrl, not just emit a bare media key
         assert!(
             c.contains(&KeyCode::KEY_LEFTCTRL.0),
-            "应继续走 Cmd 查表并注入 Ctrl: {:?}",
+                        "should continue through the Cmd lookup and inject Ctrl: {:?}",
             c
         );
     }
 
-    /// 释放顺序无关：先松 Fn 与先松 F1 都应释放同一个媒体键。
+        /// Release order does not matter: releasing Fn first or F1 first should release the same media key.
     ///
-    /// 依赖 `pressed` 以**物理键**为键——若以解析后的键为键，
-    /// Fn 先松开时释放路径会推导出错误的键。
+        /// Relies on `pressed` being keyed by the **physical key** — if it were keyed by the resolved key,
+        /// releasing Fn first would make the release path derive the wrong key.
     #[test]
     fn release_is_symmetric_regardless_of_fn_order() {
         for fn_first in [true, false] {
@@ -3042,13 +3042,13 @@ mod fn_resolve {
             assert_eq!(
                 last,
                 KeyCode::KEY_BRIGHTNESSDOWN.0,
-                "Fn 先松={} 时最后一个事件须为媒体键释放",
+                                "when fn_first={} the last event must be the media-key release",
                 fn_first
             );
         }
     }
 
-    /// `Disabled` 模式下不做任何转换
+        /// `Disabled` mode does no conversion at all
     #[test]
     fn disabled_mode_passes_through() {
         let mut m = mapper(FnMode::Disabled);

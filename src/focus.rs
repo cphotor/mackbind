@@ -1,19 +1,20 @@
-//! 焦点窗口查询（GNOME Wayland）。
+//! Focused-window query (GNOME Wayland).
 //!
-//! # 为什么需要扩展
+//! # Why an extension is needed
 //!
-//! Wayland 下 compositor 不把窗口信息交给客户端，`xdotool`、`wmctrl`、
-//! X11 属性查询全部失效。GNOME 自带的几条路径经实测也不可用：
+//! On Wayland the compositor does not hand window information to clients, so
+//! `xdotool`, `wmctrl`, and all X11 property queries fail. The few paths GNOME
+//! ships for this were also measured to be unusable:
 //!
-//! | 方案 | 结果 |
+//! | Approach | Result |
 //! |---|---|
-//! |`org.gnome.Shell.Eval`|返回 `(false, '')`，GNOME 41+ 限制|
-//! |`org.gnome.Shell.WindowTracker`|对象路径不存在|
-//! |`xdotool` / `wmctrl`|Wayland 下不可用|
+//! |`org.gnome.Shell.Eval`|returns `(false, '')`, restricted since GNOME 41|
+//! |`org.gnome.Shell.WindowTracker`|object path does not exist|
+//! |`xdotool` / `wmctrl`|unusable under Wayland|
 //!
-//! 因此需要 GNOME Shell 扩展导出焦点窗口信息。本模块使用
-//! `focused-window-dbus@flexagoon.com`（本机实测 version 11 可用），
-//! 其 D-Bus 接口为：
+//! So a GNOME Shell extension is needed to export focused-window information.
+//! This module uses `focused-window-dbus@flexagoon.com` (measured working as
+//! version 11 on the real machine); its D-Bus interface is:
 //!
 //! ```text
 //! dest:   org.gnome.Shell
@@ -21,17 +22,20 @@
 //! method: org.gnome.shell.extensions.FocusedWindow.Get
 //! ```
 //!
-//! 返回 JSON，其中 `wm_class` 即应用标识。
+//! It returns JSON, in which `wm_class` is the app identifier.
 //!
-//! 注意 `dest` 是 `org.gnome.Shell` 本身：扩展由 GNOME Shell 进程直接
-//! 导出对象，不占用独立的 bus name。用 `org.gnome.Shell.Extensions.Dbus`
-//! 查询会得到 `ServiceUnknown`，那是地址写错，不代表扩展未启用。
+//! Note that `dest` is `org.gnome.Shell` itself: the extension exports its
+//! object directly from the GNOME Shell process and does not take a separate bus
+//! name. Querying with `org.gnome.Shell.Extensions.Dbus` yields
+//! `ServiceUnknown`; that is a wrong address, not proof the extension is
+//! disabled.
 //!
-//! # 降级行为
+//! # Fallback behavior
 //!
-//! 扩展缺失或不可用时，`focused_wm_class()` 返回 `None`，调用方按
-//! 「未知应用」处理。**不视为错误**——其他映射规则仍可正常工作，
-//! 仅「按应用区分」的部分退化为默认行为。
+//! When the extension is missing or unavailable, `focused_wm_class()` returns
+//! `None` and the caller treats it as an "unknown app". That is **not treated
+//! as an error**—the other mapping rules still work; only the "distinguish by
+//! app" part degrades to the default behavior.
 
 use std::process::Command;
 
@@ -39,9 +43,9 @@ const DBUS_DEST: &str = "org.gnome.Shell";
 const DBUS_PATH: &str = "/org/gnome/shell/extensions/FocusedWindow";
 const DBUS_METHOD: &str = "org.gnome.shell.extensions.FocusedWindow.Get";
 
-/// 查询当前焦点窗口的 `wm_class`。
+/// Query the `wm_class` of the current focused window.
 ///
-/// 扩展不可用时返回 `None`。
+/// Returns `None` when the extension is unavailable.
 pub fn focused_wm_class() -> Option<String> {
     let out = Command::new("gdbus")
         .args([
@@ -62,24 +66,26 @@ pub fn focused_wm_class() -> Option<String> {
     }
 
     let text = String::from_utf8_lossy(&out.stdout);
-    // 输出形如 ('{"title":"…","wm_class":"org.gnome.Ptyxis",…}',)
-    // 从中取出 wm_class 的值
+    // Output looks like ('{"title":"…","wm_class":"org.gnome.Ptyxis",…}',)
+    // Extract the value of wm_class from it
     extract_json_string(&text, "wm_class")
 }
 
-/// 从形如 `…"key":"value"…` 的文本中取出 value。
+/// Extract the value from text of the form `…"key":"value"…`.
 ///
-/// 只需处理 `wm_class` 这类简单字符串字段，不引入 JSON 解析库。
+/// Only simple string fields like `wm_class` need handling, so no JSON parsing
+/// library is pulled in.
 fn extract_json_string(text: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\":");
     let start = text.find(&needle)? + needle.len();
     let rest = &text[start..];
 
-    // 跳过可选的空格
+    // Skip optional whitespace
     let rest = rest.trim_start();
     let rest = rest.strip_prefix('"')?;
 
-    // 找到结束的引号（该字段无转义需求，取首个未转义的 "）
+    // Find the closing quote (this field needs no escaping; take the first
+    // unescaped ")
     let mut escaped = false;
     for (i, ch) in rest.char_indices() {
         if escaped {
@@ -123,7 +129,8 @@ mod tests {
 
     #[test]
     fn graceful_when_extension_absent() {
-        // 本机可能未启用该扩展；无论结果如何都不应 panic
+        // The extension may not be enabled on this machine; it must not panic
+        // either way
         let _ = focused_wm_class();
     }
 }

@@ -1,6 +1,6 @@
 /target
 
-# Python 字节码缓存（scripts/audit.py 作为 __main__ 运行时不生成，
-# 但被 import 时会生成，故直接忽略）
+# Python bytecode cache (not generated when scripts/audit.py runs as __main__,
+# but generated when it is imported, so ignore it outright)
 __pycache__/
 *.pyc

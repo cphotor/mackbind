@@ -1,25 +1,27 @@
-# mackbind 的 udev 规则
+# udev rule for mackbind
 #
-# 安装：
+# Install:
 #   sudo install -m644 packaging/99-mackbind.rules /etc/udev/rules.d/99-mackbind.rules
 #   sudo usermod -aG input "$USER"
 #   sudo udevadm control --reload && sudo udevadm trigger
-#   # 注销并重新登录（或重启），使新的组成员关系生效
+#   # Log out and back in (or reboot) so the new group membership takes effect
 #
-# ── 为什么需要 ────────────────────────────────────────────────────────
+# ── Why this is needed ────────────────────────────────────────────────
 #
-# mackbind 要独占物理键盘（读 /dev/input/event*）并创建虚拟键盘
-# （写 /dev/uinput）。二者都是特权设备。
+# mackbind needs to grab the physical keyboard (read /dev/input/event*) and
+# create a virtual keyboard (write /dev/uinput). Both are privileged devices.
 #
-# Ubuntu/Debian 实测：
-#   /dev/input/eventN   root:input  0660   ← 加入 input 组即可读
-#   /dev/uinput         root:root   0600   ← 默认**无人**可写
+# Measured on Ubuntu/Debian:
+#   /dev/input/eventN   root:input  0660   ← add the user to the input group and it can be read
+#   /dev/uinput         root:root   0600   ← by default **no one** can write to it
 #
-# 因此单靠「把用户加入 input 组」在 Ubuntu 上不够：/dev/uinput 仍打不开，
-# 程序会以「无法打开 uinput」退出。本规则把它交给 input 组。
+# So on Ubuntu, adding the user to the input group alone is not enough:
+# /dev/uinput still cannot be opened, and the program exits with "cannot open
+# uinput". This rule hands it to the input group.
 #
-# 注：其他发行版的 /dev/uinput 权限可能已放开（本仓库最初在 EndeavourOS
-# 调试时未遇到此问题），请用 `ls -l /dev/uinput` 确认。本规则为**追加**，
-# 不会收紧既有配置。
+# Note: other distributions may already have opened up /dev/uinput permissions
+# (this repo did not hit the issue when it was first debugged on EndeavourOS);
+# confirm with `ls -l /dev/uinput`. This rule is **additive** and does not
+# tighten any existing config.
 
 KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"

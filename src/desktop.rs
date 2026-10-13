@@ -1,31 +1,36 @@
-//! 桌面条目解析：判断应用是否属于某一类别。
+//! Desktop entry parsing: decide whether an app belongs to a category.
 //!
-//! # 为什么需要
+//! # Why this is needed
 //!
-//! 「Ctrl 已被占用」的应用（终端、GVIM）最初靠硬编码 `WM_CLASS` 名单
-//! 判定，实测立刻出问题：ptyxis 的 `wm_class` 实际是
-//! `org.gnome.Ptyxis`，而名单里写的是小写 `ptyxis`，匹配不上。
+//! Apps where "Ctrl is already taken" (terminals, GVIM) were originally
+//! determined by a hardcoded `WM_CLASS` list, which immediately proved broken in
+//! practice: ptyxis's `wm_class` is actually `org.gnome.Ptyxis`, while the list
+//! had the lowercase `ptyxis`, which did not match.
 //!
-//! freedesktop 桌面条目规范对此有标准约定——终端模拟器的 `.desktop`
-//! 条目都带 `Categories=...TerminalEmulator;`：
+//! The freedesktop Desktop Entry spec has a standard convention for this —
+//! terminal emulators' `.desktop` entries all carry
+//! `Categories=...TerminalEmulator;`:
 //!
 //! ```text
 //! /usr/share/applications/org.gnome.Ptyxis.desktop
 //!   Categories=GNOME;GTK;System;TerminalEmulator;
 //! ```
 //!
-//! 按规范判定而非枚举列表，可自动覆盖新装的终端，也不会因大小写、
-//! 前缀差异而漏判。
+//! Deciding by the spec rather than enumerating a list automatically covers
+//! newly installed terminals, and never misses one due to case or prefix
+//! differences.
 //!
-//! # 注意
+//! # Note
 //!
-//! 判定依据是**窗口所属的应用**。终端里运行的 nvim、htop、python 等
-//! 其窗口的 `WM_CLASS` 仍是终端模拟器，因此已被终端规则覆盖。独立
-//! 运行、有自己窗口的编辑器（gvim、code 等）才需另行配置。
+//! The decision is based on **the app the window belongs to**. nvim, htop,
+//! python, etc. running inside a terminal still have a terminal emulator's
+//! `WM_CLASS`, so they are already covered by the terminal rule. Only editors
+//! that run standalone with their own window (gvim, code, etc.) need separate
+//! configuration.
 
 use std::path::{Path, PathBuf};
 
-/// XDG 数据目录，与 `xdg-user-dir` / GLib 的默认值一致。
+/// XDG data directories, matching the defaults of `xdg-user-dir` / GLib.
 fn data_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Ok(home) = std::env::var("HOME") {
@@ -44,10 +49,10 @@ fn data_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// 在 XDG 数据目录中查找 `wm_class` 对应的桌面条目。
+/// Find the desktop entry for `wm_class` in the XDG data directories.
 ///
-/// `wm_class` 形如 `org.gnome.Ptyxis`，对应
-/// `applications/org.gnome.Ptyxis.desktop`。用户目录优先。
+/// `wm_class` looks like `org.gnome.Ptyxis`, corresponding to
+/// `applications/org.gnome.Ptyxis.desktop`. User directories take priority.
 fn find_desktop_file(wm_class: &str) -> Option<PathBuf> {
     let filename = format!("{wm_class}.desktop");
     data_dirs()
@@ -56,16 +61,16 @@ fn find_desktop_file(wm_class: &str) -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 
-/// 读取桌面条目的 `Categories` 值。
+/// Read the desktop entry's `Categories` value.
 ///
-/// 只解析本行，不引入完整 INI 解析器——桌面条目的 `Categories`
-/// 惯例上单行给出。
+/// Parses only this line and does not bring in a full INI parser — a desktop
+/// entry's `Categories` is conventionally given on a single line.
 fn read_categories(path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
     for line in content.lines() {
-        // 跳过段头（[Desktop Entry]）之后才生效
+        // Only takes effect after skipping past the section header ([Desktop Entry])
         if line.starts_with('[') {
-            // 进入新段，若不是主段则放弃
+            // Entered a new section; give up if it is not the main one
             if !line.trim().eq_ignore_ascii_case("[Desktop Entry]") {
                 return None;
             }
@@ -78,9 +83,9 @@ fn read_categories(path: &Path) -> Option<String> {
     None
 }
 
-/// 判断应用是否属于指定类别（大小写不敏感）。
+/// Decide whether an app belongs to the given category (case-insensitive).
 ///
-/// 用于终端判定：`is_terminal("org.gnome.Ptyxis")` → true
+/// Used for terminal detection: `is_terminal("org.gnome.Ptyxis")` → true
 pub fn has_category(wm_class: &str, category: &str) -> bool {
     let Some(path) = find_desktop_file(wm_class) else {
         return false;
@@ -93,10 +98,10 @@ pub fn has_category(wm_class: &str, category: &str) -> bool {
         .any(|c| c.trim().eq_ignore_ascii_case(category))
 }
 
-/// 终端模拟器在桌面条目中的标准类别。
+/// The standard category for terminal emulators in desktop entries.
 pub const CATEGORY_TERMINAL_EMULATOR: &str = "TerminalEmulator";
 
-/// 判断窗口所属应用是否为终端模拟器。
+/// Decide whether the app owning the window is a terminal emulator.
 pub fn is_terminal(wm_class: &str) -> bool {
     has_category(wm_class, CATEGORY_TERMINAL_EMULATOR)
 }
@@ -107,9 +112,10 @@ mod tests {
 
     #[test]
     fn detects_installed_terminals() {
-        // 不同发行版默认终端不同（EndeavourOS 实测有 kgx/gnome-console，
-        // Ubuntu 26.04 只有 ptyxis）。不强求某个具体终端，只断言：
-        // **凡是本机装了的**终端，都能按 Categories 认出来。
+        // Different distributions have different default terminals (EndeavourOS
+        // was measured to have kgx/gnome-console, Ubuntu 26.04 only ptyxis). Do
+        // not insist on a specific terminal, just assert that **every terminal
+        // installed on this machine** can be recognized via Categories.
         let candidates = [
             "org.gnome.Ptyxis",
             "org.gnome.Console",
@@ -123,41 +129,43 @@ mod tests {
         for term in candidates {
             if find_desktop_file(term).is_some() {
                 found += 1;
-                assert!(is_terminal(term), "{term} 应被识别为终端");
+                assert!(is_terminal(term), "{term} should be recognized as a terminal");
             }
         }
         assert!(
             found > 0,
-            "本机未找到任何已知终端，测试无意义——请检查桌面条目查找路径"
+            "no known terminal found on this machine, the test is meaningless — check the desktop entry lookup paths"
         );
     }
 
     #[test]
     fn non_terminal_is_not_matched() {
-        assert!(!is_terminal("org.gnome.Nautilus"), "文件管理器不是终端");
-        assert!(!is_terminal("code"), "VSCode 不是终端");
+        assert!(!is_terminal("org.gnome.Nautilus"), "a file manager is not a terminal");
+        assert!(!is_terminal("code"), "VSCode is not a terminal");
     }
 
     #[test]
     fn unknown_app_is_graceful() {
-        // 不存在的应用不应崩溃，也不应误判
+        // A nonexistent app should neither crash nor be misjudged
         assert!(!is_terminal("com.example.nonexistent.app"));
         assert!(!is_terminal(""));
     }
 
     #[test]
     fn desktop_file_lookup_is_exact_case() {
-        // wm_class 大小写需与文件名精确对应（desktop 文件名区分大小写），
-        // 但类别比较不区分大小写。
+        // wm_class case must correspond exactly to the filename (desktop
+        // filenames are case-sensitive), but the category comparison is
+        // case-insensitive.
         //
-        // 不写死 ptyxis：改用本机任一已装终端，避免依赖具体发行版的默认终端。
+        // Do not hardcode ptyxis: use any terminal installed on this machine
+        // instead, to avoid depending on a distribution's default terminal.
         let Some(term) = ["org.gnome.Ptyxis", "org.gnome.Console", "kitty", "Alacritty"]
             .into_iter()
             .find(|t| find_desktop_file(t).is_some())
         else {
-            return; // 无终端可测
+            return; // no terminal to test
         };
-        let f = find_desktop_file(term).expect("已确认存在");
+        let f = find_desktop_file(term).expect("confirmed to exist");
         assert!(f.to_string_lossy().contains(term));
     }
 }

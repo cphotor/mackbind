@@ -1,24 +1,29 @@
-//! mackbind — 在 Linux 上复现 macOS 键位习惯，同时保留 Linux 原生修饰键语义。
+//! mackbind — reproduces macOS key habits on Linux while preserving native
+//! Linux modifier semantics.
 //!
-//! # 设计要点
+//! # Design highlights
 //!
-//! 与 Kinto/Toshy 一类工具的根本区别在于**默认透传、查表例外**：
+//! The fundamental difference from tools like Kinto/Toshy is **pass-through by
+//! default, look up the table only for exceptions**:
 //!
-//! - `Cmd` 始终保持 `KEY_LEFTMETA`（即 Linux 的 Super），**不做全局改写**。
-//!   只有命中映射表的组合（如 `Cmd+C`）才翻译为 Ctrl；表外组合原样透传，
-//!   交由桌面环境或应用自行解释。
+//! - `Cmd` always stays `KEY_LEFTMETA` (Linux's Super), **with no global rewrite**.
+//!   Only combos that hit the rule table (such as `Cmd+C`) are translated to Ctrl;
+//!   combos outside the table pass through unchanged and are left for the desktop
+//!   environment or the app to interpret.
 //!
-//! 这保留了 macOS 上「Cmd 与 Ctrl 并列」的结构。若像 Toshy 那样把 Cmd
-//! 全局映射为 Ctrl，两个修饰键会指向同一槽位，`Ctrl+Cmd+Space` 这类组合
-//! 语义将全部丢失，GUI 与终端下的 Ctrl 行为也会被迫分叉。
+//! This preserves the macOS structure where "Cmd and Ctrl stand side by side". If
+//! Cmd were globally mapped to Ctrl as Toshy does, the two modifiers would point
+//! at the same slot, combos like `Ctrl+Cmd+Space` would lose all their meaning,
+//! and Ctrl behavior in the GUI and in the terminal would be forced to diverge.
 //!
-//! # 安全措施
+//! # Safety measures
 //!
-//! 抓取键盘设备是特权操作，异常退出会导致键盘失灵。因此：
+//! Grabbing a keyboard device is a privileged operation, and an abnormal exit
+//! leaves the keyboard unusable. Therefore:
 //!
-//! - 抓取失败立即报错退出，不静默挂起
-//! - 任何退出路径（正常结束、Ctrl+C、SIGTERM、panic）都释放 grab
-//! - 退出前释放所有按下的键，避免修饰键残留在按下状态
+//! - A failed grab errors out and exits immediately rather than hanging silently
+//! - Every exit path (normal end, Ctrl+C, SIGTERM, panic) releases the grab
+//! - All pressed keys are released before exit so modifiers are not left down
 
 mod accel;
 mod config;
@@ -34,27 +39,32 @@ use mapper::Mapper;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-/// 收到信号时置位，主循环据此优雅退出。
+/// Set when a signal arrives; the main loop uses it to exit gracefully.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_signal(_sig: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
 }
 
-/// 安装信号处理：Ctrl+C、SIGTERM、SIGHUP 时置 `SHUTDOWN`，由主循环退出。
+/// Install signal handling: on Ctrl+C, SIGTERM, SIGHUP set `SHUTDOWN`, and the
+/// main loop exits.
 ///
-/// **必须用 `sigaction` 且 `sa_flags = 0`，不能直接用 `libc::signal()`。**
+/// **Must use `sigaction` with `sa_flags = 0`, not `libc::signal()` directly.**
 ///
-/// `signal()` 是 BSD 语义，隐含 `SA_RESTART`：处理函数返回后，内核会自动
-/// 重启被它打断的 `read()`。而主循环就阻塞在 `fetch_events()` 上，
-/// 于是 `read()` 永远不返回，循环顶部的 `SHUTDOWN` 检查永远执行不到
-/// ——只能等 systemd 90 秒后 SIGKILL，`Cleanup::drop` 也就不会执行，
-/// 虚拟设备上按着的修饰键没人松。
+/// `signal()` has BSD semantics and implies `SA_RESTART`: after the handler
+/// returns, the kernel automatically restarts the `read()` it interrupted. But
+/// the main loop is blocked in `fetch_events()`, so `read()` would never return,
+/// the `SHUTDOWN` check at the top of the loop would never run — and we could
+/// only wait for systemd to SIGKILL after 90 seconds. `Cleanup::drop` would then
+/// never run, leaving modifiers held down on the virtual device with nothing to
+/// release them.
 ///
-/// 去掉 `SA_RESTART` 后 `read()` 会返回 `EINTR`，循环才能回到顶部。
-/// 代价是主循环必须自己区分 `Interrupted`（继续）和真正的读取错误（退出）。
+/// With `SA_RESTART` removed, `read()` returns `EINTR` and the loop can get back
+/// to the top. The cost is that the main loop must distinguish `Interrupted`
+/// (continue) from a genuine read error (exit).
 fn install_signal_handlers() {
-    // 先转成函数指针再转整数：函数项直接转整数没有对应的 ABI 保证。
+    // Convert to a function pointer first, then to an integer: casting a function
+    // item directly to an integer has no guaranteed ABI.
     let handler: extern "C" fn(libc::c_int) = handle_signal;
     let handler = handler as libc::sighandler_t;
 
@@ -63,17 +73,18 @@ fn install_signal_handlers() {
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = handler;
             libc::sigemptyset(&mut action.sa_mask);
-            // 关键：不带 SA_RESTART，让阻塞的 read() 返回 EINTR。
+            // Key: no SA_RESTART, so the blocking read() returns EINTR.
             action.sa_flags = 0;
             libc::sigaction(sig, &action, std::ptr::null_mut());
         }
     }
 }
 
-/// RAII guard：Drop 时释放 grab 并松开所有按下的键。
+/// RAII guard: on Drop it releases the grab and releases all pressed keys.
 ///
-/// 这是防止键盘失灵的最后一道防线——即使发生 panic，栈展开也会执行
-/// Drop，从而保证设备不会停留在被独占状态。
+/// This is the last line of defense against an unusable keyboard — even if a
+/// panic happens, stack unwinding still runs Drop, guaranteeing the device is
+/// never left in the grabbed state.
 struct Cleanup {
     device: Option<Device>,
     mapper_keys: Vec<KeyCode>,
@@ -82,7 +93,7 @@ struct Cleanup {
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        // 先松开所有按下的键，避免修饰键残留在输出侧
+        // First release all pressed keys so modifiers are not left on the output side
         if let Some(vdev) = self.virtual_device.as_mut() {
             let mut events = Vec::new();
             for k in &self.mapper_keys {
@@ -94,19 +105,19 @@ impl Drop for Cleanup {
             }
             if !events.is_empty() {
                 let _ = vdev.emit(&events);
-                eprintln!("[exit] 已松开 {} 个按下的键", events.len());
+                eprintln!("[exit] released {} pressed keys", events.len());
             }
         }
         if let Some(dev) = self.device.as_mut() {
             match dev.ungrab() {
-                Ok(()) => eprintln!("[exit] grab 已释放，键盘恢复正常"),
-                Err(e) => eprintln!("[exit] 警告：ungrab 失败 ({e})，请重新插拔键盘或重启"),
+                Ok(()) => eprintln!("[exit] grab released, keyboard back to normal"),
+                Err(e) => eprintln!("[exit] warning: ungrab failed ({e}), replug the keyboard or reboot"),
             }
         }
     }
 }
 
-/// 判断设备是否为键盘：需支持 A-Z 这类基础按键。
+/// Decide whether a device is a keyboard: it must support basic keys like A-Z.
 fn looks_like_keyboard(dev: &Device) -> bool {
     match dev.supported_keys() {
         Some(keys) => keys.contains(KeyCode::KEY_A) && keys.contains(KeyCode::KEY_Z),
@@ -114,9 +125,9 @@ fn looks_like_keyboard(dev: &Device) -> bool {
     }
 }
 
-/// 列出所有键盘设备，便于 `--list-devices` 与排障。
+/// List all keyboard devices, for `--list-devices` and troubleshooting.
 fn list_devices() {
-    println!("{:<52} {}", "设备名", "路径");
+    println!("{:<52} {}", "device name", "path");
     println!("{}", "-".repeat(80));
     for (path, dev) in evdev::enumerate() {
         if looks_like_keyboard(&dev) {
@@ -132,28 +143,28 @@ fn list_devices() {
 fn print_usage() {
     println!(
         "\
-mackbind — macOS 键位习惯 for Linux
+mackbind — macOS key habits for Linux
 
-用法：
-    mackbind [选项]
+Usage:
+    mackbind [options]
 
-选项：
-    -l, --list-devices    列出检测到的键盘设备后退出
-    -v, --verbose         输出逐事件调试日志
-    -c, --check           仅校验配置文件，不抓取设备
-    -h, --help            显示此帮助
+Options:
+    -l, --list-devices    list detected keyboard devices and exit
+    -v, --verbose         print per-event debug logs
+    -c, --check           only validate the config file, do not grab a device
+    -h, --help            show this help
 
-环境变量：
-    MACKBIND_CONFIG       指定配置文件路径（最高优先级）
-    MACKBIND_VERBOSE      等价于 --verbose
-    MACKBIND_DEVICE       指定设备路径，跳过自动选择
+Environment variables:
+    MACKBIND_CONFIG       config file path (highest priority)
+    MACKBIND_VERBOSE      equivalent to --verbose
+    MACKBIND_DEVICE       device path, skipping automatic selection
 
-配置查找顺序（后者覆盖前者）：
+Config lookup order (later overrides earlier):
     /etc/mackbind/config.toml
     ~/.config/mackbind/config.toml
 
-无需任何配置即可运行——内置默认映射已提供 CapsLock↔Ctrl 互换
-与常用 macOS 快捷键。"
+Runs with no configuration at all — the built-in default mapping already
+provides the CapsLock↔Ctrl swap and common macOS shortcuts."
     );
 }
 
@@ -173,7 +184,7 @@ fn main() {
 
     let verbose = flag("-v") || flag("--verbose") || std::env::var("MACKBIND_VERBOSE").is_ok();
 
-    // 配置：解析失败必须大声退出，不能以默认配置静默运行。
+    // Config: a parse failure must exit loudly, never silently run with defaults.
     let cfg = match config::load() {
         Ok(c) => c,
         Err(e) => {
@@ -183,19 +194,20 @@ fn main() {
     };
     println!("[config] {}", cfg.summary());
     if verbose {
-        // desc 字段本就是「仅供人阅读」，在 verbose 下打出来，
-        // 否则写了说明却永远看不到，等于没写。
+        // The desc field is by nature "for humans only"; print it under verbose,
+        // otherwise a description that can never be seen may as well not exist.
         for r in &cfg.remap {
             if let Some(d) = &r.desc {
                 println!("[config]   remap {} → {}{}", r.from, r.to,
                     if r.desc.is_some() { format!("   # {d}") } else { String::new() });
             }
         }
-        // 打印整张规则表——不只是带 desc 的那些。
+        // Print the whole rule table — not just the rows that have a desc.
         //
-        // 这是「到底做了什么」的唯一权威视图：表里有几行、每行管什么，
-        // 一屏可见。desc 仅供人阅读，缺失不影响列出。
-        println!("[config] 规则表（{} 行，Cmd 隐含）:", cfg.rules.len());
+        // This is the only authoritative view of "what it actually does": how
+        // many rows the table has and what each governs, all on one screen. desc
+        // is for humans only; a missing desc does not affect the listing.
+        println!("[config] rule table ({} rows, Cmd implicit):", cfg.rules.len());
         for r in &cfg.rules {
             let app = if r.apps.is_empty() {
                 "*".to_string()
@@ -221,15 +233,15 @@ fn main() {
                             s.push_str(name);
                         }
                     }
-                    // 主键去掉 KEY_ 前缀并小写：`KEY_DELETE` → `delete`、
-                    // `KEY_LEFTBRACE` → `leftbrace`
+                    // Strip the KEY_ prefix from the main key and lowercase it:
+                    // `KEY_DELETE` → `delete`, `KEY_LEFTBRACE` → `leftbrace`
                     let k = key.strip_prefix("KEY_").unwrap_or(key).to_lowercase();
                     s.push_str(&k);
                     s
                 }
-                crate::config::Action::DeAccel { feature } => format!("读DE({feature})"),
+                crate::config::Action::DeAccel { feature } => format!("ReadDE({feature})"),
                 crate::config::Action::TerminalCtrlShift => {
-                    "Ctrl+Shift（若应用如此绑定）".to_string()
+                    "Ctrl+Shift (if the app binds it so)".to_string()
                 }
                 crate::config::Action::Exec {
                     program,
@@ -237,11 +249,11 @@ fn main() {
                     confirm,
                     ..
                 } => format!(
-                    "执行 {}{}{}",
+                    "exec {}{}{}",
                     program,
                     if args.is_empty() { "" } else { " " },
                     args.join(" ")
-                ) + if *confirm { "（需确认）" } else { "" },
+                ) + if *confirm { " (needs confirmation)" } else { "" },
             };
             println!(
                 "[config]   {:<28} {:<20} → {}{}",
@@ -256,45 +268,49 @@ fn main() {
     let mut mapper = match Mapper::new(&cfg, verbose) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("[config] 规则解析失败: {e}");
+            eprintln!("[config] rule parse failed: {e}");
             std::process::exit(1);
         }
     };
 
     if flag("-c") || flag("--check") {
-        println!("[check] 配置与规则校验通过");
+        println!("[check] config and rules validated");
         return;
     }
 
-    // 注册信号处理：Ctrl+C、SIGTERM、SIGHUP 时优雅退出并释放 grab。
+    // Register signal handling: on Ctrl+C, SIGTERM, SIGHUP exit gracefully and
+    // release the grab.
     install_signal_handlers();
 
-    // --trace：只观察，不接管。
+    // --trace: observe only, do not take over.
     //
-    // **不 grab、不创建虚拟设备、不注入任何事件**——键盘完全保持原生
-    // 行为，用户可以正常打字。同时把「输入事件 → 本应发出的事件」
-    // 记录到 stderr，用于诊断映射逻辑。
+    // **Does not grab, does not create a virtual device, does not inject any
+    // event** — the keyboard keeps its fully native behavior and the user can
+    // still type normally. At the same time it records "input event → the event
+    // that should have been emitted" to stderr, to diagnose the mapping logic.
     //
-    // 存在的理由：映射一旦生效，键盘就由本程序接管，出现问题时
-    // 用户无法再打字，也就没有办法观察现场。trace 模式绕开这一点。
+    // Why it exists: once the mapping is active the keyboard is owned by this
+    // program, and when something goes wrong the user can no longer type, so
+    // there is no way to observe the scene. Trace mode sidesteps exactly that.
     if std::env::args().any(|a| a == "--trace") {
         run_trace(&target_from_env());
     }
 
-    // 选择目标设备
+    // Pick the target device
     let target = match std::env::var("MACKBIND_DEVICE") {
         Ok(p) => std::path::PathBuf::from(p),
         Err(_) => match pick_keyboard() {
             Some(p) => p,
             None => {
-                eprintln!("[fatal] 未找到键盘设备。用 --list-devices 查看可用设备。");
+                eprintln!("[fatal] no keyboard device found. Use --list-devices to see available devices.");
                 std::process::exit(1);
             }
         },
     };
     println!("[device] {}", target.display());
 
-    // 建虚拟设备。必须声明完整按键集，否则系统可能不认它是键盘。
+    // Build the virtual device. It must declare the full key set, or the system
+    // may not recognize it as a keyboard.
     let keys = full_keyboard_capabilities();
     let mut vdev = match VirtualDevice::builder() {
         Ok(b) => match b
@@ -305,45 +321,47 @@ fn main() {
         {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("[fatal] 创建虚拟键盘失败: {e}");
+                eprintln!("[fatal] failed to create virtual keyboard: {e}");
                 uinput_permission_hint();
                 std::process::exit(1);
             }
         },
         Err(e) => {
-            eprintln!("[fatal] 无法打开 uinput: {e}");
+            eprintln!("[fatal] failed to open uinput: {e}");
             uinput_permission_hint();
             std::process::exit(1);
         }
     };
-    println!("[uinput] 虚拟键盘已创建");
+    println!("[uinput] virtual keyboard created");
 
-    // 独占抓取。失败立即退出——绝不能在此挂起。
+    // Exclusive grab. Exit immediately on failure — must never hang here.
     let mut dev = match Device::open(&target) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("[fatal] 打开设备失败: {e}");
-            eprintln!("        若提示 Device or resource busy，说明已有其他程序（如 Toshy）占用。");
+            eprintln!("[fatal] failed to open device: {e}");
+            eprintln!("        If it says Device or resource busy, another program (such as Toshy) is using it.");
             std::process::exit(1);
         }
     };
     if let Err(e) = dev.grab() {
-        eprintln!("[fatal] 抓取设备失败: {e}");
-        eprintln!("        若提示 busy，请先停止 Toshy 等占用键盘的程序。");
-        eprintln!("        键盘未受影响，可正常使用。");
+        eprintln!("[fatal] failed to grab device: {e}");
+        eprintln!("        If it says busy, first stop programs like Toshy that use the keyboard.");
+        eprintln!("        The keyboard is unaffected and works normally.");
         std::process::exit(1);
     };
-    println!("[grab] 已独占，映射已生效");
+    println!("[grab] grabbed, mapping active");
 
-    // 主动发出所有修饰键的**释放**事件，清除可能残留的按下态。
+    // Actively emit **release** events for all modifiers, clearing any residual
+    // pressed state.
     //
-    // 为什么需要：若此前 mackbind（或任何程序）让某个修饰键卡在按下态，
-    // GNOME 会把它记在**合成器侧**。重启 mackbind 只销毁了虚拟设备，
-    // 合成器并不保证自动清除——于是空格变 Cmd+空格、W 变 Cmd+W，
-    // 且按物理 Cmd 也无济于事（本程序抑制了 Meta 的按下与释放，
-    // GNOME 收不到任何事件来纠正自己的状态）。
+    // Why this is needed: if mackbind (or any program) previously left a modifier
+    // stuck down, GNOME records it on the **compositor side**. Restarting mackbind
+    // only destroys the virtual device; the compositor does not guarantee it
+    // clears automatically — so space becomes Cmd+Space, W becomes Cmd+W, and
+    // pressing physical Cmd does not help either (this program suppresses Meta's
+    // press and release, so GNOME receives no event to correct its own state).
     //
-    // 「无对应的按下」而发释放，对 libinput 是安全的空操作。
+    // Emitting a release with "no matching press" is a safe no-op for libinput.
     for key in [
         evdev::KeyCode::KEY_LEFTMETA,
         evdev::KeyCode::KEY_RIGHTMETA,
@@ -361,10 +379,11 @@ fn main() {
             0,
         )]);
     }
-    // 打印 PID 与退出方式。Ctrl+C 不可用——本程序占用了 Ctrl 与 Cmd，
-    // 键盘已无法产生 SIGINT，必须提供明确的替代退出通道。
-    println!("[ready] 映射已生效（PID {}）", std::process::id());
-    println!("        停止：systemctl --user stop mackbind");
+    // Print the PID and how to exit. Ctrl+C is unavailable — this program takes
+    // over Ctrl and Cmd, so the keyboard can no longer produce SIGINT; an
+    // explicit alternative exit channel must be provided.
+    println!("[ready] mapping active (PID {})", std::process::id());
+    println!("        stop: systemctl --user stop mackbind");
     println!();
 
     let mut cleanup = Cleanup {
@@ -373,9 +392,9 @@ fn main() {
         virtual_device: Some(vdev),
     };
 
-    // 主循环
+    // Main loop
     let mut ev_count: u64 = 0;
-    // 上次查询到的焦点窗口，用于避免在按键热路径上重复解析 .desktop
+    // Last queried focused window, to avoid re-parsing the .desktop on the key hot path
     let mut last_focus: Option<String> = None;
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
@@ -385,12 +404,12 @@ fn main() {
         let events: Vec<InputEvent> = match cleanup.device.as_mut().unwrap().fetch_events() {
             Ok(iter) => iter.collect(),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                // 被信号打断：回顶部检查 SHUTDOWN 后再读。
-                // 不能当作致命错误 break —— 收到 SIGTERM 也会走到这里。
+                // Interrupted by a signal: loop back, check SHUTDOWN, then read.
+                // Must not break as a fatal error — receiving SIGTERM also lands here.
                 continue;
             }
             Err(e) => {
-                eprintln!("[error] 读取事件失败: {e}");
+                eprintln!("[error] failed to read events: {e}");
                 break;
             }
         };
@@ -401,13 +420,16 @@ fn main() {
                 continue;
             }
 
-            // 懒查询焦点窗口：仅在收到按键时才查。
+            // Lazily query the focused window: only when a key event arrives.
             //
-            // 「Cmd → Ctrl+Shift」需知道当前焦点窗口是否终端或 Ctrl
-            // 占用应用。焦点变化不频繁，无需常驻轮询；有输入才需要判断。
+            // "Cmd → Ctrl+Shift" needs to know whether the current focused
+            // window is a terminal or a Ctrl-using app. Focus does not change
+            // often, so there is no need for constant polling; only input
+            // requires the decision.
             //
-            // wm_class 与上次相同时跳过 set_window_id——它内部要解析
-            // .desktop 条目，不宜在按键热路径上重复执行。
+            // Skip set_window_id when wm_class is the same as last time — it
+            // parses .desktop entries internally, which should not run repeatedly
+            // on the key hot path.
             if batch.iter().any(|e| e.event_type() == EventType::KEY) {
                 if let Some(wm_class) = focus::focused_wm_class() {
                     if last_focus.as_deref() != Some(wm_class.as_str()) {
@@ -417,13 +439,15 @@ fn main() {
                 }
             }
 
-            // 整批映射后一次性注入。
+            // Map the whole batch, then inject it in one shot.
             //
-            // 关键：不能逐事件 emit。`emit()` 每次都会自动补一个
-            // SYN_REPORT，若逐事件发送，一次物理按键序列会被拆成多个
-            // 同步报告。输入法（fcitx5/ibus）以 SYN 为批次边界判定
-            // 「一次输入结束」，收到多余 SYN 就会把 j、k 当作两次独立
-            // 输入直接提交——表现为双拼音打不出来、只出英文字母。
+            // Key point: do not emit event by event. Every `emit()` automatically
+            // appends a SYN_REPORT, so sending event by event would split one
+            // physical key sequence into multiple sync reports. Input methods
+            // (fcitx5/ibus) treat SYN as the batch boundary that determines "one
+            // input is finished"; extra SYNs make it submit j and k as two
+            // separate inputs — which shows up as double pinyin not working and
+            // only English letters coming out.
             let mut out: Vec<InputEvent> = Vec::new();
             for ev in batch {
                 ev_count += 1;
@@ -446,7 +470,7 @@ fn main() {
             }
 
             if !out.is_empty() {
-                // 记录当前按下的键，供退出时松开
+                // Record currently pressed keys, to release them on exit
                 for e in &out {
                     if e.event_type() == EventType::KEY && e.value() == 1 {
                         cleanup.mapper_keys.push(KeyCode(e.code()));
@@ -454,24 +478,24 @@ fn main() {
                 }
                 if let Some(v) = cleanup.virtual_device.as_mut() {
                     if let Err(err) = v.emit(&out) {
-                        eprintln!("[error] 注入事件失败: {err}");
+                        eprintln!("[error] failed to inject events: {err}");
                     }
                 }
             }
         }
 
-        // 无事件时短暂休眠，避免忙等占满 CPU。
+        // Brief sleep when there are no events, to avoid busy-waiting on CPU.
         if n_events == 0 {
             std::thread::sleep(Duration::from_millis(4));
         }
     }
 
     let n = cleanup.mapper_keys.len();
-    drop(cleanup); // 触发清理
-    eprintln!("\n[exit] 共处理 {ev_count} 个事件，松开 {n} 个按下的键");
+    drop(cleanup); // trigger cleanup
+    eprintln!("\n[exit] processed {ev_count} events, released {n} pressed keys");
 }
 
-/// 自动选择键盘：优先内置 Apple 键盘，否则取第一个。
+/// Automatically pick a keyboard: prefer a built-in Apple keyboard, otherwise the first one.
 fn pick_keyboard() -> Option<std::path::PathBuf> {
     let mut fallback = None;
     for (path, dev) in evdev::enumerate() {
@@ -489,20 +513,21 @@ fn pick_keyboard() -> Option<std::path::PathBuf> {
     fallback
 }
 
-/// 完整的键盘能力集。
+/// Full keyboard capability set.
 ///
-/// 选定 trace 模式要观察的设备（不 grab，仅读取）。
+/// Pick the device for trace mode to observe (no grab, read only).
 fn target_from_env() -> std::path::PathBuf {
     match std::env::var("MACKBIND_DEVICE") {
         Ok(p) => std::path::PathBuf::from(p),
         Err(_) => pick_keyboard().unwrap_or_else(|| {
-            eprintln!("[fatal] 未找到键盘设备");
+            eprintln!("[fatal] no keyboard device found");
             std::process::exit(1);
         }),
     }
 }
 
-/// trace 模式：读入事件，跑一遍映射，把结果打到 stderr，不注入。
+/// trace mode: read events, run them through the mapping, print the result to
+/// stderr, do not inject.
 fn run_trace(target: &std::path::Path) -> ! {
     let cfg = match config::load() {
         Ok(c) => c,
@@ -514,30 +539,31 @@ fn run_trace(target: &std::path::Path) -> ! {
     let mut mapper = match Mapper::new(&cfg, false) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("[config] 规则解析失败: {e}");
+            eprintln!("[config] rule parse failed: {e}");
             std::process::exit(1);
         }
     };
     let mut dev = match Device::open(target) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("[fatal] 打开设备失败: {e}");
+            eprintln!("[fatal] failed to open device: {e}");
             std::process::exit(1);
         }
     };
-    eprintln!("[trace] 观察 {}（不 grab、不注入）", target.display());
+    eprintln!("[trace] observing {} (no grab, no injection)", target.display());
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
-            eprintln!("[trace] 收到退出信号，结束");
-            // 本函数签名是 `-> !`，用 exit 而非 break 保持「永不返回」。
+            eprintln!("[trace] exit signal received, finishing");
+            // This function's signature is `-> !`, so use exit rather than break
+            // to keep the "never returns" guarantee.
             std::process::exit(0);
         }
     let events: Vec<InputEvent> = match dev.fetch_events() {
         Ok(iter) => iter.collect(),
-        // 被信号打断：回顶部检查 SHUTDOWN 后再读（见 install_signal_handlers）
+        // Interrupted by a signal: loop back, check SHUTDOWN, then read (see install_signal_handlers)
         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
         Err(e) => {
-            eprintln!("[fatal] 读取事件失败: {e}");
+            eprintln!("[fatal] failed to read events: {e}");
             std::process::exit(1);
         }
     };
@@ -552,7 +578,7 @@ fn run_trace(target: &std::path::Path) -> ! {
         eprintln!(
             "[trace] IN {:<22} {} -> OUT [{}]",
             desc(ev.code()),
-            if ev.value() == 1 { "按下" } else if ev.value() == 0 { "松开" } else { "重复" },
+            if ev.value() == 1 { "down" } else if ev.value() == 0 { "up" } else { "repeat" },
             outs.iter()
                 .map(|o| format!("{}{}", desc(o.code()),
                     if o.value() == 1 { "+" } else if o.value() == 0 { "-" } else { "=" }))
@@ -564,31 +590,34 @@ fn run_trace(target: &std::path::Path) -> ! {
 
 }
 
-/// `/dev/uinput` 打开失败时的排查提示。
+/// Troubleshooting hint when `/dev/uinput` fails to open.
 ///
-/// 这里刻意按发行版分述：Arch/EndeavourOS 的 udev 默认已放开
-/// `/dev/uinput`，只被「不在 input 组」挡住；而 Debian/Ubuntu 默认是
-/// `root:root 0600`——**加入 input 组也不够**，还需本仓库的 udev 规则。
-/// 只提示「加入 input 组」会让 Ubuntu 用户反复无效尝试。
+/// This deliberately distinguishes distributions: Arch/EndeavourOS udev already
+/// opens `/dev/uinput` by default and it is only blocked by "not being in the
+/// input group", whereas Debian/Ubuntu default to `root:root 0600` — **joining
+/// the input group is not enough**; this repo's udev rule is also required. Only
+/// hinting "join the input group" would make Ubuntu users try repeatedly in vain.
 fn uinput_permission_hint() {
-    eprintln!("        /dev/uinput 需可读可写。排查：");
-    eprintln!("          · 是否处于 input 组：id -nG");
-    eprintln!("          · Debian/Ubuntu 默认仅 root 可写，需额外安装 udev 规则：");
+    eprintln!("        /dev/uinput must be readable and writable. Check:");
+    eprintln!("          · are you in the input group: id -nG");
+    eprintln!("          · Debian/Ubuntu default to root-only write, requiring an extra udev rule:");
     eprintln!("            sudo install -m644 packaging/99-mackbind.rules \\");
     eprintln!("              /etc/udev/rules.d/99-mackbind.rules");
     eprintln!("            sudo udevadm control --reload && sudo udevadm trigger");
-    eprintln!("            然后注销重新登录。详见 README「环境要求」。");
+    eprintln!("            then log out and back in. See the README 'Requirements' section.");
 }
 
-/// uinput 创建的虚拟设备若不声明某按键，系统会忽略该键的事件。
-/// 因此这里列出 evdev 的全部键码。
-/// 相对轴能力声明。
+/// If the virtual device created by uinput does not declare a key, the system
+/// ignores that key's events. So all evdev key codes are listed here.
+/// Relative axis capability declaration.
 ///
-/// 即便只做键盘映射，也需声明 REL_X/Y/WHEEL/HWHEEL。缺了它，内核会把
-/// 虚拟设备归类成 rfkill 设备（`Handlers=... rfkill`），libinput 随即
-/// 走完全不同的解析路径，输入法可能收不到完整的按键序列。
+/// Even for keyboard mapping only, REL_X/Y/WHEEL/HWHEEL must be declared.
+/// Without it, the kernel classifies the virtual device as an rfkill device
+/// (`Handlers=... rfkill`), libinput then takes a completely different parsing
+/// path, and the input method may not receive the full key sequence.
 ///
-/// 这点参考了 Toshy/Kinto 的既有实现（`output.py` 的 `real_uinput()`）。
+/// This follows the existing implementation in Toshy/Kinto (`real_uinput()` in
+/// `output.py`).
 fn relative_axes() -> AttributeSet<RelativeAxisCode> {
     [
         RelativeAxisCode::REL_X,
@@ -602,9 +631,11 @@ fn relative_axes() -> AttributeSet<RelativeAxisCode> {
 }
 
 fn full_keyboard_capabilities() -> AttributeSet<KeyCode> {
-    // 遍历 KeyCode 的全部变体填入集合。uinput 虚拟设备若不声明某按键，
-    // 系统会直接忽略该键的事件，因此必须声明完整集合。
-    // evdev 的 KeyCode 是 ArrayedEvdevEnum，可用 FromIterator 批量构造。
-    // evdev 按键码从 0 连续编号（KEY_CNT 为总数），遍历整个区间即可。
+    // Iterate over all variants of KeyCode and fill the set. If the uinput
+    // virtual device does not declare a key, the system ignores that key's
+    // events, so the full set must be declared.
+    // evdev's KeyCode is an ArrayedEvdevEnum, buildable in bulk with FromIterator.
+    // evdev key codes are numbered consecutively from 0 (KEY_CNT is the total),
+    // so iterating the whole range suffices.
     (0..=0x2ff).map(KeyCode::new).collect()
 }

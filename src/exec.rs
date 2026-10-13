@@ -1,79 +1,91 @@
-//! 执行外部命令（「动作即函数」里的函数型动作）。
+//! Run external commands (the function-style actions of "actions as functions").
 //!
-//! 有些 macOS 操作无法通过发按键实现——它们不是组合键，而是**命令**：
-//! 清倒废纸篓要跑 `gio trash --empty --force`，锁屏可以走 D-Bus 等。
-//! 这类一律落到表里的 `exec` 动作，声明式地指到命令。
+//! Some macOS operations cannot be implemented by emitting key events — they are
+//! not key combos but **commands**: emptying the trash runs
+//! `gio trash --empty --force`, locking the screen can go over D-Bus, and so on.
+//! These all fall to an `exec` action in the table, declaratively pointing at a
+//! command.
 //!
-//! # 为什么用 `gio trash` 而不是别的
+//! # Why `gio trash` and nothing else
 //!
-//! `gio` 是 glib 自带的工具（GNOME 桌面环境下必然存在），`gio trash`
-//! 走 GIO 的回收站实现，与文件管理器（Nautilus 等）操作的是同一个
-//! 废纸篓。不依赖具体文件管理器，也不依赖 `rm`。
+//! `gio` is a tool shipped with glib (always present in a GNOME desktop
+//! environment), and `gio trash` goes through GIO's trash implementation, the
+//! same trash that file managers (Nautilus, etc.) operate on. It depends on no
+//! particular file manager, nor on `rm`.
 //!
-//! # 安全考量：破坏性命令需要确认
+//! # Security consideration: destructive commands need confirmation
 //!
-//! 清倒废纸篓**不可逆**。本模块对破坏性命令默认先确认：
+//! Emptying the trash is **irreversible**. By default this module confirms
+//! destructive commands first:
 //!
-//! - `confirm = true`（默认）：发出 GNOME 通知并要求用户点击确认，
-//!   超时或无法通知则**放弃执行**
-//! - `confirm = false`：直接执行。**仅在调用方明确知晓后果时使用**
+//! - `confirm = true` (default): sends a GNOME notification and asks the user to
+//!   click to confirm; on timeout or if the notification cannot be sent it
+//!   **gives up**
+//! - `confirm = false`: run directly. **Use only when the caller clearly knows
+//!   the consequences**
 //!
-//! 注意 `gio trash --empty` 本身带 `--force`，会跳过它自己的确认。
-//! 所以「不确认」这个语义必须由本模块来保证，而不是依赖 gio。
+//! Note that `gio trash --empty` itself carries `--force`, which skips its own
+//! confirmation. So the "no confirmation" semantics must be guaranteed by this
+//! module, not left to gio.
 
 use std::process::{Command, Stdio};
 
-/// 模态确认框的等待上限（秒）。超时按取消处理。
+/// Upper bound for waiting on the modal confirmation dialog (seconds). Timeout is
+/// treated as cancel.
 const DIALOG_TIMEOUT_SECS: u64 = 60;
 
-/// 破坏性命令的确认超时（秒）。
+/// Confirmation timeout for destructive commands (seconds).
 ///
-/// 超时即放弃执行——宁可不做，也不能在用户没注意时删掉东西。
+/// Timeout means give up — better to do nothing than to delete something while
+/// the user is not looking.
 const CONFIRM_TIMEOUT_SECS: u64 = 20;
 
-/// 列出命令的危险动作类别。
+/// Classify a command's risk category.
 ///
-/// 分类决定是否需要确认。新增破坏性命令时须更新此处，
-/// 避免「因为忘了标记而被无声执行」。
+/// The classification decides whether confirmation is needed. Additions of
+/// destructive commands must update this, to avoid "silently executed because
+/// someone forgot to mark it".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Risk {
-    /// 无副作用（如打开文件管理器）
+    /// No side effects (e.g. opening a file manager)
     Safe,
-    /// 不可逆的破坏性操作（清空废纸篓）
+    /// An irreversible destructive operation (emptying the trash)
     Destructive,
 }
 
-/// 供测试与调用方判断：某命令是否属破坏性。
+/// For tests and callers to decide: is a command destructive?
 pub fn is_destructive(program: &str, args: &[String]) -> bool {
     classify(program, args) == Risk::Destructive
 }
 
-/// 该请求是否需要弹确认框。
+/// Whether this request needs a confirmation dialog.
 ///
-/// 只看规则自己的 `confirm` 设置——安全性由 [`refuse`] 的作用域守卫
-/// 兜底，不在这里二次强制。
+/// Looks only at the rule's own `confirm` setting — safety is backed by the
+/// scope guard in [`refuse`], not forced a second time here.
 pub fn should_confirm(req: &ExecRequest<'_>) -> bool {
     req.confirm
 }
 
-/// 该请求是否应被直接拒绝（破坏性 + 免确认 + 未限定应用）。
+/// Whether this request should be rejected outright (destructive + no confirm +
+/// not app-scoped).
 pub fn refuse(req: &ExecRequest<'_>) -> bool {
     is_destructive(req.program, req.args) && !req.confirm && !req.scoped
 }
 
 fn classify(program: &str, args: &[String]) -> Risk {
     match program {
-        // `gio trash --empty` 清空整个废纸篓，文件永久消失
+        // `gio trash --empty` empties the whole trash; files disappear permanently
         "gio" if args.iter().any(|a| a == "--empty") => Risk::Destructive,
         "gio" if args.iter().any(|a| a == "trash") => Risk::Safe,
         _ => Risk::Safe,
     }
 }
 
-/// 通过 D-Bus 发 GNOME 通知。
+/// Send a GNOME notification over D-Bus.
 ///
-/// 返回 `true` 表示通知已投递。失败不阻断流程——由调用方决定是否
-/// 在无通知时放弃。
+/// Returns `true` if the notification was delivered. A failure does not block
+/// the flow — the caller decides whether to give up when there is no
+/// notification.
 fn notify(summary: &str, body: &str) -> bool {
     Command::new("gdbus")
         .args([
@@ -93,7 +105,7 @@ fn notify(summary: &str, body: &str) -> bool {
             &format!("{body}"),    // body
             "[]",          // actions
             "{}",          // hints
-            "-1",          // expire_timeout：永不自动消失
+            "-1",          // expire_timeout: never auto-dismiss
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -102,36 +114,40 @@ fn notify(summary: &str, body: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 等待用户确认。
+/// Wait for the user's confirmation.
 ///
-/// 确认方式取决于环境：
+/// The confirmation method depends on the environment:
 ///
-/// - **有 TTY**（前台运行）：在终端里等 `y`，附带倒计时提示
-/// - **无 TTY**（systemd 服务）：等一个**写在该键组合上的二次确认**——
-///   即用户必须再按一次同样的组合才真正执行
+/// - **Has a TTY** (foreground run): wait for `y` in the terminal, with a
+///   countdown hint
+/// - **No TTY** (systemd service): wait for a **second confirmation bound to
+///   that key combo** — the user must press the same combo again for it to
+///   actually run
 ///
-/// 第二种是必须的：程序由 systemd 拉起时没有可读的终端，
-/// 早期版本「无 TTY 即放弃」导致该功能完全不可用且毫无反馈——
-/// 用户按了键什么都没发生，也不给任何提示。
+/// The second is necessary: when the program is started by systemd there is no
+/// readable terminal, and an early version's "no TTY means give up" made the
+/// feature completely unusable with no feedback at all — the user pressed the
+/// key and nothing happened, with no hint whatsoever.
 fn wait_for_confirmation(prompt: &str, timeout_secs: u64) -> bool {
     let has_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
     if !has_tty {
-        // 无终端：请用户再按一次同样的组合确认（由调用方重试机制处理）
+        // No terminal: ask the user to press the same combo again to confirm
+        // (handled by the caller's retry mechanism)
         eprintln!("[exec] {prompt}");
-        eprintln!("[exec] 已在后台运行：请再按一次同样的组合以确认（{} 秒内有效）", timeout_secs);
+        eprintln!("[exec] running in the background: press the same combo again to confirm (valid for {} seconds)", timeout_secs);
         return false;
     }
     eprintln!("[exec] {prompt}");
-    eprintln!("[exec] 确认请按 y（{timeout_secs} 秒后自动放弃）");
+    eprintln!("[exec] press y to confirm (auto-gives up after {timeout_secs} seconds)");
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let mut buf = [0u8; 1];
     loop {
         if std::time::Instant::now() >= deadline {
-            eprintln!("[exec] 超时，已放弃执行");
+            eprintln!("[exec] timed out, gave up");
             return false;
         }
-        // poll 而非 read，1 秒一次超时循环
+        // poll rather than read, with a 1-second timeout loop
         let mut fds = libc::pollfd {
             fd: libc::STDIN_FILENO,
             events: libc::POLLIN,
@@ -148,41 +164,46 @@ fn wait_for_confirmation(prompt: &str, timeout_secs: u64) -> bool {
     }
 }
 
-/// 执行一条命令。
+/// Run a single command.
 ///
-/// `confirm` 为 `false` 时跳过确认——**仅用于非破坏性命令**。
-/// 破坏性命令即使 `confirm = false` 也会被强制确认。
+/// When `confirm` is `false` confirmation is skipped — **for non-destructive
+/// commands only**. A destructive command is forced to confirm even when
+/// `confirm = false`.
 ///
-/// # 二次确认（后台运行时的唯一可行方案）
+/// # Second confirmation (the only workable option when running in the background)
 ///
-/// 程序由 systemd 拉起时没有 TTY，无法等 `y`。此时改为要求
-/// **再按一次同样的组合**：第一次按下只发通知并记下时间，
-/// 第二次（窗口内）才真正执行。
+/// When the program is started by systemd there is no TTY and it cannot wait for
+/// `y`. In that case it instead requires **pressing the same combo again**: the
+/// first press only sends a notification and records the time, and the second
+/// press (within the window) actually runs it.
 ///
-/// 这比「无 TTY 即放弃」可用得多——早期那版让该功能完全静默失效，
-/// 用户按了键既没反应也没提示。同时它仍构成一道人工确认：
-/// 误按一次不会立刻删掉东西。
+/// This is far more usable than "no TTY means give up" — that early version made
+/// the feature fail completely silently, so the user pressed the key with no
+/// response and no hint. At the same time it still constitutes a manual
+/// confirmation: an accidental single press does not immediately delete anything.
 pub struct ExecRequest<'a> {
     pub program: &'a str,
     pub args: &'a [String],
-    /// 说明文字，来自规则表的 `desc`
+    /// Human-readable text, from the rule table's `desc`
     pub label: Option<&'a str>,
     pub confirm: bool,
-    /// 确认框正文。`None` 时自动生成
+    /// Confirmation dialog body. Auto-generated when `None`
     pub prompt: Option<&'a str>,
-    /// 确认按钮文字。`None` 时用「执行」
+    /// Confirmation button text. Uses "Run" when `None`
     pub ok_label: Option<&'a str>,
-    /// 用于「再按一次同一组合」的描述
+    /// Description used for "press the same combo again"
     pub confirm_key: Option<&'a str>,
-    /// 规则是否限定了应用。
+    /// Whether the rule is app-scoped.
     ///
-    /// 破坏性命令**免确认**只在限定应用时允许：全局绑定误按一次就是
-    /// 永久删除，而 macOS 对应的操作本就只在自己的文件管理器里有效。
+    /// A destructive command is allowed to be **confirmation-free** only when
+    /// app-scoped: a global binding would permanently delete things on one
+    /// accidental press, whereas the corresponding macOS operation only ever
+    /// applies within its own file manager.
     pub scoped: bool,
 }
 
 pub fn run(req: ExecRequest<'_>) {
-    // 先做两项判定（需要完整的请求），再解构执行
+    // Make the two decisions first (they need the full request), then destructure to execute
     let refused = refuse(&req);
     let needs_confirm = should_confirm(&req);
 
@@ -198,44 +219,47 @@ pub fn run(req: ExecRequest<'_>) {
     let label = label.unwrap_or(program);
 
     if refused {
-        eprintln!("[exec] 全局破坏性命令须显式确认，已拒绝：{label}");
+        eprintln!("[exec] global destructive command requires explicit confirmation, refused: {label}");
         return;
     }
 
-    // 是否弹确认框，**只看规则自己的设置**。
+    // Whether to show the confirmation dialog **looks only at the rule's own setting**.
     //
-    // 此前写成 `confirm || risk == Destructive`，导致 `confirm: false`
-    // 完全不起作用——`risk` 一项让条件恒真，弹窗照弹。
-    // 安全性由上面的作用域守卫保证：破坏性命令免确认时必须限定应用，
-    // 否则直接拒绝执行，不该在这里再强制弹框。
+    // It used to be written `confirm || risk == Destructive`, which made
+    // `confirm: false` completely ineffective — the `risk` term made the
+    // condition always true, so the dialog popped up anyway.
+    // Safety is guaranteed by the scope guard above: a destructive command that is
+    // confirmation-free must be app-scoped, otherwise execution is refused
+    // outright and the dialog should not be forced here.
 
     if needs_confirm {
         let prompt = custom_prompt.map(|s| s.to_string()).unwrap_or_else(|| {
             format!(
-                "即将执行「{}」：{} {}\n\n此操作不可撤销。",
+                "about to run \"{}\": {} {}\n\nThis operation cannot be undone.",
                 label,
                 program,
                 args.join(" ")
             )
         });
 
-        // 优先用模态对话框：用户必须点「执行」，无法被忽略或错过。
-        // 早期版本用桌面通知，通知被静音或错过时功能等同于没有——
-        // 用户按了键毫无反馈。
-        match confirm_dialog(&prompt, ok_label.unwrap_or("执行")) {
+        // Prefer a modal dialog: the user must click "Run", it cannot be ignored or missed.
+        // An early version used a desktop notification, and when notifications were
+        // muted or missed the feature was as good as absent — the user pressed the
+        // key with no feedback.
+        match confirm_dialog(&prompt, ok_label.unwrap_or("Run")) {
             Some(true) => {
                 spawn(program, args, label);
                 return;
             }
             Some(false) => {
-                eprintln!("[exec] 用户取消，不执行：{label}");
+                eprintln!("[exec] user cancelled, not running: {label}");
                 return;
             }
-            // 拿不到对话框（无 zenity / 无显示）→ 退回二次按组合
+            // Cannot get a dialog (no zenity / no display) → fall back to second press
             None => {}
         }
 
-        let key = confirm_key.unwrap_or("(同一组合)");
+        let key = confirm_key.unwrap_or("(same combo)");
         if let Some(done) = check_second_press(key) {
             if done {
                 spawn(program, args, label);
@@ -246,7 +270,7 @@ pub fn run(req: ExecRequest<'_>) {
         }
 
         if !wait_for_confirmation(&prompt, CONFIRM_TIMEOUT_SECS) {
-            eprintln!("[exec] 未确认，不执行：{label}");
+            eprintln!("[exec] not confirmed, not running: {label}");
             return;
         }
     }
@@ -254,9 +278,11 @@ pub fn run(req: ExecRequest<'_>) {
     spawn(program, args, label);
 }
 
-/// 弹出模态确认框。返回 `None` 表示无法弹（无 zenity / 无显示）。
+/// Pop up a modal confirmation dialog. Returns `None` if it cannot pop up (no
+/// zenity / no display).
 ///
-/// 在独立线程里等待，**不阻塞按键处理循环**——阻塞会导致整块键盘无响应。
+/// Wait in a separate thread, **without blocking the key-handling loop** —
+/// blocking would make the whole keyboard unresponsive.
 fn confirm_dialog(prompt: &str, ok_label: &str) -> Option<bool> {
     use std::sync::mpsc;
     let (tx, rx) = mpsc::channel();
@@ -267,14 +293,14 @@ fn confirm_dialog(prompt: &str, ok_label: &str) -> Option<bool> {
         let out = Command::new("zenity")
             .args([
                 "--question",
-                "--title=确认破坏性操作",
+                "--title=Confirm destructive operation",
                 "--width=420",
                 "--text",
                 &text,
                 "--ok-label",
                 &ok,
                 "--cancel-label",
-                "取消",
+                "Cancel",
             ])
             .output();
         let ok = match out {
@@ -287,25 +313,26 @@ fn confirm_dialog(prompt: &str, ok_label: &str) -> Option<bool> {
         let _ = tx.send(Some(ok));
     });
 
-    // 等用户点；超时按「取消」处理
+    // Wait for the user to click; timeout is treated as "cancel"
     rx.recv_timeout(std::time::Duration::from_secs(DIALOG_TIMEOUT_SECS))
         .ok()
         .flatten()
 }
 
-/// 已挂起待二次确认的组合。
+/// Combos already pending a second confirmation.
 static PENDING: std::sync::Mutex<Option<(String, std::time::Instant)>> =
     std::sync::Mutex::new(None);
 
-/// 二次确认窗口：秒。
+/// Second-confirmation window: seconds.
 const CONFIRM_WINDOW_SECS: u64 = 8;
 
-/// 是否处于后台（无 TTY）——只有那时才用二次确认。
+/// Whether we are in the background (no TTY) — only then is second confirmation used.
 fn is_background() -> bool {
     (unsafe { libc::isatty(libc::STDIN_FILENO) } != 1)
 }
 
-/// 有 TTY 时返回 `None`（走终端确认）；后台时返回 `Some(是否本次即执行)`。
+/// Returns `None` when there is a TTY (use terminal confirmation); in the
+/// background it returns `Some(whether this press actually runs)`.
 fn check_second_press(key: &str) -> Option<bool> {
     if !is_background() {
         return None;
@@ -324,10 +351,10 @@ fn check_second_press(key: &str) -> Option<bool> {
     }
 }
 
-/// 第一次按下：挂起并通知。
+/// First press: arm and notify.
 fn arm(key: &str, label: &str) {
-    let prompt = format!("再按一次 {key} 以确认执行「{label}」（{CONFIRM_WINDOW_SECS} 秒内有效）");
-    let _ = notify("待确认：破坏性操作", &prompt);
+    let prompt = format!("press {key} again to confirm running \"{label}\" (valid for {CONFIRM_WINDOW_SECS} seconds)");
+    let _ = notify("Pending: destructive operation", &prompt);
     eprintln!("[exec] {prompt}");
 }
 
@@ -339,11 +366,11 @@ fn spawn(program: &str, args: &[String], label: &str) {
         .spawn()
     {
         Ok(mut child) => {
-            // 不等待：按键事件的处理循环不能被子进程阻塞
+            // Do not wait: the key-event handling loop must not be blocked by a child process
             let _ = child.try_wait();
-            eprintln!("[exec] 已执行：{label}");
+            eprintln!("[exec] ran: {label}");
         }
-        Err(e) => eprintln!("[exec] 执行失败：{label}（{e}）"),
+        Err(e) => eprintln!("[exec] failed: {label} ({e})"),
     }
 }
 
@@ -377,7 +404,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        // 不应真的执行，故只验证分类与守卫逻辑本身
+        // It should not actually run, so only verify the classification and guard logic itself
         assert_eq!(classify("gio", &args), Risk::Destructive);
     }
 }

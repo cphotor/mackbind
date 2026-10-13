@@ -1,310 +1,306 @@
-# macOS 快捷键映射清单
+# macOS Keyboard Shortcut Mapping Inventory
 
-依据：[Apple 官方 Mac 键盘快捷键](https://support.apple.com/zh-cn/102650)
+Source: [Apple's official Mac keyboard shortcuts](https://support.apple.com/en-us/102650)
 
-**核心原则：以 macOS 语义为准。** 目标是让操作行为与 macOS 一致，而非让按键名称一致。若目标功能已被桌面环境占用，修改桌面环境的原有绑定以让位。
+**Core principle: macOS semantics win.** The goal is to make behavior consistent with macOS, not to make key names consistent. If a target function is already claimed by the desktop environment, change the desktop environment's existing binding to make room.
 
 ---
 
-## 判定分类
+## Classification
 
-| 类 | 含义 | 实现方式 |
+| Class | Meaning | Implementation |
 |---|---|---|
-| **A** | 应用内通用操作 | 默认 `Cmd+X` → `Ctrl+X` |
-| **C** | 终端/编辑器特化 | `Cmd+X` → `Ctrl+Shift+X`（**逐键**，非整体） |
-| **D** | macOS 特有键位或功能 | 显式规则表 |
-| **E** | 有等价功能但桌面环境未绑 | mackbind 主动实现（按 DE 适配） |
-| **F** | 概念不存在于目标平台 | 放弃 |
-| **B** | 平台 Super 绑定 | **暂缓**，见「暂缓事项」 |
+| **A** | General in-app operations | default `Cmd+X` → `Ctrl+X` |
+| **C** | Terminal/editor specialization | `Cmd+X` → `Ctrl+Shift+X` (**per key**, not wholesale) |
+| **D** | macOS-specific keys or features | explicit rule table |
+| **E** | Equivalent feature exists but the desktop environment does not bind it | mackbind implements it proactively (adapted per DE) |
+| **F** | Concept does not exist on the target platform | dropped |
+| **B** | Platform Super bindings | **deferred**, see "Deferred items" |
 
 ---
 
-## 核心设计原则
+## Core design principles
 
-### 一、以 macOS 语义为准
+### 1. macOS semantics win
 
-目标是让操作**行为**与 macOS 一致，而非按键名称一致。若目标功能已被桌面环境占用，按「macOS 优先」处理冲突。
+The goal is to make the operation's **behavior** consistent with macOS, not the key names. If a target function is already claimed by the desktop environment, resolve the conflict according to "macOS first".
 
-### 二、桌面环境是可配置项，不可硬编码
+### 2. The desktop environment is a configurable option, not hard-coded
 
-Linux 上有 GNOME、KDE Plasma、Sway、Hyprland 等多种桌面环境，同一 macOS 功能在不同 DE 下的实现方式、可用性、默认快捷键都不同。
+On Linux there are many desktop environments, such as GNOME, KDE Plasma, Sway, and Hyprland; the same macOS feature has a different implementation, availability, and default shortcuts under each DE.
 
-因此 DE 相关行为必须做成配置项：
+So DE-related behavior must be exposed as a config option:
 
 ```toml
 [desktop]
-type = "gnome"      # gnome | kde | none | 自定义
+type = "gnome"      # gnome | kde | none | custom
 ```
 
-| 目标 | GNOME | KDE Plasma | Sway / i3 |
+| Target | GNOME | KDE Plasma | Sway / i3 |
 |---|---|---|---|
-|切换应用|`Super+Tab`|`Meta+Tab`|需自行绑定|
-|显示桌面|`show-desktop`（默认未绑）|Plasma 概览|需自行绑定|
-|截图|未绑定，需注册|Spectacle 自带|需自行绑定|
+|Switch apps|`Super+Tab`|`Meta+Tab`|bind it yourself|
+|Show desktop|`show-desktop` (unbound by default)|Plasma overview|bind it yourself|
+|Screenshot|unbound, must be registered|built into Spectacle|bind it yourself|
 
-`type = "none"` 表示不查任何 DE 绑定，相关规则跳过，其余规则照常生效。
+`type = "none"` means "do not query any DE bindings; skip the related rules, and let the rest apply as usual."
 
-**不可查的功能不可当作不存在**——应记录在文档中，待支持对应 DE 时启用。
+**A feature you cannot query is not the same as a feature that does not exist** -- record it in the docs and enable it once the relevant DE is supported.
 
-### 三、特化类应用
+### 3. Specialized apps
 
-此类应用内 `Ctrl` 已被占用，`Cmd` 在其中映射为 `Ctrl+Shift`。**但这是逐键的，不是整体的**——只对应用自身已用 `Ctrl+Shift` 绑定的键加 Shift，其余键仍走默认的 `Ctrl`。理由见「实现状态 → 终端特化的粒度」。
+Inside these apps `Ctrl` is already taken, so `Cmd` maps to `Ctrl+Shift` there. **But this is per key, not wholesale** -- only keys that the app itself has already bound to `Ctrl+Shift` get Shift added; all other keys still go through the default `Ctrl`. See "Implementation status → Granularity of terminal specialization" for the rationale.
 
-判定依据分两层：
+The decision is made in two layers:
 
-1. `.desktop` 条目的 `Categories` 含 `TerminalEmulator` —— 按 freedesktop 规范判定，自动覆盖新装的终端。硬编码 WM_CLASS 名单曾因写成小写 `ptyxis` 而实际值是 `org.gnome.Ptyxis` 漏判。
-2. `ctrl_busy_apps` 配置项 —— 用于终端之外、Ctrl 有非标准含义的应用（如独立窗口的 gvim）。
+1. The `.desktop` entry's `Categories` contains `TerminalEmulator` -- decided by the freedesktop spec, so newly installed terminals are covered automatically. A hard-coded WM_CLASS list once missed because it was written in lowercase as `ptyxis` while the actual value is `org.gnome.Ptyxis`.
+2. The `ctrl_busy_apps` config option -- for apps outside terminals where Ctrl has a non-standard meaning (e.g. gvim in its own window).
 
-焦点窗口信息经 GNOME Shell 扩展 `focused-window-dbus` 获取，采用懒查询（收到按键才查，`wm_class` 未变则跳过解析）。
-
----
-
-## 暂缓事项
-
-### Super 键相关规则（原分类 B）
-
-macOS 的 `Cmd+Tab`（切换应用）、`Cmd+H`（隐藏）、`Cmd+↑/↓`（窗口管理）在 Linux 上对应 `Super+X` 组合。
-
-**这类规则暂缓实现。** 理由：
-
-1. 目标是模拟 macOS，Super 在 Linux 上是「Windows 键」语义，与 macOS 的 Cmd 并不等价
-2. 各 DE 对 Super 的占用情况差异大（GNOME 用它管窗口，Sway 另有一套）
-3. 先把不依赖 DE 的规则（A/C/D/E）做扎实，Super 相关留待后续
-
-后续实现时按 §二 的方式做成 DE 配置项，不写死任何 DE 的绑定表。
+Focused-window information is obtained through the GNOME Shell extension `focused-window-dbus`, using lazy queries (only query on a keypress; skip parsing when `wm_class` has not changed).
 
 ---
 
-## 一、常用操作
+## Deferred items
 
-|macOS|Linux 目标|类|
+### Super-key rules (former class B)
+
+macOS's `Cmd+Tab` (switch apps), `Cmd+H` (hide), and `Cmd+↑/↓` (window management) correspond to `Super+X` combos on Linux.
+
+**These rules are deferred.** Reasons:
+
+1. The goal is to emulate macOS; on Linux, Super carries the "Windows key" semantics and is not equivalent to macOS's Cmd.
+2. How much each DE claims Super varies a lot (GNOME uses it for window management; Sway has its own scheme).
+3. Get the rules that do not depend on the DE (A/C/D/E) solid first; leave the Super-related ones for later.
+
+When they are implemented later, make them DE config options per §2 -- do not hard-code any DE's binding table.
+
+---
+
+## 1. Common operations
+
+|macOS|Linux target|Class|
 |---|---|---|
-|`Cmd+X` 剪切|`Ctrl+X`|A|
-|`Cmd+C` 复制|`Ctrl+C`|A|
-|`Cmd+V` 粘贴|`Ctrl+V`|A|
-|`Cmd+Z` 撤销|`Ctrl+Z`|A|
-|`Shift+Cmd+Z` 重做|`Ctrl+Shift+Z`|A|
-|`Cmd+A` 全选|`Ctrl+A`|A|
-|`Cmd+F` 查找|`Ctrl+F`|A|
-|`Cmd+G` 查找下一个|`Ctrl+G`|A|
-|`Shift+Cmd+G` 查找上一个|`Ctrl+Shift+G`|A|
-|`Cmd+O` 打开|`Ctrl+O`|A|
-|`Cmd+P` 打印|`Ctrl+P`|A|
-|`Cmd+Q` 退出应用|D-Bus 请求焦点应用退出|E|
-|`Cmd+S` 存储|`Ctrl+S`|A|
-|`Cmd+T` 新标签页|`Ctrl+T`|A|
-|`Cmd+W` 关闭窗口|`Ctrl+W`|A|
-|`Option+Cmd+W` 关闭 App 全部窗口|`Ctrl+Alt+W`|应用处理|
-|`Cmd+H` 隐藏窗口|`Super+h`|B（暂缓）|
-|`Option+Cmd+H` 隐藏其他 App|无|F|
-|`Cmd+M` 最小化|`Super+Down`|B（暂缓）|
-|`Option+Cmd+M` 最小化全部窗口|无|F|
-|`Option+Cmd+Esc` 强制退出|`Ctrl+Alt+Esc`|A|
-|`Cmd+空格` 聚焦/Spotlight|活动概览；**GNOME 原 `Super+space` 需让位**|E|
-|`Option+Cmd+空格` 访达内聚焦|无全局对应|F|
-|`Ctrl+Cmd+空格` 字符检视器|无|F|
-|`Ctrl+Cmd+F` 全屏|`F11`|D（已实现：显式规则）|
-|`Cmd+,` 偏好设置|无全局对应|F|
-|`Cmd+Tab` 切换应用|`Super+Tab`|B（暂缓）|
-|`Shift+Cmd+Tab` 反向切换|`Shift+Super+Tab`|B（暂缓）|
-|`Cmd+`` ` `` 切换窗口|无全局对应|F|
-|`Cmd+Shift+3/4/5` 截图|`Shift+Print`（3）/ `Print`（4、5）|D（已实现，见下）|
-|`Cmd+Shift+N` 访达新建文件夹|`Ctrl+Shift+N`|A|
-|`Ctrl+Cmd+N` 新建含所选项目的文件夹|无|F|
-|`Shift+Cmd+6` Siri 询问（macOS 27+）|无|F|
-|`Fn+Q` 快速备忘录|无|F|
-|`Space` 快速查看|无全局对应|F|
+|`Cmd+X` Cut|`Ctrl+X`|A|
+|`Cmd+C` Copy|`Ctrl+C`|A|
+|`Cmd+V` Paste|`Ctrl+V`|A|
+|`Cmd+Z` Undo|`Ctrl+Z`|A|
+|`Shift+Cmd+Z` Redo|`Ctrl+Shift+Z`|A|
+|`Cmd+A` Select all|`Ctrl+A`|A|
+|`Cmd+F` Find|`Ctrl+F`|A|
+|`Cmd+G` Find next|`Ctrl+G`|A|
+|`Shift+Cmd+G` Find previous|`Ctrl+Shift+G`|A|
+|`Cmd+O` Open|`Ctrl+O`|A|
+|`Cmd+P` Print|`Ctrl+P`|A|
+|`Cmd+Q` Quit app|D-Bus request for the focused app to quit|E|
+|`Cmd+S` Save|`Ctrl+S`|A|
+|`Cmd+T` New tab|`Ctrl+T`|A|
+|`Cmd+W` Close window|`Ctrl+W`|A|
+|`Option+Cmd+W` Close all app windows|`Ctrl+Alt+W`|App-handled|
+|`Cmd+H` Hide window|`Super+h`|B (deferred)|
+|`Option+Cmd+H` Hide other apps|none|F|
+|`Cmd+M` Minimize|`Super+Down`|B (deferred)|
+|`Option+Cmd+M` Minimize all windows|none|F|
+|`Option+Cmd+Esc` Force quit|`Ctrl+Alt+Esc`|A|
+|`Cmd+Space` Focus/Spotlight|activities overview; **GNOME's original `Super+space` must give way**|E|
+|`Option+Cmd+Space` Focus within Finder|no global equivalent|F|
+|`Ctrl+Cmd+Space` Character viewer|none|F|
+|`Ctrl+Cmd+F` Full screen|`F11`|D (implemented: explicit rule)|
+|`Cmd+,` Preferences|no global equivalent|F|
+|`Cmd+Tab` Switch apps|`Super+Tab`|B (deferred)|
+|`Shift+Cmd+Tab` Switch apps in reverse|`Shift+Super+Tab`|B (deferred)|
+|`Cmd+`` ` `` Switch window|no global equivalent|F|
+|`Cmd+Shift+3/4/5` Screenshot|`Shift+Print` (3) / `Print` (4, 5)|D (implemented, see below)|
+|`Cmd+Shift+N` New folder in Finder|`Ctrl+Shift+N`|A|
+|`Ctrl+Cmd+N` New folder with selection|none|F|
+|`Shift+Cmd+6` Ask Siri (macOS 27+)|none|F|
+|`Fn+Q` Quick Note|none|F|
+|`Space` Quick Look|no global equivalent|F|
 
-## 二、睡眠、退出与关机
+## 2. Sleep, log out, and shut down
 
-|macOS|Linux 目标|类|
+|macOS|Linux target|Class|
 |---|---|---|
-|`Ctrl+Cmd+Q` 锁定屏幕|`Super+l`|D|
-|`Shift+Cmd+Q` 退出登录|`Ctrl+Alt+Delete`|D（已实现）|
-|`Option+Shift+Cmd+Q` 直接退出登录|无|F|
+|`Ctrl+Cmd+Q` Lock screen|`Super+l`|D|
+|`Shift+Cmd+Q` Log out|`Ctrl+Alt+Delete`|D (implemented)|
+|`Option+Shift+Cmd+Q` Log out immediately|none|F|
 
-> 电源按钮类快捷键无对应键盘按键，忽略。
+> Power-button shortcuts have no corresponding keyboard key and are ignored.
 
-## 三、访达与系统
+## 3. Finder and system
 
-访达即 macOS 的 Finder，对应 Linux 的 Nautilus。以下多为文件管理器内部操作，多数可由应用自身处理。
+Finder is macOS's Finder, corresponding to Nautilus on Linux. Most of the following are operations inside the file manager and can largely be handled by the app itself.
 
-|macOS|Linux 目标|类|
+|macOS|Linux target|Class|
 |---|---|---|
-|`Cmd+D` 复制文件|`Ctrl+D`|A|
-|`Cmd+E` 推出磁盘|无|F|
-|`Cmd+I` 显示简介|`Ctrl+I`|A|
-|`Cmd+[` 上一个文件夹|`Alt+←`|D|
-|`Cmd+]` 下一个文件夹|`Alt+→`|D|
-|`Cmd+Delete` 移到废纸篓|`Delete`（不带 Ctrl）|D（已实现，见下）|
-|`Shift+Cmd+Delete` 清倒废纸篓|`gio trash --empty --force`|E（已实现，强制确认）|
-|`Option+Shift+Cmd+Delete` 不确认清倒废纸篓|`gio trash --empty --force`|E（已实现，免确认）|
-|`Cmd+1/2/3/4` 图标/列表/分栏/画廊视图|Nautilus 内部|应用处理|
-|`Shift+Cmd+H` 个人文件夹|Nautilus 内部|应用处理|
-|`Option+Cmd+L` 下载文件夹|Nautilus 内部|应用处理|
-|`Shift+Cmd+O` 文稿文件夹|Nautilus 内部|应用处理|
-|`Shift+Cmd+U` 实用工具文件夹|Nautilus 内部|应用处理|
-|`Cmd+K` 连接服务器|Nautilus 内部|应用处理|
-|`Cmd+J` 显示选项|Nautilus 内部|应用处理|
-|`Cmd+N` 新访达窗口|`Ctrl+N`|A|
-|`Cmd+↑/↓` 打开上级/所选|`Ctrl+↑/↓`|A|
-|`Ctrl+Cmd+↑` 新窗口打开上级|无|F|
-|`Shift+Cmd+D` 桌面文件夹|Nautilus 内部|应用处理|
-|`Shift+Cmd+F` 最近使用|Nautilus 内部|应用处理|
-|`Shift+Cmd+G` 前往文件夹|Nautilus 内部|应用处理|
-|`Shift+Cmd+I` iCloud 云盘|无（无 iCloud）|F|
-|`Shift+Cmd+K` 网络窗口|Nautilus 内部|应用处理|
-|`Shift+Cmd+R` 隔空投送|无（无 Airdrop）|F|
-|`Shift+Cmd+P` 预览面板|Nautilus 内部|应用处理|
-|`Shift+Cmd+T` 标签页栏|Nautilus 内部|应用处理|
-|`Option+Cmd+P/S/T/V` 路径栏/边栏/工具栏/移动|应用处理|应用处理|
-|`Cmd+/` 状态栏|Nautilus 内部|应用处理|
-|`Option+Cmd+N` 智能文件夹|无|F|
-|`Option+Cmd+Y` 幻灯片放映快速查看|无全局对应|F|
-|`Option+Cmd+D` 显示/隐藏程序坞|无（GNOME 无 Dock）|F|
-|`Ctrl+Cmd+T` 添加到程序坞|无（GNOME 无 Dock）|F|
-|`Ctrl+Cmd+A` 制作替身|无（无替身概念）|F|
-|`Shift+Cmd+C` 电脑窗口|无|F|
-|`Shift+Cmd+X` 添加到边栏|应用处理|应用处理|
-|`Cmd+亮度键` 视频镜像|无|F|
-|`Option+亮度键` 显示器设置|无全局对应|F|
-|`Ctrl+亮度键` 外接显示器亮度|无（硬件相关）|F|
-|`Option+调度中心键` 调度中心设置|无|F|
-|`Cmd+调度中心` / `Fn+H` / `Fn+F11` 显示桌面|实现方式待定|E|
-|`Ctrl+↑` 调度中心|活动概览|E（已实现）|
-|`Ctrl+↓` 前方 App 所有窗口|无|F|
-|`Option+音量/键盘亮度键` 打开对应设置|无全局对应|F|
+|`Cmd+D` Duplicate file|`Ctrl+D`|A|
+|`Cmd+E` Eject disk|none|F|
+|`Cmd+I` Get info|`Ctrl+I`|A|
+|`Cmd+[` Previous folder|`Alt+←`|D|
+|`Cmd+]` Next folder|`Alt+→`|D|
+|`Cmd+Delete` Move to trash|`Delete` (without Ctrl)|D (implemented, see below)|
+|`Shift+Cmd+Delete` Empty trash|`gio trash --empty --force`|E (implemented, forced confirmation)|
+|`Option+Shift+Cmd+Delete` Empty trash without confirmation|`gio trash --empty --force`|E (implemented, no confirmation)|
+|`Cmd+1/2/3/4` Icon/list/column/gallery view|Nautilus internal|App-handled|
+|`Shift+Cmd+H` Home folder|Nautilus internal|App-handled|
+|`Option+Cmd+L` Downloads folder|Nautilus internal|App-handled|
+|`Shift+Cmd+O` Documents folder|Nautilus internal|App-handled|
+|`Shift+Cmd+U` Utilities folder|Nautilus internal|App-handled|
+|`Cmd+K` Connect to server|Nautilus internal|App-handled|
+|`Cmd+J` Show options|Nautilus internal|App-handled|
+|`Cmd+N` New Finder window|`Ctrl+N`|A|
+|`Cmd+↑/↓` Open enclosing folder/selected item|`Ctrl+↑/↓`|A|
+|`Ctrl+Cmd+↑` Open enclosing folder in new window|none|F|
+|`Shift+Cmd+D` Desktop folder|Nautilus internal|App-handled|
+|`Shift+Cmd+F` Recents|Nautilus internal|App-handled|
+|`Shift+Cmd+G` Go to folder|Nautilus internal|App-handled|
+|`Shift+Cmd+I` iCloud Drive|none (no iCloud)|F|
+|`Shift+Cmd+K` Network window|Nautilus internal|App-handled|
+|`Shift+Cmd+R` AirDrop|none (no AirDrop)|F|
+|`Shift+Cmd+P` Preview pane|Nautilus internal|App-handled|
+|`Shift+Cmd+T` Tab bar|Nautilus internal|App-handled|
+|`Option+Cmd+P/S/T/V` Path bar/sidebar/toolbar/move|App-handled|App-handled|
+|`Cmd+/` Status bar|Nautilus internal|App-handled|
+|`Option+Cmd+N` Smart folder|none|F|
+|`Option+Cmd+Y` Slideshow Quick Look|no global equivalent|F|
+|`Option+Cmd+D` Show/hide Dock|none (GNOME has no Dock)|F|
+|`Ctrl+Cmd+T` Add to Dock|none (GNOME has no Dock)|F|
+|`Ctrl+Cmd+A` Make alias|none (no alias concept)|F|
+|`Shift+Cmd+C` Computer window|none|F|
+|`Shift+Cmd+X` Add to sidebar|App-handled|App-handled|
+|`Cmd+Brightness` Video mirroring|none|F|
+|`Option+Brightness` Display settings|no global equivalent|F|
+|`Ctrl+Brightness` External display brightness|none (hardware-dependent)|F|
+|`Option+Dashboard` Dashboard settings|none|F|
+|`Cmd+Dashboard` / `Fn+H` / `Fn+F11` Show desktop|implementation TBD|E|
+|`Ctrl+↑` Dashboard|activities overview|E (implemented)|
+|`Ctrl+↓` All windows of the front app|none|F|
+|`Option+Volume/Brightness` Open the corresponding settings|no global equivalent|F|
 
-## 四、文本编辑
+## 4. Text editing
 
-### 光标移动
+### Cursor movement
 
-|macOS|Linux 目标|类|
+|macOS|Linux target|Class|
 |---|---|---|
-|`Cmd+←/→` 行首/行尾|`Ctrl+←/→`|A|
-|`Cmd+↑/↓` 文稿开头/末尾|`Ctrl+↑/↓`|A|
-|`Option+←/→` 上一/下一词首尾|`Alt+←/→`|D|
-|`Shift+Cmd+←/→` 选中到行首/行尾|`Ctrl+Shift+←/→`|A|
-|`Shift+Cmd+↑/↓` 选中到文稿首/末|`Ctrl+Shift+↑/↓`|A|
-|`Shift+↑/↓` 扩展选择到上/下一行|`Ctrl+Shift+↑/↓`|D|
-|`Shift+←/→` 扩展一个字符|`Ctrl+Shift+←/→`|D|
-|`Option+Shift+↑/↓` 扩展到段首/段尾|`Alt+Shift+↑/↓`|A（默认语义已覆盖）|
-|`Option+Shift+←/→` 扩展到词首/词尾|`Alt+Shift+←/→`|A（默认语义已覆盖）|
-|`Fn+↑/↓/←/→` PageUp/PageDown/Home/End|`Ctrl+↑/↓`（X11 惯例）|D|
+|`Cmd+←/→` Start/end of line|`Ctrl+←/→`|A|
+|`Cmd+↑/↓` Start/end of document|`Ctrl+↑/↓`|A|
+|`Option+←/→` Previous/next word boundary|`Alt+←/→`|D|
+|`Shift+Cmd+←/→` Select to start/end of line|`Ctrl+Shift+←/→`|A|
+|`Shift+Cmd+↑/↓` Select to start/end of document|`Ctrl+Shift+↑/↓`|A|
+|`Shift+↑/↓` Extend selection to previous/next line|`Ctrl+Shift+↑/↓`|D|
+|`Shift+←/→` Extend by one character|`Ctrl+Shift+←/→`|D|
+|`Option+Shift+↑/↓` Extend to start/end of paragraph|`Alt+Shift+↑/↓`|A (already covered by default semantics)|
+|`Option+Shift+←/→` Extend to start/end of word|`Alt+Shift+←/→`|A (already covered by default semantics)|
+|`Fn+↑/↓/←/→` PageUp/PageDown/Home/End|`Ctrl+↑/↓` (X11 convention)|D|
 
-### 删除
+### Deletion
 
-|macOS|Linux 目标|类|
+|macOS|Linux target|Class|
 |---|---|---|
-|`Option+Delete` 删除左边字词|`Ctrl+Delete`|A（已实现）|
-|`Ctrl+H` 删除左边字符|`Backspace`|A|
-|`Ctrl+D` 删除右边字符|`Ctrl+Delete`|A|
-|`Fn+Delete` 向前删除|`Ctrl+Delete`|D|
+|`Option+Delete` Delete word to the left|`Ctrl+Delete`|A (implemented)|
+|`Ctrl+H` Delete character to the left|`Backspace`|A|
+|`Ctrl+D` Delete character to the right|`Ctrl+Delete`|A|
+|`Fn+Delete` Forward delete|`Ctrl+Delete`|D|
 
-### Emacs 风格绑定（macOS 原生支持，Linux 已有同名键）
+### Emacs-style bindings (native to macOS, and Linux already has the same-named keys)
 
-这些在 Linux 上本就可用，**不作任何映射**：
+These already work on Linux, so **no mapping is done**:
 
 ```
-Ctrl+A 行首      Ctrl+E 行尾      Ctrl+F 前进      Ctrl+B 后退
-Ctrl+P 上移      Ctrl+N 下移      Ctrl+O 插入新行  Ctrl+T 交换字符
-Ctrl+L 居中      Ctrl+H 删左字符  Ctrl+D 删右字符
+Ctrl+A start of line    Ctrl+E end of line      Ctrl+F forward     Ctrl+B backward
+Ctrl+P up               Ctrl+N down             Ctrl+O insert newline  Ctrl+T transpose chars
+Ctrl+L center           Ctrl+H delete char left Ctrl+D delete char right
 ```
 
-### 格式与编辑
+### Formatting and editing
 
-|macOS|Linux 目标|类|
+|macOS|Linux target|Class|
 |---|---|---|
-|`Cmd+B/I/U` 粗体/斜体/下划线|`Ctrl+B/I/U`|A|
-|`Cmd+K` 插入网页链接|`Ctrl+K`|A|
-|`Cmd+T` 显示/隐藏字体窗口|无（F）/ 已有（Linux）|F|
-|`Cmd+;` 拼写检查|`Ctrl+;`|A|
-|`Shift+Cmd+;` 拼写和语法窗口|无|F|
-|`Ctrl+Cmd+D` 显示词定义|无|F|
-|`Cmd+{` / `Cmd+}` 左/右对齐|无全局对应|F|
-|`Shift+Cmd+\|` 居中对齐|无全局对应|F|
-|`Option+Cmd+F` 前往搜索栏|`Alt+←` 或已有|F|
-|`Option+Cmd+T` 显示/隐藏工具栏|应用处理|应用处理|
-|`Option+Cmd+C` 拷贝样式|无|F|
-|`Option+Cmd+V` 粘贴样式|无|F|
-|`Option+Shift+Cmd+V` 粘贴并匹配样式|无|F|
-|`Option+Cmd+I` 检查器窗口|无|F|
-|`Shift+Cmd+P` 页面设置|无|F|
-|`Shift+Cmd+-` / `Shift+Cmd+=` 缩小/放大|无全局对应|F|
-|`Shift+Cmd+?` 帮助菜单|无|F|
-|`Shift+Cmd+空格` Siri 询问（macOS 27+）|无|F|
+|`Cmd+B/I/U` Bold/italic/underline|`Ctrl+B/I/U`|A|
+|`Cmd+K` Insert web link|`Ctrl+K`|A|
+|`Cmd+T` Show/hide Fonts window|none (F) / already present (Linux)|F|
+|`Cmd+;` Check spelling|`Ctrl+;`|A|
+|`Shift+Cmd+;` Spelling and grammar window|none|F|
+|`Ctrl+Cmd+D` Show word definition|none|F|
+|`Cmd+{` / `Cmd+}` Align left/right|no global equivalent|F|
+|`Shift+Cmd+\|` Align center|no global equivalent|F|
+|`Option+Cmd+F` Go to search field|`Alt+←` or already present|F|
+|`Option+Cmd+T` Show/hide toolbar|App-handled|App-handled|
+|`Option+Cmd+C` Copy style|none|F|
+|`Option+Cmd+V` Paste style|none|F|
+|`Option+Shift+Cmd+V` Paste and match style|none|F|
+|`Option+Cmd+I` Inspector window|none|F|
+|`Shift+Cmd+P` Page setup|none|F|
+|`Shift+Cmd+-` / `Shift+Cmd+=` Zoom out/in|no global equivalent|F|
+|`Shift+Cmd+?` Help menu|none|F|
+|`Shift+Cmd+Space` Ask Siri (macOS 27+)|none|F|
 
-## 五、辅助功能
+## 5. Accessibility
 
-默认关闭，暂不实现。
+Disabled by default; not implemented for now.
 
-|macOS|说明|
+|macOS|Description|
 |---|---|
-|`Ctrl+Option+Cmd+8` 反转颜色|
-|`Ctrl+Option+Cmd+,` / `.` 降低/增强对比度|
-|`Ctrl+F2~F6` / `Fn+Ctrl+F2~F6` 焦点移动|
-|`Ctrl+Shift+F6/F7/F8` 焦点相关|
-|`Option+Cmd+F5` 辅助功能快捷键面板|
-|`Ctrl+Tab` / `Ctrl+Shift+Tab` 焦点切换|
+|`Ctrl+Option+Cmd+8` Invert colors|
+|`Ctrl+Option+Cmd+,` / `.` Decrease/increase contrast|
+|`Ctrl+F2~F6` / `Fn+Ctrl+F2~F6` Move focus|
+|`Ctrl+Shift+F6/F7/F8` Focus related|
+|`Option+Cmd+F5` Accessibility shortcuts panel|
+|`Ctrl+Tab` / `Ctrl+Shift+Tab` Cycle focus|
 
-## 六、App 专用
+## 6. App-specific
 
-Safari、日历、音乐、邮件等各有自己的快捷键，**不纳入全局映射**。多数已在 Linux 上保持一致（如 `Cmd+C` 复制）。
+Safari, Calendar, Music, Mail, etc. each have their own shortcuts and are **not included in the global mapping**. Most are already consistent on Linux (e.g. `Cmd+C` copy).
 
-### 「应用处理」类的判定：`Option+Cmd+W`
+### Deciding the "App-handled" class: `Option+Cmd+W`
 
-Apple 官方文档确有此键——「关闭最前方的窗口。要关闭 App 的所有窗口，
-请按下 Option-Command-W」。但它**不是系统级快捷键，而是应用自行实现**：
+Apple's official docs do list this key -- "Close the frontmost window. To close all windows of an app, press Option-Command-W". But it is **not a system-level shortcut; each app implements it itself**:
 
-|应用|`Option+Cmd+W`|
+|App|`Option+Cmd+W`|
 |---|---|
-|访达（系统应用）|有（关闭该 App 的全部窗口）|
-|Chrome（第三方）|**无**（实测按了没反应）|
+|Finder (system app)|yes (closes all windows of that app)|
+|Chrome (third-party)|**no** (measured: pressing it does nothing)|
 
-系统菜单里列出的快捷键，通常**只保证对系统自带应用有效**。
-第三方应用是否实现由各自开发者决定——这解释了为何在 macOS 上按了
-也没反应：不是键不存在，是 Chrome 没实现。
+Shortcuts listed in the system menu usually **only guarantee that they work for built-in apps**. Whether a third-party app implements them is up to its developer -- which explains why pressing it on macOS does nothing either: it is not that the key does not exist, but that Chrome does not implement it.
 
-因此归类为「应用处理」，标 F 或标 E 都不准确：
+Hence it is classified as "App-handled"; marking it F or E would both be wrong:
 
-- 标 **F**（概念不存在）→ 错，macOS 上确实存在，访达就实现了
-- 标 **E**（本工具实现）→ 错，GNOME 无对应动作，且不该由 mackbind 代劳
+- Marking it **F** (concept does not exist) → wrong; it does exist on macOS, Finder implements it.
+- Marking it **E** (implemented by this tool) → wrong; GNOME has no corresponding action, and mackbind should not take it on.
 
-Linux 侧由默认语义给出 `Ctrl+Alt+W`。该组合**在 Linux 上对任何应用都无效**
-——GNOME 未占用它（它只占 `Ctrl+Alt+方向键/Tab/Esc`），也没有应用认领它。
+On the Linux side the default semantics produce `Ctrl+Alt+W`. That combo **does nothing for any app on Linux** -- GNOME does not claim it (it only claims `Ctrl+Alt+arrows/Tab/Esc`), and no app claims it either.
 
-**这正是理想结果。** 本工具的默认语义不会替它编造一个动作，于是：
+**This is exactly the ideal outcome.** The tool's default semantics do not invent an action for it, so:
 
-|可能的映射|结局|
+|Possible mapping|Outcome|
 |---|---|
-|`Ctrl+W`|❌ 危险 —— 会逐个关闭窗口|
-|`Alt+F4`|❌ 有副作用 —— 关闭整个应用|
-|`Ctrl+Alt+W`|✅ 无害 —— 无人认领，空操作|
+|`Ctrl+W`|❌ dangerous -- would close windows one by one|
+|`Alt+F4`|❌ has side effects -- closes the whole app|
+|`Ctrl+Alt+W`|✅ harmless -- unclaimed, a no-op|
 
-即「macOS 上只对系统应用有效」→「Linux 上安全地失效」。
-不做特殊处理，比替它猜一个动作要好。
+In other words, "effective only for built-in apps on macOS" → "safely inert on Linux".
+Not special-casing it is better than guessing an action for it.
 
-> **教训**：「在某个应用里实测无反应」≠「该快捷键不存在」。
-> 三种「查不到」必须分开：
+> **Lesson**: "it does nothing when I try it in some app" ≠ "the shortcut does not exist".
+> The three kinds of "not found" must be kept apart:
 >
-> |症状|真实含义|
+> |Symptom|Real meaning|
 > |---|---|
-> |命令报错 / 返回空|找错地方或 schema 不对|
-> |应用里按了没反应|**可能只是该应用没实现**|
-> |官方文档也没有|才是真不存在|
+> |command errors / returns empty|wrong place, or wrong schema|
+> |pressing it in the app does nothing|**maybe the app just has not implemented it**|
+> |absent from the official docs too|only then does it truly not exist|
 >
-> 下「不存在」结论前，先换应用复测或查官方文档。
-> 这与「找错地方导致误判」是同一类错误。
+> Before concluding "does not exist", retest with a different app or check the official docs.
+> This is the same class of mistake as "looking in the wrong place and misjudging".
 
 ---
 
-## 应用分类清单
+## App classification list
 
-### 特化类（`Cmd` → `Ctrl+Shift`）
+### Specialized class (`Cmd` → `Ctrl+Shift`)
 
-此类应用内 `Ctrl` 已被占用，映射为 `Ctrl+Shift` 以避免冲突。
+Inside these apps `Ctrl` is already taken, so map to `Ctrl+Shift` to avoid conflicts.
 
-**终端**（`Ctrl+C` 中断进程、`Ctrl+Z` 挂起）：
+**Terminals** (`Ctrl+C` interrupts a process, `Ctrl+Z` suspends):
 
 ```
 gnome-terminal-server  org.gnome.Console  kitty  Alacritty
@@ -312,41 +308,40 @@ foot  wezterm  org.kde.konsole  konsole  xfce4-terminal
 io.elementary.terminal  Tilix  org.tigervault
 ```
 
-**GVIM**（`Ctrl+V` 块选择、`Ctrl+C` 退出）：
+**GVIM** (`Ctrl+V` block select, `Ctrl+C` quit):
 
 ```
 nvim  vim
 ```
 
-**VSCode**（`Ctrl+C` 复制行、`Ctrl+V` 粘贴）：
+**VSCode** (`Ctrl+C` copy line, `Ctrl+V` paste):
 
 ```
 code  code-url-handler  codium
 ```
 
-> VSCode 自身快捷键已与 macOS 高度一致，纳入特化类会与现有绑定冲突。
-> 建议仅映射确实不同的组合，或整体排除。
+> VSCode's own shortcuts are already highly consistent with macOS; putting it in the specialized class would conflict with its existing bindings.
+> Consider mapping only the combos that actually differ, or excluding it entirely.
 
 ---
 
-## GNOME 需要调整的绑定
+## Bindings GNOME needs to adjust
 
-按「macOS 优先」原则，以下需让位或新增：
+Following the "macOS first" principle, the following need to give way or be added:
 
-|macOS|目标|GNOME 现状|处理|
+|macOS|Target|GNOME status|Action|
 |---|---|---|---|
-|`Cmd+空格` Spotlight|活动概览|`Super+space` = 切换输入法|让位|
-|`Ctrl+Cmd+Q` 锁屏|`Super+l`|media-keys 的 `screensaver`（已绑定）|已实现|
-|`Cmd+Tab` 切换应用|`Super+Tab`|已绑定|无冲突|
-|`Cmd+↑/↓`|`Super+↑/↓`|已绑定|无冲突|
-|`Shift+Cmd+3/4/5` 截图|`Print` / `Shift+Print`|已绑定|无冲突|
-|`Shift+Cmd+Q` 退出登录|`Ctrl+Alt+Delete`|media-keys 的 `logout`（本机已绑定）|无冲突|
+|`Cmd+Space` Spotlight|activities overview|`Super+space` = switch input method|give way|
+|`Ctrl+Cmd+Q` Lock screen|`Super+l`|media-keys `screensaver` (bound)|implemented|
+|`Cmd+Tab` Switch apps|`Super+Tab`|bound|no conflict|
+|`Cmd+↑/↓`|`Super+↑/↓`|bound|no conflict|
+|`Shift+Cmd+3/4/5` Screenshot|`Print` / `Shift+Print`|bound|no conflict|
+|`Shift+Cmd+Q` Log out|`Ctrl+Alt+Delete`|media-keys `logout` (bound on this machine)|no conflict|
 
-### GNOME 抢占 `Ctrl+Alt` 系列（重要）
+### GNOME claims the `Ctrl+Alt` family (important)
 
-默认语义把 `Cmd` 变 `Ctrl`，于是所有 `Option+Cmd+X` 都落到 `Ctrl+Alt+X`。
-而 GNOME 把 `Ctrl+Alt` 系列绑给了**工作区切换**——这些在桌面环境层
-就被拦截，**应用根本收不到**：
+Default semantics turn `Cmd` into `Ctrl`, so every `Option+Cmd+X` lands on `Ctrl+Alt+X`.
+And GNOME binds the `Ctrl+Alt` family to **workspace switching** -- these are intercepted at the desktop-environment layer, so **apps never receive them**:
 
 ```
 switch-to-workspace-up      ['<Control><Alt>Up']
@@ -357,73 +352,69 @@ switch-panels               ['<Control><Alt>Tab']
 cycle-panels                ['<Control><Alt>Escape']
 ```
 
-影响：任何 `Option+Cmd+方向键/Tab/Esc` 组合都无法透传给应用。
-这不是 mackbind 的缺陷，是目标平台的既有绑定。遇到这类组合时，
-**必须查 DE 是否已占用**，不能只看应用认不认。
+Impact: any `Option+Cmd+arrow/Tab/Esc` combo cannot pass through to the app.
+This is not a mackbind defect; it is an existing binding of the target platform. With such combos,
+**you must check whether the DE has already claimed it** -- not just whether the app recognizes it.
 
-（`Ctrl+Alt+W` 不在此列——`W` 未被占用，能传给应用。但 Chrome 也不认它，
-且 macOS 上该组合本就无行为，故标 F。）
+(`Ctrl+Alt+W` is not in this list -- `W` is not claimed and can reach the app. But Chrome does not recognize it either,
+and the combo has no behavior on macOS in the first place, so it is marked F.)
 
 ---
 
-## 实现状态
+## Implementation status
 
-对照本文档逐条核对的结果。**未列出的组合即由默认语义自动覆盖**（`Cmd+X → Ctrl+X`），不需要单独实现。
+The result of checking this document item by item. **Combos not listed here are automatically covered by the default semantics** (`Cmd+X → Ctrl+X`) and need no separate implementation.
 
-### 已实现
+### Implemented
 
-|项|实现方式|
+|Item|Implementation|
 |---|---|
-|A 应用内通用操作|默认语义，无需列举|
-|C 终端/GVIM 特化|逐键粒度，见下|
-|`Cmd+Q` → `Alt+F4`|全局显式规则（GNOME `wm.keybindings close`）|
-|`Cmd+空格` → 概览|读 GNOME `toggle-overview` 现有绑定并发出；该动作未绑定时（GNOME 50 起默认如此）改读 mutter `overlay-key` 发一次点按|
-|D 光标移动 / `Cmd+[` `Cmd+]`|`DEFAULT_CMD_MAP` 中 14 条|
+|A General in-app operations|default semantics, nothing to list|
+|C Terminal/GVIM specialization|per-key granularity, see below|
+|`Cmd+Q` → `Alt+F4`|global explicit rule (GNOME `wm.keybindings close`)|
+|`Cmd+Space` → overview|read GNOME's existing `toggle-overview` binding and emit it; when that action is unbound (the default since GNOME 50), fall back to reading mutter's `overlay-key` and emit one tap|
+|D Cursor movement / `Cmd+[` `Cmd+]`|14 entries in `DEFAULT_CMD_MAP`|
 |Delete → `Ctrl+Delete`|`DEFAULT_CMD_MAP`|
-|`Super+l` 锁屏|用户已自设，mackbind 不介入|
-|Super 相关（分类 B）|**暂缓**，见「暂缓事项」|
+|`Super+l` Lock screen|the user configured it themselves; mackbind stays out|
+|Super-related (class B)|**deferred**, see "Deferred items"|
 
-### 未实现
+### Not implemented
 
-|项|阻塞原因|
+|Item|Blocker|
 |---|---|
-|「显示桌面」|动作存在（`show-desktop`）但默认未绑定（`@as []`），需用户自行绑定后本工具才能发出对应键|
-|访达 → Nautilus 内部操作|多数由应用自身处理，无需全局规则|
+|"Show desktop"|the action exists (`show-desktop`) but is unbound by default (`@as []`); the user must bind it before this tool can emit the corresponding key|
+|Finder → Nautilus internal operations|most are handled by the app itself and need no global rule|
 
-### 清倒废纸篓：与 macOS 的差异（有意为之）
+### Empty trash: the deliberate difference from macOS
 
-macOS 上 `Shift+Cmd+Delete` 清倒废纸篓（有确认），
-`Option+Shift+Cmd+Delete` 免确认（Option 即「跳过确认」）。
-本工具**照搬这一差异**：前者弹确认框，后者直接执行。
+On macOS, `Shift+Cmd+Delete` empties the trash (with confirmation), and
+`Option+Shift+Cmd+Delete` skips confirmation (Option means "skip confirmation").
+This tool **reproduces that difference**: the former shows a confirmation dialog, the latter executes directly.
 
-免确认之所以可行，是因为规则**限定在 Nautilus 内**。
-全局免确认绝不可接受：`gio trash --empty --force` 会跳过 gio 自己的
-确认（`--force`），而全局绑定不限应用、不限焦点窗口，
-误按一次就是永久删除，没有回收站可捞。
-exec 层据此加了守卫：破坏性命令免确认时，规则必须限定应用。
+Skipping confirmation is only acceptable because the rule is **scoped to Nautilus**.
+Global skip-confirmation would be unacceptable: `gio trash --empty --force` bypasses gio's own
+confirmation (`--force`), and a global binding is not scoped to an app or a focused window, so
+one accidental press would delete permanently, with no trash to recover from.
+The exec layer therefore has a guard: destructive commands that skip confirmation must be scoped to an app.
 
-**限定在 Nautilus 内**（macOS 上这两个是 Finder 的菜单项，桌面也归
-Finder 管，并非系统级快捷键）。全局绑定有两个实际风险：终端恰恰是
-删除操作最容易出事的场景，而写密码时误按会直接弹确认框。限定后
-误按在那些地方毫无反应。
+**Scoped to Nautilus** (on macOS these two are Finder menu items, and Finder also manages the desktop, so they are not system-level shortcuts). A global binding has two practical risks: the terminal is precisely the place where deletion most easily goes wrong, and an accidental press while typing a password would immediately pop up the confirmation dialog. Once scoped, an accidental press in those places does nothing at all.
 
-确认方式：**zenity 模态确认框**，正文「确定要永久抹掉回收站中的
-项目吗？」，左「取消」右「清倒回收站」。
+Confirmation method: a **zenity modal dialog**, with the body "Are you sure you want to permanently erase the items in the Trash?", "Cancel" on the left and "Empty Trash" on the right.
 
-早期版本用桌面通知，通知被静音或错过时功能等同于没有——
-用户按了键毫无反馈（实测踩过）。弹不出对话框时退回
-「再按一次同一组合」；再不行则放弃执行。
+Early versions used desktop notifications; when notifications are muted or missed, the feature is as good as absent --
+the user presses the key with no feedback at all (learned the hard way). When the dialog cannot be shown, it falls back to
+"press the same combo again"; if that fails too, execution is abandoned.
 
-规则表里写 `confirm = false` 也无法绕过——破坏性命令的确认
-由 `src/exec.rs` 强制保证。
+Writing `confirm = false` in the rule table cannot bypass this either -- confirmation for destructive commands
+is enforced by `src/exec.rs`.
 
-### 终端特化的粒度（重要）
+### Granularity of terminal specialization (important)
 
-**不是**「终端里把 `Cmd` 一律变成 `Ctrl+Shift`」。那样做会让 `Cmd+Q` 退化成 `Ctrl+Shift+Q`——一个谁也不认的组合。
+It is **not** "turn every `Cmd` into `Ctrl+Shift` inside a terminal". That would degrade `Cmd+Q` into `Ctrl+Shift+Q` -- a combo nobody recognizes.
 
-实际做法是**逐键**：只对**终端自身已用 `Ctrl+Shift` 绑定**的键加 Shift。
+The actual approach is **per key**: only keys that **the terminal itself has already bound to `Ctrl+Shift`** get Shift added.
 
-更进一步：GNOME 系终端用 GSettings 声明全部快捷键，mackbind 直接读取其 schema：
+Going further: GNOME-family terminals declare all their shortcuts via GSettings, and mackbind reads their schema directly:
 
 ```bash
 gsettings list-recursively org.gnome.Ptyxis.Shortcuts
@@ -432,160 +423,161 @@ gsettings list-recursively org.gnome.Ptyxis.Shortcuts
 # copy-clipboard  '<ctrl><shift>c'
 ```
 
-因此用户改过终端快捷键，mackbind 会自动跟上。手写白名单曾漏掉 `n`（新窗口），这是改用 schema 的直接原因。
+So if the user changes the terminal's shortcuts, mackbind follows automatically. A hand-written allowlist once missed `n` (new window); that is the direct reason for switching to the schema.
 
-不使用 GSettings 的终端（kitty、wezterm 等）查不到 schema，退回内置白名单。
+Terminals that do not use GSettings (kitty, wezterm, etc.) have no schema to query, so they fall back to the built-in allowlist.
 
-> 注：ptyxis 的 `close-window` 实为 `Ctrl+Shift+Q`，但全局规则 `Cmd+Q → Alt+F4` 优先于终端特化，故实际发出的是 `Alt+F4`。这是有意的——`Alt+F4` 是 GNOME 的通用关闭绑定，跨应用一致。
+> Note: ptyxis's `close-window` is actually `Ctrl+Shift+Q`, but the global rule `Cmd+Q → Alt+F4` takes priority over terminal specialization, so what is actually emitted is `Alt+F4`. This is intentional -- `Alt+F4` is GNOME's generic close binding and is consistent across apps.
 
-### 终端的复制键：ptyxis / konsole 特例
+### Terminal copy key: the ptyxis / konsole special case
 
-这两个终端在**无选中文本**时会把 `Ctrl+Shift+C` 穿透给子进程当作 SIGINT，使「复制」杀掉正在运行的任务。wezterm、ghostty、gnome-terminal 无此问题（无条件吞掉该组合）。
+These two terminals, **when no text is selected**, pass `Ctrl+Shift+C` through to the child process as SIGINT, so "copy" kills the running task. wezterm, ghostty, and gnome-terminal do not have this problem (they swallow the combo unconditionally).
 
-故这两者改用 `Ctrl+Insert`（X11 传统复制键，终端均支持且不会被当作控制字符发送）。由 `app_cmd_map` 配置项承载，判定依据是**行为差异**而非应用名单。
+So these two instead use `Ctrl+Insert` (the traditional X11 copy key, supported by all terminals and never sent as a control character). It is carried by the `app_cmd_map` config option, and the criterion is a **behavioral difference**, not an app list.
 
 ---
 
-## 电源键组合（Apple 文档有，但不做）
+## Power-key combos (in Apple's docs, but not done here)
 
-Apple 快捷键表里列了四条与电源键的组合：
+Apple's shortcut table lists four combos with the power key:
 
-|组合|效果|
+|Combo|Effect|
 |---|---|
-|`Ctrl+Shift+电源`|显示器睡眠|
-|`Ctrl+电源`|弹重启/睡眠/关机对话框|
-|`Ctrl+Cmd+电源`|**强制重启**|
-|`Ctrl+Option+Cmd+电源`|退出所有 App 后关机|
+|`Ctrl+Shift+Power`|Display sleep|
+|`Ctrl+Power`|Restart/sleep/shut-down dialog|
+|`Ctrl+Cmd+Power`|**Force restart**|
+|`Ctrl+Option+Cmd+Power`|Quit all apps, then shut down|
 
-**本工具一律不做（F）**，理由：
+**This tool does none of them (F)**, for these reasons:
 
-1. **GNOME 无对应可绑定动作** —— 前两条在 GNOME 侧不存在；后两条
-   只能靠 `systemctl reboot` / `loginctl terminate-user` 这类命令实现
-2. **后两条是全局的一键毁掉所有工作** —— 强制重启会丢弃全部未保存
-   内容。不设防的全局热键等于定时炸弹
-3. **实际按不出来** —— 需同时按住电源键加最多四个修饰键
+1. **GNOME has no corresponding bindable action** -- the first two do not exist on the GNOME side; the last two
+   could only be implemented with commands like `systemctl reboot` / `loginctl terminate-user`.
+2. **The last two are global one-key destruction of all work** -- a forced restart discards all unsaved
+   content. An unguarded global hotkey is a time bomb.
+3. **You cannot actually press them** -- they require holding the power key plus up to four modifiers at once.
 
-裸电源键**不需要管**：GNOME 的 `power-button-action` 默认就是 `suspend`，
-按电源键直接睡眠，与 macOS 一致。
+The bare power key **needs no handling**: GNOME's `power-button-action` defaults to `suspend`,
+so pressing the power key sleeps, same as macOS.
 
-> 注：Apple 文档给这四条标注的条件是「在没有配备触控 ID 的内建键盘上」。
-> 不同批次的同型号机器配置不同，请以自己键盘的实际行为为准。
+> Note: Apple's docs list the condition for these four as "on a built-in keyboard without Touch ID".
+> Different production batches of the same model differ, so go by your own keyboard's actual behavior.
 
-## 附：概览（Spotlight）的实现
+## Appendix: Implementing the overview (Spotlight)
 
-macOS 的 `Cmd+空格` 对应 GNOME 的活动概览。GNOME 为此提供过可绑定动作：
+macOS's `Cmd+Space` corresponds to GNOME's activities overview. GNOME has provided bindable actions for this:
 
 ```bash
 gsettings get org.gnome.shell.keybindings toggle-overview
-# 旧版 GNOME / EndeavourOS 实测：['<Shift><Control>space']
-# GNOME 50 起（含 Ubuntu 26.04）：@as []（未绑定）
+# older GNOME / EndeavourOS measured: ['<Shift><Control>space']
+# GNOME 50 and later (incl. Ubuntu 26.04): @as [] (unbound)
 ```
 
-**GNOME 50 起该动作默认为空**，概览改由 mutter 的 `overlay-key`
-（默认 `Super`）触发——即**裸按 Super 键**。这是该版本的固定行为，
-不是「用户没绑」。
+**Since GNOME 50 this action is empty by default**, and the overview is instead triggered by mutter's `overlay-key`
+(default `Super`) -- i.e. **pressing the bare Super key**. This is fixed behavior of that version,
+not "the user did not bind it".
 
-mackbind 的处理因此分两层：
+mackbind therefore handles it in two layers:
 
-1. 优先**读取 `toggle-overview` 现有绑定并发出同样的键**（旧版路径）
-2. 该动作未绑定时，退回读取 `org.gnome.mutter overlay-key`，发出一次
-   该修饰键的**点按**（GNOME 50 路径）
+1. Prefer to **read the existing `toggle-overview` binding and emit the same key** (the older path).
+2. When that action is unbound, fall back to reading `org.gnome.mutter overlay-key` and emit **a tap**
+   of that modifier key (the GNOME 50 path).
 
-**只做追加，不覆盖**：只要 `toggle-overview` 已绑定，就永远走第 1 条，
-旧环境行为不变。两条路径都不改写用户配置，也不影响用户自己的设置。
+**Only append, never overwrite**: as long as `toggle-overview` is bound, path 1 is always used, and
+older environments behave unchanged. Neither path rewrites the user's config, nor affects the user's own settings.
 
-点按为什么必须「按下后立即松开」：GNOME 的 overlay-key 在**松开**时才开
-概览；若把 Super 留到物理键（空格）松开，期间 mutter 会把它当成
-`Super+空格`（输入法切换）。
+Why a tap must be "press, then release immediately": GNOME's overlay-key opens the
+overview on **release**; if Super is held until the physical key (Space) is released, mutter will treat it as
+`Super+Space` (switch input method) in the meantime.
 
-注：`Super+space`（GNOME 的输入法切换）在 mackbind 模型下不会被占用
-——默认语义不产生 Super。二者不再冲突，无需「让位」。
+Note: `Super+space` (GNOME's input-method switch) is not claimed under mackbind's model
+-- the default semantics never produce Super. The two no longer conflict, so no "giving way" is needed.
 
-### 一度误判为不可行
+### Once misjudged as infeasible
 
-初查时只看了 `org.gnome.desktop.wm.keybindings`，其中确实没有概览动作，遂判定需「写入用户账户设置」才能实现，属侵入式改动而暂缓。
+During the initial investigation only `org.gnome.desktop.wm.keybindings` was checked, and it indeed has no overview action, so it was concluded that implementing it would require "writing to the user account settings" -- an invasive change -- and it was deferred.
 
-这个结论是错的——概览动作在**另一个 schema**（`org.gnome.shell.keybindings`）下。教训与此前「默认方向反转」同源：**在断言某能力不存在之前，应先确认是否找对了地方**。
+That conclusion was wrong -- the overview action lives under **another schema** (`org.gnome.shell.keybindings`). The lesson is the same as the earlier "default direction reversed" one: **before asserting that some capability does not exist, first make sure you are looking in the right place.**
 
-真正不可用的是以下路径（实测记录，以免重复尝试）：
+What is genuinely unusable is the following (measured record, to avoid repeated attempts):
 
-|方案|结果|
+|Approach|Result|
 |---|---|
-|`org.gnome.Shell.Eval`|返回 `(false, '')`，GNOME 41+ 限制|
-|`org.gnome.Shell.WindowTracker`|对象路径 `/org/gnome/Shell/WindowTracker` 不存在|
-|`xdotool` / `wmctrl`|Wayland 下不可用|
+|`org.gnome.Shell.Eval`|returns `(false, '')`; restricted since GNOME 41|
+|`org.gnome.Shell.WindowTracker`|object path `/org/gnome/Shell/WindowTracker` does not exist|
+|`xdotool` / `wmctrl`|unusable under Wayland|
 
-### 键盘类型差异
+### Keyboard-type differences
 
-macOS 的 `Cmd+调度中心` 在 MacBook 上对应 `Fn+F11`，在带独立功能键的外接键盘上则无对应键。GNOME 侧同样无独立的「调度中心」动作（`Ctrl+↑` 语义上接近，但 GNOME 未提供该绑定）。
+macOS's `Cmd+Dashboard` corresponds to `Fn+F11` on a MacBook, and to no key on an external keyboard with dedicated function keys. GNOME likewise has no dedicated "Dashboard" action (`Ctrl+↑` is semantically close, but GNOME does not provide that binding).
 
 ---
 
-## 附：「显示桌面」的实现
+## Appendix: Implementing "Show desktop"
 
-GNOME 内置 `show-desktop` 动作（隐藏所有普通窗口），默认未绑定：
+GNOME has a built-in `show-desktop` action (hides all normal windows), unbound by default:
 
 ```bash
-gsettings get org.gnome.desktop.wm.keybindings show-desktop   # @as []（未绑定）
+gsettings get org.gnome.desktop.wm.keybindings show-desktop   # @as [] (unbound)
 ```
 
-对应 macOS 的 `Cmd+调度中心` / `Fn+H` / `Fn+F11`（显示桌面），以及 `Ctrl+↑`（调度中心）。
+It corresponds to macOS's `Cmd+Dashboard` / `Fn+H` / `Fn+F11` (show desktop), and to `Ctrl+↑` (Dashboard).
 
-绑定该动作后可由 mackbind 发出对应键实现，但同样需要写入账户设置，故暂缓。
+Once the action is bound, mackbind could emit the corresponding key, but this too requires writing to account settings, so it is deferred.
 
-> 注：设置界面中的条目名因 GNOME 版本而异。GNOME 51（本机）中该动作的
-> schema 键为 `show-desktop`；「隐藏所有普通窗口」可能是其他版本或
-> 其他 schema 下的名称。设置界面的显示名与底层键名不一定一致。
+> Note: entry names in the settings UI vary by GNOME version. On GNOME 51 (this machine) the
+> schema key for this action is `show-desktop`; "hide all normal windows" may be the name in
+> other versions or other schemas. The display name in the settings UI and the underlying key name
+> are not necessarily the same.
 
-### 截图三键的映射（实测，与直觉相反）
+### Mapping the three screenshot keys (measured, counterintuitive)
 
-GNOME 的三个截图动作，**哪个直接截、哪个弹界面，与直觉相反**：
+GNOME's three screenshot actions -- **which one captures directly and which one opens the UI is the opposite of intuition**:
 
-|GNOME 动作|本机绑定|实际行为|
+|GNOME action|Binding on this machine|Actual behavior|
 |---|---|---|
-|`screenshot`|`Shift+Print`|**直接截全屏**，不弹界面|
-|`screenshot-window`|`Alt+Print`|直接截（本机实测亦为全屏）|
-|`show-screenshot-ui`|`Print`|**弹出截图界面**|
+|`screenshot`|`Shift+Print`|**captures the full screen directly**, no UI|
+|`screenshot-window`|`Alt+Print`|captures directly (also full-screen on this machine)|
+|`show-screenshot-ui`|`Print`|**opens the screenshot UI**|
 
-macOS 则是 `Cmd+Shift+3` 直接截全屏、`Cmd+Shift+4/5` 进选择模式。
-故按功能对齐：
+macOS, by contrast, captures the full screen directly with `Cmd+Shift+3` and enters selection mode with `Cmd+Shift+4/5`.
+So we align by function:
 
-|按键|映射到|行为|
+|Key|Maps to|Behavior|
 |---|---|---|
-|`Cmd+Shift+3`|`screenshot` → `Shift+Print`|直接截全屏（与 macOS 一致）|
-|`Cmd+Shift+4`|`show-screenshot-ui` → `Print`|截图界面，选区/窗口在其中选|
-|`Cmd+Shift+5`|`show-screenshot-ui` → `Print`|同上|
+|`Cmd+Shift+3`|`screenshot` → `Shift+Print`|capture the full screen directly (same as macOS)|
+|`Cmd+Shift+4`|`show-screenshot-ui` → `Print`|screenshot UI; choose region/window there|
+|`Cmd+Shift+5`|`show-screenshot-ui` → `Print`|same as above|
 
-**4 与 5 行为相同是妥协。** GNOME 只有三个截图动作，其中
-`screenshot` 与 `screenshot-window` 实测都表现为直接截全屏，
-无法据此把选区与窗口区分开。二者统一走截图界面，
-选区/窗口仍能在界面里选到。
+**That 4 and 5 behave the same is a compromise.** GNOME has only three screenshot actions, and
+`screenshot` and `screenshot-window` both measured as direct full-screen captures,
+so region and window cannot be told apart from them. Both go through the screenshot UI uniformly,
+where a region/window can still be chosen.
 
-### 「Delete」键的键码陷阱（本机踩过）
+### The "Delete" key's keycode trap (learned on this machine)
 
-macOS 把退格键（⌫）叫 **Delete**，向前删除键（MacBook 上不存在）才叫
-Forward Delete。日常说的「Cmd+Delete 移到废纸篓」按的就是 ⌫。
+macOS calls the backspace key (⌫) **Delete**; only the forward delete key (absent on MacBooks) is called
+Forward Delete. The everyday "Cmd+Delete moves to trash" presses ⌫.
 
-但 evdev 里这两个是不同的键码：
+But in evdev these are two different keycodes:
 
-|macOS 叫法|物理键|evdev 键码|本机是否产生|
+|macOS name|Physical key|evdev keycode|Produced on this machine|
 |---|---|---|---|
-|Delete|⌫ 退格|`KEY_BACKSPACE`|✓ MacBook 键盘只有它|
-|Forward Delete|⌦ 向前删除|`KEY_DELETE`|✗ 本机无此键|
+|Delete|⌫ backspace|`KEY_BACKSPACE`|✓ the MacBook keyboard only has this|
+|Forward Delete|⌦ forward delete|`KEY_DELETE`|✗ this machine has no such key|
 
-早期规则全部按 `KEY_DELETE` 写，导致**所有删除类规则在本机形同虚设**
-——`Cmd+Delete`、`Option+Delete`、`Shift+Cmd+Delete` 全部落空，
-且因为落到了默认语义，看起来只是「变成了 Ctrl+退格」，不易察觉。
+Earlier rules were all written against `KEY_DELETE`, which made **every deletion rule a no-op on this machine**
+-- `Cmd+Delete`, `Option+Delete`, and `Shift+Cmd+Delete` all fell through, and because they fell through to
+the default semantics, it looked like they merely "became Ctrl+backspace", which is hard to notice.
 
-现对两个键码都写规则：本机走 `KEY_BACKSPACE`，外接键盘走 `KEY_DELETE`。
+Now rules are written for both keycodes: this machine goes through `KEY_BACKSPACE`, external keyboards through `KEY_DELETE`.
 
-|组合|映射|本机按键|
+|Combo|Mapping|Physical keys|
 |---|---|---|
-|`Cmd+Delete`|移到废纸篓 → `Ctrl+Delete`|Cmd+⌫|
-|`Option+Delete`|删除左边字词 → `Ctrl+Backspace`|Option+⌫|
-|`Shift+Cmd+Delete`|清倒废纸篓 → `gio trash`|Shift+Cmd+⌫|
-|`Option+Shift+Cmd+Delete`|同上|Option+Shift+Cmd+⌫|
+|`Cmd+Delete`|move to trash → `Ctrl+Delete`|Cmd+⌫|
+|`Option+Delete`|delete word to the left → `Ctrl+Backspace`|Option+⌫|
+|`Shift+Cmd+Delete`|empty trash → `gio trash`|Shift+Cmd+⌫|
+|`Option+Shift+Cmd+Delete`|same as above|Option+Shift+Cmd+⌫|
 
-> 注：`Option+Delete` 映射到 **`Ctrl+Backspace`** 而非 `Ctrl+Delete`。
-> `Ctrl+Delete` 在 GTK 文本控件里是「删下一个词」，与「删除左边字词」
-> 方向相反。
+> Note: `Option+Delete` maps to **`Ctrl+Backspace`**, not `Ctrl+Delete`.
+> `Ctrl+Delete` in GTK text widgets means "delete the next word", the opposite direction
+> from "delete word to the left".

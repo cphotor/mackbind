@@ -1,16 +1,17 @@
-//! 键名解析与组合键表达式。
+//! Key-name parsing and combo-key expressions.
 //!
-//! 配置里的键名采用 evdev 的 `KeyCode` 枚举名（`KEY_LEFTMETA` 等），
-//! 可直接 `from_str` 解析，无需自建映射表。
+//! Key names in config use the evdev `KeyCode` enum names (`KEY_LEFTMETA`,
+//! etc.), which can be parsed directly with `from_str`, with no need for a
+//! hand-rolled mapping table.
 //!
-//! 组合键表达式用简写，覆盖常见修饰键：
+//! Combo-key expressions use shorthand covering the common modifiers:
 //!   `C` = Ctrl, `A` = Alt, `S` = Shift, `M` = Cmd/Super
-//! 例如 `C-s`、`S-C-s`、`M-A-Left`。
+//! For example `C-s`, `S-C-s`, `M-A-Left`.
 
 use evdev::KeyCode;
 use std::str::FromStr;
 
-/// 修饰键缩写 → 键码。
+/// Modifier abbreviation → keycode.
 pub fn modifier_from_abbrev(s: &str) -> Option<KeyCode> {
     match s {
         "C" => Some(KeyCode::KEY_LEFTCTRL),
@@ -21,20 +22,21 @@ pub fn modifier_from_abbrev(s: &str) -> Option<KeyCode> {
     }
 }
 
-/// 解析修饰键缩写，失败时给出可读的错误。
+/// Parse a modifier abbreviation, giving a readable error on failure.
 fn parse_modifier(s: &str) -> Result<KeyCode, KeyError> {
     modifier_from_abbrev(s).ok_or_else(|| {
         KeyError::BadModifier(
             s.to_string(),
-            "可用缩写：C(Ctrl) A(Alt) S(Shift) M(Cmd/Super)".into(),
+            "available abbreviations: C(Ctrl) A(Alt) S(Shift) M(Cmd/Super)".into(),
         )
     })
 }
 
-/// 常用键的友好别名 → evdev 原名。
+/// Friendly aliases for common keys → the original evdev names.
 ///
-/// 配置里写 `Left`、`[` 这类可读形式更友好，但底层解析走
-/// `KeyCode::from_str`，只认 evdev 的 `KEY_LEFT` 形式。
+/// Writing readable forms like `Left` or `[` in config is friendlier, but the
+/// underlying parsing goes through `KeyCode::from_str`, which only understands
+/// evdev's `KEY_LEFT` form.
 const ALIASES: &[(&str, &str)] = &[
     ("left", "KEY_LEFT"),
     ("right", "KEY_RIGHT"),
@@ -73,36 +75,39 @@ const ALIASES: &[(&str, &str)] = &[
     (";", "KEY_SEMICOLON"),
     ("'", "KEY_APOSTROPHE"),
     ("`", "KEY_GRAVE"),
-    // GTK 加速键 / X11 键符号名。与上表合并而非另写一张——
-    // 曾因两处各写一份 `plus`/`minus` 而产生分歧。
+    // GTK accelerator / X11 keysym names. Merged into the table above rather
+    // than written as a separate one—having two copies of `plus`/`minus`
+    // previously caused them to diverge.
     ("plus", "KEY_EQUAL"),
     ("Return", "KEY_ENTER"),
     ("Page_Up", "KEY_PAGEUP"),
     ("Page_Down", "KEY_PAGEDOWN"),
-    // Print：GNOME 截图绑在它上面，但 evdev 的键码名是历史遗留的
-    // SYSRQ（SysRq 与 Print 是同一个物理键）。没有这条别名，
-    // `de_accel` 读到的 `Print` 解析失败，截图规则会被静默剔除。
+    // Print: GNOME binds screenshot to it, but the evdev keycode name is the
+    // historical SYSRQ (SysRq and Print are the same physical key). Without
+    // this alias, the `Print` read by `de_accel` fails to parse and the
+    // screenshot rules get silently dropped.
     ("print", "KEY_SYSRQ"),
     ("sysrq", "KEY_SYSRQ"),
-    // GNOME 的 `overlay-key` 是**字符串型** schema（值为 `Super`），
-    // 用于「裸按 Super 开概览」。解析它时主键就是这个词，故需此别名。
+    // GNOME's `overlay-key` is a **string** schema (value `Super`), used for
+    // "press bare Super to open the overview". When parsing it the main key is
+    // that word, so this alias is needed.
     ("super", "KEY_LEFTMETA"),
     ("meta", "KEY_LEFTMETA"),
 ];
 
-/// 解析单个键名。
+/// Parse a single key name.
 ///
-/// 支持三种写法，优先级从高到低：
-/// 1. evdev 原名，如 `KEY_LEFTMETA`
-/// 2. 友好别名，如 `Left`、`[`
-/// 3. 单字符简写，自动补 `KEY_`，如 `a` → `KEY_A`
+/// Three forms are supported, in decreasing priority:
+/// 1. the original evdev name, e.g. `KEY_LEFTMETA`
+/// 2. a friendly alias, e.g. `Left`, `[`
+/// 3. a single-character shorthand, auto-prefixed with `KEY_`, e.g. `a` → `KEY_A`
 pub fn parse_key(name: &str) -> Result<KeyCode, KeyError> {
-    // 1) evdev 原名
+    // 1) original evdev name
     if let Ok(k) = KeyCode::from_str(name) {
         return Ok(k);
     }
 
-    // 2) 友好别名（不区分大小写）
+    // 2) friendly alias (case-insensitive)
     let lower = name.to_lowercase();
     for (alias, real) in ALIASES {
         if lower == *alias {
@@ -111,7 +116,7 @@ pub fn parse_key(name: &str) -> Result<KeyCode, KeyError> {
         }
     }
 
-    // 3) 单字符简写
+    // 3) single-character shorthand
     if name.chars().count() == 1 {
         let upper = name.to_uppercase();
         if let Ok(k) = KeyCode::from_str(&format!("KEY_{upper}")) {
@@ -122,27 +127,29 @@ pub fn parse_key(name: &str) -> Result<KeyCode, KeyError> {
     Err(KeyError::UnknownKey(name.to_string()))
 }
 
-/// 解析**来自动态数据**（GSettings、终端 schema）的键名。
+/// Parse a key name **coming from dynamic data** (GSettings, terminal schema).
 ///
-/// 与 [`parse_key`] 的区别是这些名字不受本工具控制，大小写与拼写都只能
-/// 按实际见到的处理：GTK 写 `<Shift><Control>space`、`F1`、`Page_Down`、
-/// `plus`，形式比配置文件里可能出现的更杂。
+/// Unlike [`parse_key`], these names are not under this tool's control, so case
+/// and spelling can only be handled as actually seen: GTK writes
+/// `<Shift><Control>space`, `F1`, `Page_Down`, `plus`, in a messier variety
+/// than what may appear in a config file.
 ///
-/// 策略：
-/// 1. 查别名表（大小写不敏感）
-/// 2. 已是 evdev 形式（`KEY_A`、`Page_Down`）直接试
-/// 3. 单字符或 `F<n>`，补 `KEY_` 前缀后试
+/// Strategy:
+/// 1. look up the alias table (case-insensitive)
+/// 2. already in evdev form (`KEY_A`, `Page_Down`) → try directly
+/// 3. single character or `F<n>` → try with a `KEY_` prefix
 ///
-/// 解析失败返回 `None`——调用方据此跳过该条规则，而非让整个程序失败。
-/// 动态数据随时可能变，一个不认识的名字不该拖垮映射。
+/// Returns `None` on failure—the caller skips that rule on this basis instead
+/// of failing the whole program. Dynamic data can change at any time; one
+/// unrecognized name should not bring down the mapping.
 pub fn parse_external_key(name: &str) -> Option<KeyCode> {
     let t = name.trim();
     if t.is_empty() {
         return None;
     }
 
-    // 1) 别名表（大小写不敏感——GTK 的 `Page_Down` 与 evdev 的
-    //    `KEY_PAGEDOWN` 都要能命中，而表内两种大小写都出现过）
+    // 1) alias table (case-insensitive—GTK's `Page_Down` and evdev's
+    //    `KEY_PAGEDOWN` must both match, and both cases appear in the table)
     let lower = t.to_lowercase();
     if let Some((_, real)) = ALIASES
         .iter()
@@ -151,12 +158,12 @@ pub fn parse_external_key(name: &str) -> Option<KeyCode> {
         return KeyCode::from_str(real).ok();
     }
 
-    // 2) 已是 evdev 或 X11 形式（含大写者，如 Page_Down、KEY_A）
+    // 2) already evdev or X11 form (including uppercase ones, e.g. Page_Down, KEY_A)
     if let Ok(k) = KeyCode::from_str(t) {
         return Some(k);
     }
 
-    // 3) 小写单字符 / F 数字，补 KEY_ 前缀
+    // 3) lowercase single character / F-number, add the KEY_ prefix
     let upper = t.to_ascii_uppercase();
     let prefixed = if upper.chars().count() == 1 || is_function_key(&upper) {
         format!("KEY_{upper}")
@@ -166,18 +173,18 @@ pub fn parse_external_key(name: &str) -> Option<KeyCode> {
     KeyCode::from_str(&prefixed).ok()
 }
 
-/// 是否为 `F1`…`F24` 这类功能键写法。
+/// Whether this is a function-key spelling like `F1`…`F24`.
 fn is_function_key(upper: &str) -> bool {
     upper.starts_with('F')
         && upper.len() > 1
         && upper[1..].chars().all(|c| c.is_ascii_digit())
 }
 
-/// 解析组合表达式，按 `-` 分隔。返回 (修饰键列表, 主键)。
+/// Parse a combo expression, separated by `-`. Returns (modifier list, main key).
 pub fn parse_combo(expr: &str) -> Result<(Vec<KeyCode>, KeyCode), KeyError> {
     let parts: Vec<&str> = expr.split('-').collect();
     if parts.is_empty() {
-        return Err(KeyError::BadCombo(expr.to_string(), "表达式为空".into()));
+        return Err(KeyError::BadCombo(expr.to_string(), "expression is empty".into()));
     }
 
     let (last, mods) = parts.split_last().unwrap();
@@ -187,7 +194,7 @@ pub fn parse_combo(expr: &str) -> Result<(Vec<KeyCode>, KeyCode), KeyError> {
         modifiers.push(parse_modifier(m)?);
     }
 
-    // 主键：可能是修饰键本身（"C-C" 这种），也可能普通键
+    // Main key: may be a modifier itself ("C-C" style), or an ordinary key
     let key = match modifier_from_abbrev(last) {
         Some(k) => k,
         None => parse_key(last)?,
@@ -206,9 +213,9 @@ pub enum KeyError {
 impl std::fmt::Display for KeyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            KeyError::UnknownKey(k) => write!(f, "未知键名 '{k}'（需 evdev 形式如 KEY_A）"),
-            KeyError::BadModifier(m, h) => write!(f, "未知修饰键 '{m}'；{h}"),
-            KeyError::BadCombo(c, r) => write!(f, "无效组合 '{c}'：{r}"),
+            KeyError::UnknownKey(k) => write!(f, "unknown key name '{k}' (expected evdev form such as KEY_A)"),
+            KeyError::BadModifier(m, h) => write!(f, "unknown modifier '{m}'; {h}"),
+            KeyError::BadCombo(c, r) => write!(f, "invalid combo '{c}': {r}"),
         }
     }
 }

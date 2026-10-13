@@ -1,127 +1,129 @@
-# 表驱动重构方案
+# Table-Driven Refactor Plan
 
-**状态：已完成（行为等价）。** 下文保留「为什么这么做」，
-包括几处不那么显然的设计取舍。
+**Status: done (behavior-preserving).** The text below keeps the "why we did it this way",
+including a few less-than-obvious design trade-offs.
 
-## 为什么要重构
+## Why refactor
 
-重构前，「一个 Cmd 组合该输出什么」由**六套并行机制**共同回答：
+Before the refactor, "what should a given Cmd combo emit" was answered jointly by **six parallel mechanisms**:
 
-|机制|位置|回答什么|
+|Mechanism|Location|Answers|
 |---|---|---|
-|`cmd_map`|`config.rs`|全局显式规则|
-|`app_cmd_map`|`config.rs`|按应用覆盖|
-|`terminal_shift_keys` + `ctrl_busy_apps`|`config.rs`|终端内给部分键加 Shift|
-|默认语义|`mapper.rs` 分支|`Cmd+X → Ctrl+X`|
-|DE 特性规则|`mapper.rs` + `accel.rs`|读 DE 现有绑定后发出|
-|运行时 GSettings|`desktop.rs` / `accel.rs`|终端判定与快捷键发现|
+|`cmd_map`|`config.rs`|global explicit rules|
+|`app_cmd_map`|`config.rs`|per-app overrides|
+|`terminal_shift_keys` + `ctrl_busy_apps`|`config.rs`|add Shift to some keys inside terminals|
+|default semantics|`mapper.rs` branch|`Cmd+X → Ctrl+X`|
+|DE feature rules|`mapper.rs` + `accel.rs`|read an existing DE binding and emit it|
+|runtime GSettings|`desktop.rs` / `accel.rs`|terminal detection and shortcut discovery|
 
-它们互相咬合，优先级靠 `mapper.rs` 里的 if-else 链维持：
+They interlocked, and their priority was maintained by an if-else chain in `mapper.rs`:
 
 ```
-app_cmd_map  >  cmd_map  >  终端特化  >  默认语义
+app_cmd_map  >  cmd_map  >  terminal specialization  >  default semantics
 ```
 
-问题不在于行数多，而在于**「做了什么」无法一眼看出**。这直接导致了
-`scripts/audit.py` 首轮查出 11 条文档声称需实现而代码没有、2 条分类错误。
+The problem is not the number of lines but that **"what it does" cannot be seen at a glance**. This directly caused
+`scripts/audit.py`'s first run to find 11 doc entries claiming an implementation with no code behind them, and 2 misclassified entries.
 
-## 现在的结构
+## The structure now
 
-一张表回答所有问题，29 行：
+One table answers everything, 29 rows:
 
-|应用|按键组合|动作|
+|App|Key combo|Action|
 |---|---|---|
 |`*`|`Cmd+Q`|`emit` `Alt+F4`|
 |`*`|`Cmd+[`|`emit` `Alt+Left`|
-|`*`|`Cmd+空格`|`de_accel` `overview`|
-|`org.gnome.Ptyxis` 等|`Cmd+C`|`emit` `Ctrl+Insert`|
-|`gvim`|`Cmd+任意键`|`terminal_ctrl_shift`|
-|`TerminalEmulator`|`Cmd+任意键`|`terminal_ctrl_shift`|
+|`*`|`Cmd+Space`|`de_accel` `overview`|
+|`org.gnome.Ptyxis` etc.|`Cmd+C`|`emit` `Ctrl+Insert`|
+|`gvim`|`Cmd+any key`|`terminal_ctrl_shift`|
+|`TerminalEmulator`|`Cmd+any key`|`terminal_ctrl_shift`|
 
-**顺序即优先级**——原先散落在三处的优先级关系，现在只由规则在表中的
-位置决定。查找是线性扫描取首个命中者；用户配置追加在末尾，故天然优先。
+**Order is priority** -- the priority relationships formerly scattered across three places are now decided solely by
+a rule's position in the table. Lookup is a linear scan taking the first hit; user config is appended at the end, so it naturally takes priority.
 
-`mackbind --verbose` 启动时打印整张表。
+`mackbind --verbose` prints the whole table at startup.
 
-## 动作即函数
+## Actions are functions
 
-关键点：**动作不是枚举的变体，而是函数**。因此表不限于静态映射。
+The key point: **an action is not an enum variant, it is a function**. So the table is not limited to static mappings.
 
-|动作|职责|
+|Action|Responsibility|
 |---|---|
-|`emit`|直接产出按键事件|
-|`de_accel`|查 DE 现有绑定，发出同样的键|
-|`terminal_ctrl_shift`|查目标应用自己的绑定，决定是否加 Shift|
+|`emit`|produce key events directly|
+|`de_accel`|look up an existing DE binding and emit the same key|
+|`terminal_ctrl_shift`|look up the target app's own bindings and decide whether to add Shift|
 
-后两者内部做运行时查找。这不是妥协，是正确的分层：**表负责命名，
-函数负责求值**。硬塞静态快照才会过期——那正是文档漂移的病因。
+The latter two do runtime lookups internally. This is not a compromise but the right layering: **the table names,
+the function evaluates**. Cramming in a static snapshot is what goes stale -- and that is exactly the
+disease that made the docs drift.
 
-### `terminal_ctrl_shift` 与通配主键
+### `terminal_ctrl_shift` and the wildcard main key
 
-这一条最能体现「静态表 + 运行时求值」的必要性。
+This one best shows the necessity of "static table + runtime evaluation".
 
-终端的 `Ctrl+Shift` 绑定是**运行时**从它的 GSettings 查得的，各终端不同：
-ptyxis 声明了 `new-window = Ctrl+Shift+N`，而 `N` 不在任何静态名单里。
-若逐键列举规则表，运行时发现的键将无处安放——这正是 commit `18c03a2`
-之前的缺陷（当时靠整体替换 `terminal_bindings` 解决，代价是该逻辑无法
-表达成数据）。
+A terminal's `Ctrl+Shift` bindings are looked up **at runtime** from its GSettings, and they differ per terminal:
+ptyxis declares `new-window = Ctrl+Shift+N`, and `N` is not on any static list.
+Listing rules per key in the table would leave no place for keys discovered at runtime -- that was exactly
+the defect before commit `18c03a2` (then solved by wholesale replacement of `terminal_bindings`, at the cost
+that the logic could not be expressed as data).
 
-故表中用 `keys = ["*"]` 通配主键，由动作在运行时判定具体哪些键生效。
-兜底名单 `DEFAULT_TERMINAL_SHIFT_KEYS` 只在查不到 schema 时使用
-（kitty、wezterm 等不走 GSettings 的终端）。
+So the table uses `keys = ["*"]` as a main-key wildcard, and the action decides at runtime which keys apply.
+The fallback list `DEFAULT_TERMINAL_SHIFT_KEYS` is used only when no schema can be found
+(terminals that do not go through GSettings, such as kitty and wezterm).
 
-### `resolve_fn` 不在表里
+### `resolve_fn` is not in the table
 
-F1–F12 的含义取决于 Fn 状态与**完整修饰键上下文**（macOS 上
-`Cmd+Shift+F1` 需按 `Cmd+Shift+Fn+F1`），是**按键级**变换而非组合规则，
-故留在表外——但同样已统一为一个函数 `resolve_fn`，且**只做替换不短路**。
+The meaning of F1–F12 depends on the Fn state and the **full modifier context** (on macOS,
+`Cmd+Shift+F1` requires pressing `Cmd+Shift+Fn+F1`); it is a **key-level** transformation rather than a combo rule,
+so it stays outside the table -- but it too has been unified into a single function, `resolve_fn`, which **only substitutes and never short-circuits**.
 
-它此前曾用 `return` 短路，绕过整个查表流程，实测
-`Fn+Meta+Shift+F1` 输出 `Meta+媒体键`：Meta 泄漏（本应被抑制），
-Ctrl/Shift 丢失。已修复并加 6 个测试。
+It previously used a `return` to short-circuit, bypassing the whole table-lookup flow; measured,
+`Fn+Meta+Shift+F1` emitted `Meta+media key`: Meta leaked (it should have been suppressed) and
+Ctrl/Shift were lost. Fixed, with 6 tests added.
 
-## 表外的部分（必须显式声明）
+## Parts outside the table (must be declared explicitly)
 
-不是所有行为都是行。以下两者留在表外：
+Not every behavior is a row. The following two stay outside the table:
 
-1. **修饰键重映射** —— CapsLock ↔ LeftCtrl 成对互换。发生在组合判定**之前**，
-   作用于按键本身而非组合。表中 `keys` 一列无法表达「一个物理键被换成另一个」。
-2. **按键释放对称性** —— 释放事件须与按下时决策一致（否则输出侧残留按下态）。
-   这是状态机职责，不该表达成行。
+1. **Modifier remapping** -- CapsLock ↔ LeftCtrl swap as a pair. It happens **before** combo matching
+   and applies to the key itself rather than a combo. The table's `keys` column cannot express
+   "one physical key is replaced by another".
+2. **Key-release symmetry** -- a release event must match the decision made on press (otherwise the
+   output side is left with a stuck-down key). This is a state-machine responsibility and should not be expressed as a row.
 
-## 应用列的取值
+## Values of the app column
 
-|取值|含义|
+|Value|Meaning|
 |---|---|
-|`*`|所有应用|
-|`TerminalEmulator`|按 `.desktop` 的 `Categories` 判定（freedesktop 规范）|
-|`gvim` 等 wm_class|按子串匹配窗口类|
+|`*`|all apps|
+|`TerminalEmulator`|decided by the `.desktop` entry's `Categories` (freedesktop spec)|
+|`gvim` and other wm_class values|match the window class by substring|
 
-`TerminalEmulator` 这个取值是关键——装新终端自动生效，不需要维护名单。
-这条能力保留自 `238c703`，不要退回硬编码列表（曾因写成小写 `ptyxis`
-而漏判实际的 `org.gnome.Ptyxis`）。
+The `TerminalEmulator` value is the key one -- installing a new terminal works automatically, with no list to
+maintain. This capability is retained from `238c703`; do not regress to a hard-coded list (it once missed
+the real `org.gnome.Ptyxis` because it was written in lowercase as `ptyxis`).
 
-## 重构中踩到的两个坑
+## Two pitfalls hit during the refactor
 
-两者都因「顺序即优先级」这一新性质而暴露，值得记下：
+Both surfaced because of the new property "order is priority", and are worth recording:
 
-1. **更具体的规则必须排在更通用的之前。** ptyxis 的 `Ctrl+Insert`
-   原先放在通用终端规则之后，永远命中不了——因为查找取**首个**命中者。
-2. **同一段规则被复制成两份。** 修复上述问题时新增了一个
-   `TerminalEmulator` 循环，却忘了删原来的，导致通用规则仍排在前面。
+1. **More specific rules must come before more general ones.** ptyxis's `Ctrl+Insert`
+   was originally placed after the general terminal rule and could never match -- because lookup takes the **first** hit.
+2. **The same block of rules got duplicated.** While fixing the above, a new
+   `TerminalEmulator` loop was added but the original was not deleted, so the general rule still came first.
 
-教训：改动规则表后，用 `mackbind --verbose` 打印实际顺序核对，
-不要凭记忆。
+Lesson: after changing the rule table, print the actual order with `mackbind --verbose` to check it,
+don't trust your memory.
 
-## 前提：每行都要有实测依据
+## Premise: every row needs measured evidence
 
-表格只有在「每行都知道为什么存在」时才有价值。当前文档 11 条缺失里，
-多条经查证根本无法按文档所述实现：
+A table is only valuable when "every row knows why it exists". Of the 11 currently missing doc entries,
+several turned out to be impossible to implement as described:
 
-|文档条目|实际|
+|Doc entry|Reality|
 |---|---|
-|`Ctrl+Cmd+Q` 锁屏 → `Super+l`|GNOME 51 **无 `lock-screen` 绑定键**，锁屏不在 wm.keybindings schema 里。应标 **F**|
-|`Cmd+Shift+3/4/5` 截图 → `Print`|GNOME 现有绑定为 `Print`（截图UI）/ `Alt+Print`（窗口）/ `Shift+Print`（区域），与文档写法不符|
-|`Ctrl+Cmd+F` 全屏 → `F11`|可实现。`toggle-fullscreen` 存在但未绑定（`@as []`），发 `F11` 即可|
+|`Ctrl+Cmd+Q` lock screen → `Super+l`|GNOME 51 has **no `lock-screen` binding key**; lock screen is not in the wm.keybindings schema. Should be marked **F**|
+|`Cmd+Shift+3/4/5` screenshot → `Print`|GNOME's existing bindings are `Print` (screenshot UI) / `Alt+Print` (window) / `Shift+Print` (region), which do not match how the docs write it|
+|`Ctrl+Cmd+F` full screen → `F11`|implementable. `toggle-fullscreen` exists but is unbound (`@as []`); emitting `F11` is enough|
 
-这些尚未处理——**下一步就是逐条实机验证，据结果决定表里增删哪些行**。
+These are not handled yet -- **the next step is to verify them one by one on the real machine and decide from the results which rows to add or remove from the table**.

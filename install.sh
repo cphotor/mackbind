@@ -1,28 +1,28 @@
 #!/usr/bin/env bash
 #
-# mackbind 安装脚本
+# mackbind install script
 #
-# 依次做四件事：
-#   1. 编译并把二进制安装到 ~/.local/bin/mackbind
-#   2. 安装 udev 规则放开 /dev/uinput（建虚拟键盘）
-#   3. 把当前用户加入 input 组（读物理键盘）
-#   4. 安装并启用 systemd 用户服务
+# Does four things in order:
+#   1. Build and install the binary to ~/.local/bin/mackbind
+#   2. Install the udev rule that opens up /dev/uinput (to create a virtual keyboard)
+#   3. Add the current user to the input group (to read the physical keyboard)
+#   4. Install and enable the systemd user service
 #
-# 用法：
-#   ./install.sh                 全套
-#   ./install.sh --no-build      跳过编译，使用已有的 target/release/mackbind
-#   ./install.sh --no-udev       不装 udev 规则（例如 /dev/uinput 本就可写）
-#   ./install.sh --no-group      不修改 input 组
-#   ./install.sh --no-service    不装 systemd 用户服务
-#   ./install.sh -h | --help     显示帮助
+# Usage:
+#   ./install.sh                 full run
+#   ./install.sh --no-build      skip the build, use the existing target/release/mackbind
+#   ./install.sh --no-udev       do not install the udev rule (e.g. /dev/uinput is already writable)
+#   ./install.sh --no-group      do not modify the input group
+#   ./install.sh --no-service    do not install the systemd user service
+#   ./install.sh -h | --help     show help
 #
-# 卸载：./uninstall.sh
+# Uninstall: ./uninstall.sh
 #
-# 需要 root 的步骤（udev / input 组）会用 sudo，届时可能提示输入密码。
+# Steps that need root (udev / input group) use sudo and may prompt for your password.
 
 set -euo pipefail
 
-# ── 路径 ────────────────────────────────────────────────────────────────
+# ── Paths ───────────────────────────────────────────────────────────────
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BIN_SRC="$REPO_DIR/target/release/mackbind"
 BIN_DST="$HOME/.local/bin/mackbind"
@@ -31,7 +31,7 @@ UNIT="$UNIT_DIR/mackbind.service"
 UDEV_SRC="$REPO_DIR/packaging/99-mackbind.rules"
 UDEV_DST="/etc/udev/rules.d/99-mackbind.rules"
 
-# ── 参数 ────────────────────────────────────────────────────────────────
+# ── Arguments ───────────────────────────────────────────────────────────
 DO_BUILD=1
 DO_UDEV=1
 DO_GROUP=1
@@ -39,19 +39,19 @@ DO_SERVICE=1
 
 usage() {
   cat <<'USAGE'
-mackbind 安装脚本
+mackbind install script
 
-用法：./install.sh [选项]
+Usage: ./install.sh [options]
 
-选项：
-  --no-build      跳过编译，使用已有的 target/release/mackbind
-  --no-udev       不装 udev 规则（例如 /dev/uinput 本就可写）
-  --no-group      不修改 input 组
-  --no-service    不装 systemd 用户服务
-  -h, --help      显示本帮助
+Options:
+  --no-build      skip the build, use the existing target/release/mackbind
+  --no-udev       do not install the udev rule (e.g. /dev/uinput is already writable)
+  --no-group      do not modify the input group
+  --no-service    do not install the systemd user service
+  -h, --help      show this help
 
-需要 root 的步骤（udev / input 组）会用 sudo，届时可能提示输入密码。
-卸载请用 ./uninstall.sh
+Steps that need root (udev / input group) use sudo and may prompt for your password.
+To uninstall, use ./uninstall.sh
 USAGE
 }
 
@@ -62,11 +62,11 @@ for arg in "$@"; do
     --no-group)   DO_GROUP=0 ;;
     --no-service) DO_SERVICE=0 ;;
     -h|--help)    usage; exit 0 ;;
-    *)            printf '未知参数：%s（用 --help 查看用法）\n' "$arg" >&2; exit 2 ;;
+    *)            printf 'Unknown argument: %s (use --help for usage)\n' "$arg" >&2; exit 2 ;;
   esac
 done
 
-# ── 输出 ────────────────────────────────────────────────────────────────
+# ── Output ──────────────────────────────────────────────────────────────
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_DIM=$'\033[2m'; C_RST=$'\033[0m'
 else
@@ -78,75 +78,75 @@ err()  { printf '%s[x]%s %s\n' "$C_ERR" "$C_RST" "$*" >&2; }
 dim()  { printf '%s    %s%s\n' "$C_DIM" "$*" "$C_RST"; }
 die()  { err "$*"; exit 1; }
 
-# root 或 sudo
+# root or sudo
 as_root() {
   if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi
 }
 
 ME="$(id -un)"
 
-# ── 前置检查 ────────────────────────────────────────────────────────────
-[ -f "$REPO_DIR/Cargo.toml" ] || die "不在仓库根目录（找不到 $REPO_DIR/Cargo.toml）"
-[ -f "$UDEV_SRC" ] || die "缺少 udev 规则文件：$UDEV_SRC"
+# ── Pre-flight checks ───────────────────────────────────────────────────
+[ -f "$REPO_DIR/Cargo.toml" ] || die "Not at the repository root (cannot find $REPO_DIR/Cargo.toml)"
+[ -f "$UDEV_SRC" ] || die "Missing udev rule file: $UDEV_SRC"
 
 if [ "$DO_UDEV" -eq 1 ] || [ "$DO_GROUP" -eq 1 ]; then
   if [ "$(id -u)" -ne 0 ]; then
-    command -v sudo >/dev/null 2>&1 || die "需要 root 权限但系统里没有 sudo"
-    info "接下来几步需要 root 权限，可能提示你输入密码"
-    sudo -v || die "无法获得 sudo 权限"
+    command -v sudo >/dev/null 2>&1 || die "Root permissions are required but sudo is not available"
+    info "The next few steps need root permissions and may prompt for your password"
+    sudo -v || die "Could not obtain sudo permissions"
   fi
 fi
 
-# ── 1. 编译 ─────────────────────────────────────────────────────────────
+# ── 1. Build ────────────────────────────────────────────────────────────
 if [ "$DO_BUILD" -eq 1 ]; then
   command -v cargo >/dev/null 2>&1 \
-    || die "找不到 cargo。请先装 Rust 工具链，或用 --no-build 指定已有二进制。"
-  info "编译 release 版本…"
+    || die "cargo not found. Install the Rust toolchain first, or use --no-build to point at an existing binary."
+  info "Building the release version…"
   ( cd "$REPO_DIR" && cargo build --release )
 elif [ ! -x "$BIN_SRC" ]; then
-  die "--no-build 但找不到可执行文件：$BIN_SRC"
+  die "--no-build was given but no executable was found: $BIN_SRC"
 fi
-[ -x "$BIN_SRC" ] || die "编译产物不存在或不可执行：$BIN_SRC"
+[ -x "$BIN_SRC" ] || die "Build artifact does not exist or is not executable: $BIN_SRC"
 
-# ── 2. 安装二进制（先停服务，否则会「文本文件忙」）────────────────────────
+# ── 2. Install the binary (stop the service first, or you get "text file busy") ──
 if systemctl --user is-active --quiet mackbind 2>/dev/null; then
-  info "已有 mackbind 服务在运行，先停下以便替换二进制"
+  info "A mackbind service is already running; stopping it to replace the binary"
   systemctl --user stop mackbind || true
 fi
 
-info "安装二进制 → $BIN_DST"
+info "Installing binary → $BIN_DST"
 install -Dm755 "$BIN_SRC" "$BIN_DST"
-# 核对必须是硬性步骤：曾两次让用户测了旧二进制
-cmp -s "$BIN_SRC" "$BIN_DST" || die "安装后的二进制与编译产物不一致（MD5 校验失败）"
-dim "MD5 $(md5sum "$BIN_DST" | awk '{print $1}')（与编译产物一致）"
+# Verifying is mandatory: twice the user ended up testing an old binary
+cmp -s "$BIN_SRC" "$BIN_DST" || die "Installed binary differs from the build artifact (MD5 check failed)"
+dim "MD5 $(md5sum "$BIN_DST" | awk '{print $1}') (matches the build artifact)"
 
-# ── 3. input 组 ─────────────────────────────────────────────────────────
+# ── 3. input group ──────────────────────────────────────────────────────
 NEED_RELOGIN=0
 if [ "$DO_GROUP" -eq 1 ]; then
   if id -nG "$ME" | tr ' ' '\n' | grep -qx input; then
-    info "$ME 已在 input 组，跳过"
+    info "$ME is already in the input group, skipping"
   else
-    info "把 $ME 加入 input 组（读物理键盘 /dev/input/event*）"
+    info "Adding $ME to the input group (to read the physical keyboard /dev/input/event*)"
     as_root usermod -aG input "$ME"
     NEED_RELOGIN=1
   fi
 fi
 
-# ── 4. udev 规则 ────────────────────────────────────────────────────────
+# ── 4. udev rule ────────────────────────────────────────────────────────
 if [ "$DO_UDEV" -eq 1 ]; then
   if [ -f "$UDEV_DST" ] && cmp -s "$UDEV_SRC" "$UDEV_DST"; then
-    info "udev 规则已是最新，跳过"
+    info "The udev rule is already up to date, skipping"
   else
-    info "安装 udev 规则 → $UDEV_DST（放开 /dev/uinput）"
+    info "Installing udev rule → $UDEV_DST (opening up /dev/uinput)"
     as_root install -m644 "$UDEV_SRC" "$UDEV_DST"
     as_root udevadm control --reload
     as_root udevadm trigger
   fi
 fi
 
-# ── 5. systemd 用户服务 ─────────────────────────────────────────────────
+# ── 5. systemd user service ─────────────────────────────────────────────
 if [ "$DO_SERVICE" -eq 1 ]; then
-  info "安装 systemd 用户服务 → $UNIT"
+  info "Installing systemd user service → $UNIT"
   mkdir -p "$UNIT_DIR"
   cat > "$UNIT" <<'EOF'
 [Unit]
@@ -167,7 +167,7 @@ EOF
   systemctl --user reset-failed mackbind 2>/dev/null || true
 fi
 
-# ── 6. 权限就绪就立刻启动，否则提示重登 ─────────────────────────────────
+# ── 6. Start right away if permissions are ready, otherwise suggest re-login ──
 keyboard_readable() {
   for d in /dev/input/event*; do
     [ -r "$d" ] && return 0
@@ -178,29 +178,29 @@ keyboard_readable() {
 STARTED=0
 if [ "$DO_SERVICE" -eq 1 ]; then
   if keyboard_readable && [ -w /dev/uinput ]; then
-    info "权限已就绪，启动服务"
+    info "Permissions are ready, starting the service"
     systemctl --user restart mackbind
     sleep 1
     if systemctl --user is-active --quiet mackbind; then
-      info "mackbind 正在运行 ✅"
+      info "mackbind is running ✅"
       STARTED=1
     else
-      warn "服务未能启动，查看日志：journalctl --user -u mackbind -n 30 --no-pager"
+      warn "The service failed to start; check the log: journalctl --user -u mackbind -n 30 --no-pager"
     fi
   else
     NEED_RELOGIN=1
   fi
 fi
 
-# ── 收尾 ────────────────────────────────────────────────────────────────
+# ── Wrap-up ─────────────────────────────────────────────────────────────
 echo
 if [ "$NEED_RELOGIN" -eq 1 ]; then
-  warn "还差一步：注销并重新登录（或重启），让 input 组的新成员关系对进程生效。"
-  [ "$DO_SERVICE" -eq 1 ] && dim "服务已启用，重登后会自动启动。"
-  dim "重登后自检：ls -l /dev/uinput    # 应为 root input 0660"
+  warn "One step left: log out and back in (or reboot) so the new input group membership takes effect for your processes."
+  [ "$DO_SERVICE" -eq 1 ] && dim "The service is enabled and will start automatically after you log back in."
+  dim "Self-check after re-login: ls -l /dev/uinput    # should be root input 0660"
   dim "             systemctl --user status mackbind"
 elif [ "$STARTED" -eq 0 ]; then
-  info "完成（未启用服务，按需自行运行 mackbind）。"
+  info "Done (service not enabled; run mackbind yourself as needed)."
 else
-  info "完成。"
+  info "Done."
 fi

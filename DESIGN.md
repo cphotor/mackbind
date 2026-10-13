@@ -1,141 +1,191 @@
-# mackbind — 设计方案
+# mackbind — Design
 
-在 Linux 上模拟 macOS 键位习惯，同时完整保留 Linux 原生修饰键语义。
+Emulate macOS keyboard habits on Linux while fully preserving Linux's native
+modifier semantics.
 
-## 问题
+## Problem
 
-macOS 与 Linux/Windows 的修饰键语义几乎相同，只有名字不同：
+The modifier semantics of macOS and Linux/Windows are nearly identical; only the
+names differ:
 
-|物理位置|macOS|Linux 内核报告|X11 keysym|
+|Physical position|macOS|Linux kernel report|X11 keysym|
 |---|---|---|---|
-|左起第 1|Ctrl|`KEY_LEFTCTRL`|Control_L|
-|左起第 2|Option|`KEY_LEFTALT`|Alt_L|
-|左起第 3|Command|`KEY_LEFTMETA`|Super_L / Meta_L|
-|Tab 行最左|CapsLock|`KEY_CAPSLOCK`|Caps_Lock|
+|1st from the left|Ctrl|`KEY_LEFTCTRL`|Control_L|
+|2nd from the left|Option|`KEY_LEFTALT`|Alt_L|
+|3rd from the left|Command|`KEY_LEFTMETA`|Super_L / Meta_L|
+|Leftmost of the Tab row|CapsLock|`KEY_CAPSLOCK`|Caps_Lock|
 
-硬件层面**无需任何转换**。真正的问题出在软件层。
+At the hardware level **no conversion whatsoever** is needed. The real problem
+lies in the software layer.
 
-### Toshy 的做法及其副作用
+### Toshy's approach and its side effects
 
-Toshy（以及它继承的 Kinto）为了实现「`Cmd+X` → `Ctrl+X`」，采用了一条全局 modmap：
+To implement "`Cmd+X` → `Ctrl+X`", Toshy (and the Kinto it inherited from) uses a
+global modmap:
 
 ```
-Key.LEFT_META → Key.RIGHT_CTRL     # Cmd 无条件变成 Ctrl
+Key.LEFT_META → Key.RIGHT_CTRL     # Cmd unconditionally becomes Ctrl
 ```
 
-这条改写**无条件生效**，导致三个连锁后果：
+This rewrite **takes effect unconditionally**, producing three chained
+consequences:
 
-1. **Cmd 失去 Super 语义。** macOS 上 Cmd 与 Ctrl 是并列的两个系统修饰键，`Ctrl+Cmd+Space`、`Ctrl+Cmd+Q`、`Ctrl+Cmd+F` 都是合法且有意义的组合。Cmd 被映射成 Ctrl 之后，这两个修饰键指向同一槽位，无法区分。
+1. **Cmd loses its Super semantics.** On macOS, Cmd and Ctrl are two
+   side-by-side system modifiers; `Ctrl+Cmd+Space`, `Ctrl+Cmd+Q`, and
+   `Ctrl+Cmd+F` are all valid and meaningful combinations. Once Cmd is mapped to
+   Ctrl, the two modifiers point at the same slot and cannot be distinguished.
 
-2. **LEFT_CTRL 槽位被腾空，只能安置 Super。** 因为 Cmd 占了 Ctrl 的语义，物理 Ctrl 键必须改道，于是：
+2. **The LEFT_CTRL slot is vacated, so only Super can be placed there.** Because
+   Cmd has taken over Ctrl's semantics, the physical Ctrl key must be rerouted:
 
    ```python
    modmap("Cond modmap - GUI - Mac kbd", {
-       Key.LEFT_CTRL:  Key.LEFT_META,   # GUI 下 → Super
+       Key.LEFT_CTRL:  Key.LEFT_META,   # under GUI → Super
    })
    ```
 
-   同一位置在终端下却是 `LEFT_CTRL`：
+   Yet that same position is `LEFT_CTRL` under a terminal:
 
    ```python
    modmap("Caps mode - lctrl_role_swap - GUI",   {Key.CAPSLOCK: [Key.ESC, Key.LEFT_META]})
    modmap("Caps mode - lctrl_role_swap - Terms", {Key.CAPSLOCK: [Key.ESC, Key.LEFT_CTRL]})
    ```
 
-   于是同一个物理键在 GUI 与终端下行为不同。
+   So the same physical key behaves differently under the GUI and under a
+   terminal.
 
-3. **GUI 下的 Ctrl 习惯被破坏。** 在 VSCode + vim 插件这类场景中，物理 Ctrl 发出的实际是 `Super+V`，vim 插件收不到 `Ctrl+V`，块选择失效。
+3. **Ctrl habits under the GUI are broken.** In a scenario like VSCode with a vim
+   plugin, the physical Ctrl actually emits `Super+V`; the vim plugin never
+   receives `Ctrl+V`, and block selection stops working.
 
-此外 Toshy 的 7 个 `capslock_mode` 中**没有任何一个**能同时满足「Caps→真Ctrl」与「物理Ctrl→Caps」，因为其 `role_swap` 系列设计前提就是「左 Ctrl 的 GUI 角色是 Super」。
+Moreover, **none** of Toshy's 7 `capslock_mode` options can simultaneously
+satisfy "Caps→real Ctrl" and "physical Ctrl→Caps", because its `role_swap`
+family is designed on the premise that "left Ctrl's GUI role is Super".
 
-### 附带问题：内部实现泄漏
+### An incidental problem: implementation leakage
 
-Toshy 把 Cmd 的内部槽位命名为 `RIGHT_CTRL`，且文档中 `Super`/`Cmd`/`Command`/`Meta` 是同义词。于是 `C("Super-e")` 看起来是正确写法，实际永远不工作——物理 `Cmd+E` 到达 keymap 层时已变成 `RIGHT_CTRL+E`。这类命名与实现的不一致会稳定地误导用户。
+Toshy names Cmd's internal slot `RIGHT_CTRL`, and in its docs `Super`/`Cmd`/
+`Command`/`Meta` are synonyms. As a result `C("Super-e")` *looks* like the
+correct spelling but never works — by the time the physical `Cmd+E` reaches the
+keymap layer it has already become `RIGHT_CTRL+E`. This kind of mismatch between
+naming and implementation reliably misleads users.
 
-## 目标
+## Goals
 
-1. **CapsLock ↔ 左 Ctrl 位置互换**，且两个键在所有环境下均发真 Ctrl，不产生 Super。
-2. **`Cmd+X` 映射为 `Ctrl+X`**，无需穷举——长尾组合默认即正确。
-3. **Ctrl 恒等于 Ctrl**，GUI 与终端一致。终端内 `Ctrl+C` 中断进程、`Ctrl+L` 清屏、`Ctrl+A` 行首等原生行为完全不受影响。
-4. **规则表只管例外**：仅目标键与主键不同时才查表。
-5. Super 释放给桌面环境（输入法切换、`Super+Tab` 等），mackbind 默认不产生 Super。
+1. **Swap the CapsLock ↔ left Ctrl positions**, with both keys emitting a real
+   Ctrl in every environment and never producing Super.
+2. **Map `Cmd+X` to `Ctrl+X`**, with no need for exhaustive enumeration — long-tail
+   combinations are correct by default.
+3. **Ctrl always equals Ctrl**, consistent between GUI and terminal. Native
+   terminal behaviors such as `Ctrl+C` interrupting a process, `Ctrl+L` clearing
+   the screen, and `Ctrl+A` going to the start of the line are entirely
+   unaffected.
+4. **The rule table only handles exceptions**: the table is consulted only when
+   the target key differs from the main key.
+5. Super is left to the desktop environment (input-method switching, `Super+Tab`,
+   etc.); mackbind does not produce Super by default.
 
-## 核心模型
+## Core model
 
-与 Toshy 的方向相反。
+Opposite in direction to Toshy.
 
 | | Toshy | mackbind |
 |---|---|---|
-|模型|默认改写 + 逐组合指定输出|`Cmd` 即 `Ctrl`，规则表只管例外|
-|Cmd 身份|`LEFT_META` → `RIGHT_CTRL`（全局）|`Cmd` 转为 `Ctrl`，Super 释放|
-|修饰键槽位|五个键重排，互相挤占|不动|
-|映射目标|每个组合单独指定|默认值 + 例外表|
-|超出表的部分|必须显式指定，漏了就没有|默认生效|
+|Model|Rewrite by default + per-combination output|`Cmd` is `Ctrl`; the rule table only handles exceptions|
+|Cmd identity|`LEFT_META` → `RIGHT_CTRL` (global)|`Cmd` becomes `Ctrl`; Super is left free|
+|Modifier slots|Five keys rearranged, crowding each other out|Untouched|
+|Mapping target|Specified individually for each combination|Defaults + exception table|
+|Beyond the table|Must be specified explicitly; anything missed is broken|Works by default|
 
-mackbind 的逻辑可归结为：
-
-```
-收到 CAPSLOCK          → 发 LEFT_CTRL
-收到 LEFT_CTRL         → 发 CAPSLOCK
-收到 LEFT_META + 键    → 查例外表? 发例外 : 发 Ctrl+键
-收到其他               → 原样透传
-```
-
-规则之间无冲突，无先后依赖。这与 Toshy 需要处理「五个修饰键的完整重映射矩阵、6 种键盘类型、数千条组合规则、multipurpose 键时序判定」形成数量级上的差距。
-
-## 关键事实：Linux 桌面上 `Super` 只用于系统级操作
-
-GNOME 当前 28 个 Super 绑定（`gsettings list-recursively org.gnome.desktop.wm.keybindings` 实测）：
+mackbind's logic reduces to:
 
 ```
-窗口管理   Super+↑ ↓ ← →                最大化/最小化/平铺
-           Super+Shift+方向             移到其他显示器
-工作区     Super+Page_Up/Down         切换工作区
-           Super+Shift+PgUp/Down      把窗口移到工作区
-           Super+Home/End             跳到首/末工作区
-应用切换   Super+Tab                   切换应用
-输入法     Super+space                 切换输入法
-其他       Super+h / Super+F1 / Super+↑ 等
+receive CAPSLOCK        → emit LEFT_CTRL
+receive LEFT_CTRL       → emit CAPSLOCK
+receive LEFT_META + key → exception table? emit exception : emit Ctrl+key
+receive anything else   → pass through unchanged
 ```
 
-**涉及字母键的仅 `<Super>h` 一项**（锁屏 `Super+l`、`Super+o` 为用户自设）。GNOME 刻意不用 `Super+字母`——字母键留给应用，Super 留给桌面环境管窗口。
+There are no conflicts between rules and no ordering dependencies. This is an
+order-of-magnitude difference from Toshy, which must handle "the full remapping
+matrix of five modifiers, 6 keyboard types, thousands of combination rules, and
+multipurpose-key timing decisions".
 
-这意味着 macOS 的 `Cmd+字母`（复制、保存、查找…）在 Linux 上**对应的从来不是 Super，而是 Ctrl**。早期「让 Cmd 保持 Super 本意」的设计判断，对绝大多数组合而言只是让按键失效。
+## Key fact: on the Linux desktop, `Super` is used only for system-level operations
 
-### 曾被误判：保持 Super 更好
-
-最初的设计是「默认透传，查表例外」——`Cmd` 始终保持 `LEFT_META`，只有命中映射表的组合才翻译。这个模型的问题在实测中暴露：**穷举不完**。
-
-当时内置 23 条 `cmd_map` 白名单。这个数字本身就是设计失败的信号——真实的 Cmd 快捷键是长尾的。未列入的组合（如 `Cmd+E`、`Cmd+Shift+N`）透传为 `Super+…`，而在 Linux 上**没有任何应用识别 `Super+字母`**，结果是什么都不发生。
-
-用户反馈印证了这一点：「cmd 组合键太多了，每个应用还不一样！不大可能穷举啊」。
-
-修正后的规则：
+GNOME's current 28 Super bindings (measured with
+`gsettings list-recursively org.gnome.desktop.wm.keybindings`):
 
 ```
-默认       LEFT_META + 键  →  Ctrl + 键
-例外 1     目标键 ≠ 主键    →  查表（Cmd+[ → Alt+←、Cmd+Q → Alt+F4…）
-例外 2     应用内 Ctrl 已被占用且该键有 Ctrl+Shift 绑定 →  Ctrl+Shift + 键
+Window management  Super+↑ ↓ ← →          maximize/minimize/tile
+                   Super+Shift+arrow      move to another monitor
+Workspaces         Super+Page_Up/Down     switch workspace
+                   Super+Shift+PgUp/Down  move window to workspace
+                   Super+Home/End         jump to first/last workspace
+App switching      Super+Tab               switch app
+Input method       Super+space             switch input method
+Other              Super+h / Super+F1 / Super+↑ etc.
 ```
 
-例外清单很小且可自动推导，因此长尾组合默认即正确。
+**The only one involving a letter key is `<Super>h`** (lock screen `Super+l` and
+`Super+o` are user-defined). GNOME deliberately avoids `Super+letter` — letter
+keys are left to applications, and Super is left to the desktop environment for
+managing windows.
 
-## 终端特化：逐键，不是整体
+This means that macOS's `Cmd+letter` (copy, save, find…) **never corresponds to
+Super on Linux, but always to Ctrl**. The earlier design judgment to "let Cmd
+keep its Super meaning" merely disabled the keys for the vast majority of
+combinations.
 
-一个曾被误判的问题：担心「`Cmd+C` 翻译为 `Ctrl+C` 会在终端里误触发 SIGINT」。
+### Once misjudged: keeping Super is better
 
-**这是错的。** macOS Terminal 里 `Cmd+C` 就是 `Ctrl+Shift+C`，Linux 终端同样支持：
+The initial design was "pass through by default, table for exceptions" — `Cmd`
+always remained `LEFT_META`, and only combinations hitting the mapping table were
+translated. The flaw in this model showed up in testing: **it cannot be
+enumerated exhaustively**.
 
-| |Linux 终端|macOS 终端|
+At the time there was a built-in whitelist of 23 `cmd_map` entries. That number
+itself is a signal of design failure — real Cmd shortcuts have a long tail.
+Combinations not on the list (such as `Cmd+E`, `Cmd+Shift+N`) passed through as
+`Super+…`, and on Linux **no application recognizes `Super+letter`**, so nothing
+happened.
+
+User feedback confirmed this: "There are too many cmd combo keys, and every app
+is different! It's impossible to enumerate them all."
+
+The corrected rules:
+
+```
+default    LEFT_META + key  →  Ctrl + key
+exception 1  target key ≠ main key  →  consult table (Cmd+[ → Alt+←, Cmd+Q → Alt+F4…)
+exception 2  Ctrl already taken in-app and the key has a Ctrl+Shift binding  →  Ctrl+Shift + key
+```
+
+The exception list is small and can be derived automatically, so long-tail
+combinations are correct by default.
+
+## Terminal specialization: per key, not wholesale
+
+A problem that was once misjudged: the worry that "`Cmd+C` translated to `Ctrl+C`
+would wrongly trigger SIGINT in a terminal".
+
+**That is wrong.** In the macOS Terminal, `Cmd+C` is `Ctrl+Shift+C`, and Linux
+terminals support the same:
+
+| |Linux terminal|macOS terminal|
 |---|---|---|
-|`Ctrl+C`|SIGINT 中断|SIGINT 中断|
-|`Ctrl+Shift+C`|复制|复制|
+|`Ctrl+C`|SIGINT interrupt|SIGINT interrupt|
+|`Ctrl+Shift+C`|copy|copy|
 
-但由此得出「终端里把 Cmd 一律变成 Ctrl+Shift」也是错的——那会让 `Cmd+Q` 退化成 `Ctrl+Shift+Q`，一个谁也不认的组合。
+But concluding from this that "in a terminal, turn Cmd into Ctrl+Shift
+wholesale" is also wrong — that would degrade `Cmd+Q` into `Ctrl+Shift+Q`, a
+combination nobody recognizes.
 
-正确做法是**逐键**：只对**终端自身已用 `Ctrl+Shift` 绑定**的键加 Shift。
+The correct approach is **per key**: add Shift only to keys that the **terminal
+itself already binds with `Ctrl+Shift`**.
 
-更进一步，GNOME 系终端用 GSettings 声明全部快捷键，直接读其 schema 而非猜：
+Further, GNOME-family terminals declare all their shortcuts via GSettings, so
+read their schema directly rather than guessing:
 
 ```bash
 gsettings list-recursively org.gnome.Ptyxis.Shortcuts
@@ -143,169 +193,224 @@ gsettings list-recursively org.gnome.Ptyxis.Shortcuts
 # copy-clipboard  '<ctrl><shift>c'
 ```
 
-手写白名单曾漏掉 `n`（新窗口）而由用户发现。改用 schema 后，用户改过终端快捷键也能自动跟上。
+A hand-written whitelist once missed `n` (new window), and the user discovered
+it. After switching to the schema, changes the user makes to terminal shortcuts
+are picked up automatically.
 
-### 例外：ptyxis / konsole 的复制键
+### Exception: the copy key of ptyxis / konsole
 
-这两个终端在**无选中文本**时会把 `Ctrl+Shift+C` 穿透给子进程当作 SIGINT，使「复制」杀掉正在运行的任务（wezterm、ghostty、gnome-terminal 无此问题）。故改用 `Ctrl+Insert`（X11 传统复制键）。由规则表中一条按应用限定的 `emit` 承载，判定依据是**行为差异**而非应用名单。
+When there is **no selected text**, these two terminals pass `Ctrl+Shift+C`
+through to the child process as SIGINT, so "copy" kills the running task
+(wezterm, ghostty, and gnome-terminal do not have this problem). Hence
+`Ctrl+Insert` (the traditional X11 copy key) is used instead. This is carried by
+one app-scoped `emit` rule in the rule table, judged on the basis of **behavioral
+difference** rather than an app list.
 
-### 终端判定：按 freedesktop 规范，不枚举
+### Terminal detection: follow the freedesktop spec, do not enumerate
 
-`.desktop` 条目的 `Categories` 含 `TerminalEmulator` 即视为终端。最初的硬编码 WM_CLASS 名单里写的是小写 `ptyxis`，而实际值是 `org.gnome.Ptyxis`，直接漏判——用户反馈「cmd-c 在终端、控制台这几个可以，ptyxis、ghostty 不行」。
+A `.desktop` entry whose `Categories` contains `TerminalEmulator` is treated as a
+terminal. The original hard-coded WM_CLASS list wrote lowercase `ptyxis`, whereas
+the actual value is `org.gnome.Ptyxis`, so it was missed outright — user
+feedback: "cmd-c works in the terminal and console, but not in ptyxis or
+ghostty".
 
-焦点窗口经 GNOME Shell 扩展 `focused-window-dbus` 获取，懒查询（收到按键才查，`wm_class` 未变则跳过 `.desktop` 解析）。
+The focused window is obtained via the GNOME Shell extension
+`focused-window-dbus`, with a lazy query (query only when a key arrives; skip
+`.desktop` parsing if `wm_class` is unchanged).
 
-## 关于「Cmd 与 Ctrl 无法区分」的代价
+## On the cost of "Cmd and Ctrl being indistinguishable"
 
-`Cmd+C` 与物理 `Ctrl+C` 在普通应用里产生**相同输出**（均为 `Ctrl+C`）。是否会误判？
+`Cmd+C` and physical `Ctrl+C` produce **the same output** in ordinary
+applications (both `Ctrl+C`). Is this a misjudgment?
 
-**不会。** 解释权在应用而非键位：mackbind 只产出事件流，GTK 应用按自身菜单把 `Ctrl+C` 解释为复制，终端按 termios 的 `ISIG` 解释为 SIGINT。同一输出、不同解读，本就是 Linux 桌面的常态。
+**No.** The interpretation belongs to the application, not the keymap: mackbind
+only produces a stream of events; a GTK application interprets `Ctrl+C` as copy
+according to its own menus, while a terminal interprets it as SIGINT according to
+termios' `ISIG`. The same output with different readings is the normal state of
+the Linux desktop.
 
-唯一受影响的场景是某个应用内要求 `Cmd+X` 与 `Ctrl+X` 触发不同动作。此类组合极少，且可通过例外表保留原样。
+The only affected scenario is one in which an application requires `Cmd+X` and
+`Ctrl+X` to trigger different actions. Such combinations are very rare and can be
+preserved as-is through the exception table.
 
-## 故障记录：输入法漏字母
+## Incident record: the input method dropping letters
 
-### 现象
+### Symptom
 
-mackbind 运行时，输入法（fcitx5 + 小鹤双拼）打字漏字母，单个拼音音节无法合成，直接输出原始英文字母。表现为输入「发展」得到「fa vj」。
+While mackbind was running, the input method (fcitx5 + Xiaohe double pinyin)
+dropped letters when typing; a single pinyin syllable could not be composed and
+the raw English letters were output directly. The symptom was that typing
+`fazhan` (the pinyin for "develop") produced `fa vj`.
 
-**与 mackbind 无关。** 根因是触控板 `tap-to-click`：
+**Unrelated to mackbind.** The root cause was the touchpad's `tap-to-click`:
 
-打字时手掌误触触控板被识别为鼠标点击，该位置的按键被吃掉。GNOME 虽有 `disable-while-typing`，但该功能依赖 GNOME 收到键盘事件；mackbind 抓走键盘后 GNOME 收不到，误判用户「未在打字」，因而不会自动禁用触控板。
+While typing, the palm accidentally touched the touchpad, which was recognized as
+a mouse click, and the key at that position was swallowed. Although GNOME has
+`disable-while-typing`, that feature depends on GNOME receiving keyboard events;
+once mackbind grabbed the keyboard, GNOME no longer received them, judged that
+the user "was not typing", and therefore did not automatically disable the
+touchpad.
 
-解决：
+Fix:
 
 ```bash
 gsettings set org.gnome.desktop.peripherals.touchpad tap-to-click false
 gsettings set org.gnome.desktop.peripherals.touchpad tap-and-drag false
 ```
 
-关闭后输入法恢复正常。
+After turning these off, the input method returned to normal.
 
-### 排查过程中走过的弯路
+### Detours taken during troubleshooting
 
-记录下来是因为这些方向**都看似合理但无效**，避免后来者重复：
+They are recorded because these directions **all looked reasonable but were
+ineffective**, so that those who come later do not repeat them:
 
-|假设 | 实测结果 |
+|Hypothesis | Measured result |
 |---|---|
-|批次切分导致输入法提前提交|无效。真实键盘同样每键一个 SYN，不是 mackbind 引入的|
-|`InputEvent::new` 时间戳为 0 导致超时聚合失效|无效。evdev 文档明确：内核在读事件时会覆盖时间戳，注入的 0 不会到达输入法|
-|参照 Toshy 加固定 9ms 按键间隔|**更严重**。Toshy 的 `throttle_delays` 是为解决按键粘滞，与输入法无关|
-|按事件时间戳还原原始按键节奏|无效，且每个键都 sleep，程序变慢|
-|转发 MISC 事件以保留触控板活动|**更严重**。MISC 下挂着 ABS 多点触控事件，一并送到未声明 `EV_ABS` 能力的虚拟设备，导致触控板与按键双双异常|
+|Batch splitting causes the input method to commit early|No effect. A real keyboard likewise sends one SYN per key; this was not introduced by mackbind|
+|`InputEvent::new`'s timestamp being 0 disables timeout aggregation|No effect. The evdev docs are explicit: the kernel overwrites the timestamp when reading the event; the injected 0 never reaches the input method|
+|Copy Toshy by adding a fixed 9ms key interval|**Worse.** Toshy's `throttle_delays` exist to solve key stickiness and are unrelated to the input method|
+|Restore the original key rhythm from event timestamps|No effect, and every key sleeps, slowing the program down|
+|Forward MISC events to preserve touchpad activity|**Worse.** ABS multitouch events hang off MISC; sending them all to a virtual device that does not declare `EV_ABS` capability made both the touchpad and the keys misbehave|
 
-### 方法论教训
+### Methodology lesson
 
-上述五次尝试的共同错误：**用「症状相似」推断「成因相同」**，把外部先例（Toshy 的实现、ptyxis 的协议栈）当作依据，而非从实际观测出发。
+The common error in all five attempts above: **inferring "same cause" from
+"similar symptoms"**, treating external precedents (Toshy's implementation,
+ptyxis's protocol stack) as evidence rather than starting from actual
+observation.
 
-真正定位问题靠的是用户的一个观察——「打字时不小心碰到了触控板」——而非对 mackbind 日志的反复分析。mackbind 侧的事件流自始至终都是正确的。
+What actually located the problem was a single observation from the user —
+"I accidentally touched the touchpad while typing" — not repeated analysis of
+mackbind's logs. The event stream on mackbind's side was correct from beginning
+to end.
 
-后续排查此类问题时，应先确认「本程序输出的事件是否正确」，再怀疑下游；本例中日志显示事件完全正确，问题却依然存在，说明观察视角本身有盲区。
+When troubleshooting problems of this kind in the future, first confirm "are the
+events this program outputs correct?", and only then suspect downstream; in this
+case the logs showed the events were entirely correct yet the problem persisted,
+which means the observation perspective itself had a blind spot.
 
-## 覆盖范围
+## Coverage
 
-基于 Macworld 完整快捷键表与 Apple 官方文档分类。
+Based on Macworld's complete shortcut table and Apple's official documentation
+categories.
 
-### L1 — 纯组合翻译（方案完整覆盖）
+### L1 — pure combination translation (fully covered by the design)
 
-Cmd 作为修饰键，按下同键输出 Ctrl。应用自行解释，无需应用上下文。
-
-```
-Cmd+C / V / X / Z / A      →  Ctrl+C / V / X / Z / A     复制粘贴剪切撤销全选
-Shift+Cmd+Z                →  Ctrl+Shift+Z                重做
-Cmd+F / G                  →  Ctrl+F / G                  查找 / 查找下一个
-Shift+Cmd+G                →  Ctrl+G                      查找上一个
-Cmd+S / O                  →  Ctrl+S / O                  保存 / 打开
-Cmd+B / I / U / K          →  Ctrl+B / I / U / K          粗体 / 斜体 / 下划线 / 链接
-Cmd+T                      →  Ctrl+T                      新标签
-Cmd+W                      →  Ctrl+W                      关闭窗口
-Cmd+P                      →  Ctrl+P                      打印
-Cmd+R                      →  Ctrl+R                      刷新
-Cmd+[ / ]                  →  Alt+Left / Alt+Right        浏览器后退 / 前进
-Cmd+N                      →  Ctrl+N                      新建窗口
-Shift+Cmd+P                →  Ctrl+Shift+P                打印相关
-```
-
-### L2 — 平台级功能（交由 DE 或未实现）
-
-这些是 macOS 特有功能，Linux 上要么有等价物，要么不存在。逐条状态见
-`docs/macos-shortcuts.md` 的「实现状态」。
+With Cmd as a modifier, pressing it with a key outputs Ctrl. The application
+interprets it itself, with no application context needed.
 
 ```
-Shift+Cmd+3 / 4 / 5   截图            → 读 GNOME 现有截图绑定（见 macos-shortcuts.md）
-Cmd+Space             Spotlight        → GNOME 概览；读 toggle-overview，未绑定时退回 mutter overlay-key
-Cmd+Del               移到废纸篓        → 依应用而定
-Ctrl+Cmd+Q            锁屏             → 读 media-keys screensaver（本机 Super+L）
-Fn 系列               显示台/Dictation → 无等价物
-Cmd+Tab               切换应用         → Super+Tab（分类 B，暂缓）
+Cmd+C / V / X / Z / A      →  Ctrl+C / V / X / Z / A      copy paste cut undo select-all
+Shift+Cmd+Z                →  Ctrl+Shift+Z                 redo
+Cmd+F / G                  →  Ctrl+F / G                   find / find next
+Shift+Cmd+G                →  Ctrl+G                       find previous
+Cmd+S / O                  →  Ctrl+S / O                   save / open
+Cmd+B / I / U / K          →  Ctrl+B / I / U / K           bold / italic / underline / link
+Cmd+T                      →  Ctrl+T                      new tab
+Cmd+W                      →  Ctrl+W                      close window
+Cmd+P                      →  Ctrl+P                      print
+Cmd+R                      →  Ctrl+R                      refresh
+Cmd+[ / ]                  →  Alt+Left / Alt+Right        browser back / forward
+Cmd+N                      →  Ctrl+N                      new window
+Shift+Cmd+P                →  Ctrl+Shift+P                print-related
 ```
 
-### L3 — Finder 专属（待实测，不在 v1）
+### L2 — platform-level features (handed to the DE or not implemented)
 
-Nautilus 绑定与 Finder 不同，需逐条核对。优先级低，因为有鼠标路径可达。
-
-```
-Cmd+D 复制 / Cmd+E 弹出 / Cmd+I 显示信息 / Cmd+1~4 视图切换
-Shift+Cmd+N 新建文件夹 / Shift+Cmd+H 家目录 / Cmd+, 偏好设置
-```
-
-### Emacs 绑定（保留不动）
-
-macOS 上 `Ctrl` 有独立的 Emacs 风格绑定。本方案不触碰 Ctrl，因此这些**天然可用**：
+These are macOS-specific features; on Linux they either have an equivalent or do
+not exist. For the status of each, see the "Implementation status" section of
+`docs/macos-shortcuts.md`.
 
 ```
-Ctrl+A 行首   Ctrl+E 行尾   Ctrl+F 前进   Ctrl+B 后退
-Ctrl+P 上行   Ctrl+N 下行   Ctrl+L 清屏   Ctrl+D 删字符
-Ctrl+K 删到行尾            Ctrl+W 删词
+Shift+Cmd+3 / 4 / 5   screenshot       → read GNOME's existing screenshot binding (see macos-shortcuts.md)
+Cmd+Space             Spotlight        → GNOME overview; read toggle-overview, fall back to the mutter overlay-key when unbound
+Cmd+Del               move to trash    → depends on the application
+Ctrl+Cmd+Q            lock screen      → read media-keys screensaver (this machine: Super+L)
+Fn family             Show Desktop/Dictation → no equivalent
+Cmd+Tab               switch app       → Super+Tab (classification B, deferred)
 ```
 
-## 实现方案
+### L3 — Finder-specific (to be tested on the real machine, not in v1)
 
-### 为什么是 evdev + uinput
+Nautilus's bindings differ from Finder's and must be checked one by one. The
+priority is low, because a mouse path can reach them.
 
-在 GNOME Wayland 下，XKB 层不可用：
+```
+Cmd+D duplicate / Cmd+E eject / Cmd+I get info / Cmd+1~4 view switching
+Shift+Cmd+N new folder / Shift+Cmd+H home directory / Cmd+, preferences
+```
 
-|层级|机制|覆盖范围|应用区分|
+### Emacs bindings (left untouched)
+
+On macOS, `Ctrl` has independent Emacs-style bindings. This design does not touch
+Ctrl, so these **work naturally**:
+
+```
+Ctrl+A line start   Ctrl+E line end   Ctrl+F forward   Ctrl+B backward
+Ctrl+P line up      Ctrl+N line down  Ctrl+L clear screen  Ctrl+D delete char
+Ctrl+K delete to end of line          Ctrl+W delete word
+```
+
+## Implementation
+
+### Why evdev + uinput
+
+Under GNOME Wayland, the XKB layer is unavailable:
+
+|Layer|Mechanism|Coverage|App discrimination|
 |---|---|---|---|
-|XKB（`setxkbmap`）|X 服务器内部 keymap|**仅 XWayland 应用**|不可|
-|evdev grab + uinput|用户态进程截获事件|全局，含原生 Wayland|可（需焦点查询）|
+|XKB (`setxkbmap`)|keymap inside the X server|**XWayland apps only**|No|
+|evdev grab + uinput|a userspace process intercepts events|global, including native Wayland|Yes (requires a focus query)|
 
-mackbind 走第二条路，与 Toshy 相同的技术栈，但逻辑远为简单。
+mackbind takes the second path, with the same tech stack as Toshy but far simpler
+logic.
 
-### 组件
+### Components
 
 ```
-1. 设备枚举与抓取
-   - 枚举 /dev/input/event*，识别键盘
-   - device.grab() 独占（需 input 组）
+1. Device enumeration and grabbing
+   - enumerate /dev/input/event*, identify keyboards
+   - device.grab() for exclusive access (needs the input group)
 
-2. 修饰键状态机
-   - 记录当前按下的修饰键集合
-   - 处理左右侧区分（LEFT_CTRL / RIGHT_CTRL）
+2. Modifier state machine
+   - record the set of currently pressed modifiers
+   - handle left/right distinction (LEFT_CTRL / RIGHT_CTRL)
 
-3. 映射决策
-   - 单键规则：CapsLock ↔ LEFT_CTRL（静态）
-   - 组合规则：LEFT_META + 键 → 查表（静态）
-   - 表外透传
+3. Mapping decision
+   - single-key rules: CapsLock ↔ LEFT_CTRL (static)
+   - combination rules: LEFT_META + key → consult table (static)
+   - pass through anything not in the table
 
-4. 虚拟设备注入
-   - uinput 建虚拟键盘
-   - 重放转换后的事件
+4. Virtual device injection
+   - create a virtual keyboard with uinput
+   - replay the converted events
 
-5. 终端检测
-   - 读 GNOME Shell 扩展的焦点窗口信息
-   - 终端类窗口中禁用所有映射
+5. Terminal detection
+   - read the focused-window info from the GNOME Shell extension
+   - disable all mappings in terminal-type windows
 ```
 
-### 关键技术点
+### Key technical points
 
-**修饰键按下时不立即输出。** 收到修饰键先记入状态并抑制输出；收到非修饰键时，结合完整修饰键集合做决策，决定输出内容。
+**A modifier is not output immediately on press.** When a modifier is received it
+is first recorded in the state and its output suppressed; when a non-modifier key
+is received, a decision is made using the complete modifier set to determine what
+to output.
 
-**释放事件需与按下时决策一致。** 转换后的修饰键，其释放事件必须按转换后的身份发出，否则会残留按下状态。
+**The release event must match the decision made on press.** A converted
+modifier's release event must be emitted under its converted identity, otherwise
+a pressed state is left behind.
 
-**终端排除只需窗口类型。** 这是唯一需要应用上下文的地方，且只需判断「是不是终端」，不需要「绑定了哪些键」。映射目标是静态表决定的，应用只需要收到正确的 `Ctrl+X`，会自行正确解释。
+**Excluding terminals requires only the window type.** This is the only place
+application context is needed, and it only requires judging "is it a terminal?",
+not "which keys are bound". The mapping target is determined by a static table;
+the application only needs to receive the correct `Ctrl+X` and will interpret it
+correctly itself.
 
-GNOME Wayland 下需 Shell 扩展提供焦点窗口信息。本机已安装 `focused-window-dbus@flexagoon.com`（version 11），**实测可用**，接口为：
+Under GNOME Wayland, a Shell extension must provide the focused-window info. This
+machine already has `focused-window-dbus@flexagoon.com` installed (version 11),
+**verified working**, with the interface:
 
 ```text
 dest:   org.gnome.Shell
@@ -313,120 +418,162 @@ object: /org/gnome/shell/extensions/FocusedWindow
 method: org.gnome.shell.extensions.FocusedWindow.Get
 ```
 
-该扩展由 GNOME Shell 进程直接导出对象，**不经独立的 bus name 激活**，因此 `--dest` 必须是 `org.gnome.Shell` 本身。若误用 `org.gnome.Shell.Extensions.Dbus` 会得到 `ServiceUnknown: The name is not activatable` —— 这不表示扩展未启用，而是地址写错了。判据：向 `org.gnome.Shell` 查询时能正常返回 JSON，而扩展目录下的 `metadata.json` 存在且 `enabled-extensions` 含该 uuid。
+This extension exports its object directly from the GNOME Shell process and is
+**not activated via a separate bus name**, so `--dest` must be `org.gnome.Shell`
+itself. Using `org.gnome.Shell.Extensions.Dbus` by mistake yields
+`ServiceUnknown: The name is not activatable` — this does not mean the extension
+is disabled, but that the address is wrong. The criterion: querying
+`org.gnome.Shell` returns JSON normally, while `metadata.json` exists in the
+extension directory and `enabled-extensions` contains that uuid.
 
-## 实现选型
+## Implementation choice
 
 | | Rust | Python |
 |---|---|---|
-|分发|单文件二进制，无运行时依赖|需解释器 + 依赖|
-|evdev 绑定|`evdev` crate（需引入 libc 细节）|`python-evdev`（成熟，但本机仅 Toshy venv 内有）|
-|开发速度|较慢|快|
-|长期可维护|优|可|
+|Distribution|single-file binary, no runtime dependency|needs an interpreter + dependencies|
+|evdev bindings|the `evdev` crate (requires pulling in libc details)|`python-evdev` (mature, but on this machine only inside the Toshy venv)|
+|Development speed|slower|fast|
+|Long-term maintainability|excellent|acceptable|
 
-倾向 **Rust**：无依赖分发对输入法级别的工具是实质优势，避免用户为了一百行映射逻辑去装 Python 生态。
+Leaning toward **Rust**: dependency-free distribution is a substantial advantage
+for a tool at the input-method level, avoiding users having to install the whole
+Python ecosystem just for a hundred lines of mapping logic.
 
-依赖清单：`evdev`（设备访问与 uinput）、`serde` + `toml`（配置解析）。均为成熟 crate。
+Dependency list: `evdev` (device access and uinput), `serde` + `toml` (config
+parsing). All are mature crates.
 
-注：`evdev` crate **自带** `Device::grab()` / `ungrab()`，无需自行实现 `EVIOCGRAB` ioctl，`libc` 依赖可省去。
+Note: the `evdev` crate **already ships** `Device::grab()` / `ungrab()`; there is
+no need to implement the `EVIOCGRAB` ioctl yourself, and the `libc` dependency
+can be dropped.
 
-## 事件流实测结论
+## Measured conclusions about the event stream
 
-以下为在 MacBook Pro 2015（`/dev/input/event6`，`Apple Inc. Apple Internal Keyboard / Trackpad`）上的实测结果，是实现的事实基础。
+The following are measured results on a MacBook Pro 2015 (`/dev/input/event6`,
+`Apple Inc. Apple Internal Keyboard / Trackpad`), and are the factual basis for
+the implementation.
 
-### 修饰键键码
+### Modifier key codes
 
-|物理键|键码|
+|Physical key|Key code|
 |---|---|
 |Cmd|`KEY_LEFTMETA` (125)|
-|左 Ctrl|`KEY_LEFTCTRL` (29)|
-|右 Ctrl|`KEY_RIGHTCTRL` (97)|
+|left Ctrl|`KEY_LEFTCTRL` (29)|
+|right Ctrl|`KEY_RIGHTCTRL` (97)|
 |Option|`KEY_LEFTALT` (56)|
 |CapsLock|`KEY_CAPSLOCK` (58)|
 |Fn|`KEY_FN` (464)|
 
-**Cmd 就是 `KEY_LEFTMETA`**，与 PC 的 Win 键同码。这是整个设计的立足点：macOS 的 Cmd 与 Linux 的 Super 在硬件层无需转换，映射表可直接基于 `LEFT_META` 构建。
+**Cmd is `KEY_LEFTMETA`**, the same code as the Win key on a PC. This is the
+foothold of the entire design: macOS's Cmd and Linux's Super need no conversion at
+the hardware layer, and the mapping table can be built directly on `LEFT_META`.
 
-### Fn 键可见，可用于用户态优先级切换
+### The Fn key is visible and can be used for userspace priority switching
 
-`KEY_FN` (464) 在设备能力列表中声明，且作为普通 key event 到达：
-
-```
-单独 Fn       → 464 press(1), release(0)
-按住 Fn       → 464 press(1), repeat(2) × N, release(0)
-Fn + F1       → 464 press(1) 与 59 press(1) 独立到达
-```
-
-内核**不做合成**——`Fn+F1` 时 `KEY_FN` 与 `KEY_F1` 分别上报，而非直接给出 `KEY_BRIGHTNESSDOWN` (224)。
-
-因此 **fn 按键优先级可在用户态实现**，两种模式（`fkeysfirst` / `fkeyslast`）都无需 root 或修改 `hid_apple` 内核参数：
+`KEY_FN` (464) is declared in the device capability list and arrives as an
+ordinary key event:
 
 ```
-Fn 未按住 + F1 →  发 KEY_F1
-Fn 按住   + F1 →  发 KEY_BRIGHTNESSDOWN (224)
+Fn alone       → 464 press(1), release(0)
+holding Fn     → 464 press(1), repeat(2) × N, release(0)
+Fn + F1        → 464 press(1) and 59 press(1) arrive independently
 ```
 
-这推翻了「fnmode 只能通过 `/sys/module/hid_apple/parameters/fnmode` 切换、需root」的假设。
+The kernel **does no synthesis** — with `Fn+F1`, `KEY_FN` and `KEY_F1` are
+reported separately, rather than directly giving `KEY_BRIGHTNESSDOWN` (224).
 
-### 实现注意事项
+Therefore **Fn key priority can be implemented in userspace**, and both modes
+(`fkeysfirst` / `fkeyslast`) need neither root nor changes to `hid_apple` kernel
+parameters:
 
-**必须处理自动重复。** 修饰键按住会产生大量 `value=2` 的 repeat 事件（如上例中 `464 2` 连续多次）。这些不能重复触发映射，否则会产生成对的按下/释放。
+```
+Fn not held + F1 →  emit KEY_F1
+Fn held     + F1 →  emit KEY_BRIGHTNESSDOWN (224)
+```
 
-**必须过滤 `MISC` 事件。** 实测每个按键前后都有 `MISC` 事件（MacBook 键盘背光/触摸板杂散事件），不属于按键语义，应透传或丢弃。
+This overturns the assumption that "fnmode can only be switched via
+`/sys/module/hid_apple/parameters/fnmode` and requires root".
 
-**释放事件须与按下时决策一致。** 转换后的修饰键，其 release 事件必须按转换后的键码发出，否则输出侧会残留按下状态。
+### Implementation cautions
 
-## 阶段划分
+**Auto-repeat must be handled.** Holding a modifier produces many repeat events
+with `value=2` (such as the consecutive `464 2`s in the example above). These
+must not trigger the mapping repeatedly, or they produce paired press/release
+events.
 
-### v1 — 最小可用
+**`MISC` events must be filtered.** Measurements show every keypress has a `MISC`
+event before and after it (stray events from the MacBook keyboard backlight/
+touchpad); they are not part of key semantics and should be passed through or
+discarded.
 
-- CapsLock ↔ 左 Ctrl 互换，两个方向均发真 Ctrl
-- L1 表中约 18 条组合映射
-- 表外组合原样透传
-- 过滤 `MISC` 事件与 `value=2` 自动重复事件
-- 无应用区分（先验证 Ctrl 是否恢复正常）
+**The release event must match the decision made on press.** A converted
+modifier's release event must be emitted under the converted key code, otherwise
+a pressed state is left behind on the output side.
 
-**验证目标**：VSCode + vim 插件中 `Ctrl+V`、`Ctrl+A`、`Ctrl+W` 恢复正常；终端中 `Ctrl+C` 中断进程正常。
+## Phasing
 
-这一步独立于后续功能即可解决核心痛点。即使 v2 不做，项目已有实际价值。
+### v1 — minimal viable
 
-### v1.5 — Fn 键优先级
+- CapsLock ↔ left Ctrl swapped, both directions emitting a real Ctrl
+- About 18 combination mappings from the L1 table
+- Combinations not in the table pass through unchanged
+- Filter `MISC` events and `value=2` auto-repeat events
+- No app discrimination (verify first whether Ctrl is back to normal)
 
-- 基于 `KEY_FN` 按下状态，在用户态实现 F 键 / 媒体键切换
-- 配置项选择 `fkeysfirst`（F 键优先，Fn 组合出媒体键）或 `fkeyslast`（媒体键优先，Fn 组合出 F 键）
-- 需维护 F1–F12 与亮度/媒体键的对应表
+**Verification goal**: in VSCode with a vim plugin, `Ctrl+V`, `Ctrl+A`, and
+`Ctrl+W` work again; in a terminal, `Ctrl+C` interrupts the process normally.
 
-该功能不依赖内核 `fnmode` 参数，纯用户态实现。
+This step solves the core pain point on its own, independent of later features.
+Even if v2 is never done, the project already has real value.
 
-### v2 — 终端排除
+### v1.5 — Fn key priority
 
-- GNOME 焦点窗口查询
-- 终端类窗口内禁用映射
+- Implement F-key / media-key switching in userspace based on `KEY_FN` press
+  state
+- A config option selects `fkeysfirst` (F key takes priority; Fn combos produce
+  media keys) or `fkeyslast` (media key takes priority; Fn combos produce F keys)
+- Requires maintaining a mapping table between F1–F12 and the brightness/media
+  keys
 
-**验证目标**：终端内 `Cmd` 组合不产生意外行为；`Ctrl` 系列完全正常。
+This feature does not depend on the kernel `fnmode` parameter and is implemented
+purely in userspace.
 
-### v3 — 完善
+### v2 — terminal exclusion
 
-- L3 Finder 映射逐条核对
-- 配置热重载
+- GNOME focused-window query
+- Disable mappings in terminal-type windows
 
-> 开机自启已落地：`~/.config/systemd/user/mackbind.service`，
-> `WantedBy=default.target`。此前列为待办是疏漏——实际早已配置好。
+**Verification goal**: `Cmd` combos inside a terminal produce no unexpected
+behavior; the `Ctrl` series works entirely normally.
 
-## 风险
+### v3 — refinement
 
-|风险|缓解|
+- Check the L3 Finder mappings one by one
+- Config hot reload
+
+> Autostart is already in place: `~/.config/systemd/user/mackbind.service`,
+> `WantedBy=default.target`. Listing it as a to-do earlier was an oversight — it
+> had in fact long since been configured.
+
+## Risks
+
+|Risk|Mitigation|
 |---|---|
-|grab 失败导致键盘失灵|启动时验证抓取结果，失败则退出并报错，不静默挂起|
-|修饰键状态泄漏|明确释放路径；退出时释放所有按下的键|
-|与 Toshy 冲突|两者不能同时 grab 同一设备，需停用 Toshy 或显式检测|
-|Wayland 焦点信息不可得|降级为无应用区分（v1 本就无此依赖）|
+|A failed grab leaves the keyboard dead|verify the grab result at startup; on failure exit with an error rather than hanging silently|
+|Modifier state leakage|define the release path explicitly; release all pressed keys on exit|
+|Conflict with Toshy|the two cannot grab the same device at once; Toshy must be disabled or explicitly detected|
+|Wayland focus info unavailable|degrade to no app discrimination (v1 has no such dependency anyway)|
 
-**与 Toshy 的关系**：两者不能共存于同一设备。mackbind 验证通过后停用 Toshy。若 mackbind 未达预期，Toshy 配置已备份在 `~/.config/toshy/toshy_user_preferences.sqlite.bak-20261009-174016`，可回滚。
+**Relationship with Toshy**: the two cannot coexist on the same device. Disable
+Toshy once mackbind passes verification. If mackbind falls short of expectations,
+the Toshy configuration has been backed up at
+`~/.config/toshy/toshy_user_preferences.sqlite.bak-20261009-174016` and can be
+rolled back.
 
-## 待确认
+## To be confirmed
 
-- [ ] L1 表中 `Cmd+N` 在终端语义冲突（新标签 vs 新建进程），是否按应用区分
-- [ ] `Cmd+P` 在 VSCode 中是「跳转文件」而非「打印」，是否按应用区分
-- [ ] L3 Finder 映射是否纳入 v3 之后
-- [ ] 项目名 `mackbind` 是否最终采用
+- [ ] Whether `Cmd+N` in the L1 table has a terminal semantic conflict (new tab
+  vs new process), and whether to discriminate by app
+- [ ] Whether `Cmd+P` in VSCode is "go to file" rather than "print", and whether
+  to discriminate by app
+- [ ] Whether the L3 Finder mappings are included after v3
+- [ ] Whether the project name `mackbind` is adopted in the end

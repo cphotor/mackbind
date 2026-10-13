@@ -1,250 +1,291 @@
-//! 配置解析。
+//! Config parsing.
 //!
-//! # 设计要点
+//! # Design points
 //!
-//! **内置默认映射，开箱即用。** 用户装上 mackbind 后无需任何配置
-//! 即可获得 macOS 快捷键习惯。用户配置用于**覆盖**或**追加**，而非
-//! 启用功能。
+//! **Built-in default mappings, ready out of the box.** After installing
+//! mackbind, the user gets the macOS shortcut habits with no configuration at
+//! all. The user config is used to **override** or **append**, not to enable
+//! features.
 //!
-//! **桌面环境是可配置项，不可硬编码。** Linux 上有 GNOME、KDE Plasma、
-//! Sway、Hyprland 等多种 DE，同一 macOS 功能在不同 DE 下的实现方式、
-//! 可用性、默认快捷键都不同。DE 相关行为通过 `[desktop] type`
-//! 指定；查不到时相关规则跳过，但**不可当作不存在**——应保留在
-//! 文档中待支持对应 DE 时启用。
+//! **The desktop environment is a configurable item and must not be
+//! hard-coded.** On Linux there are many DEs—GNOME, KDE Plasma, Sway,
+//! Hyprland, and others—and the same macOS feature differs in how it is
+//! implemented, whether it is available, and its default shortcut under each
+//! DE. DE-related behavior is specified via `[desktop] type`; when it cannot be
+//! looked up the related rule is skipped, but **must not be treated as
+//! nonexistent**—it should be kept in the docs to be enabled when the
+//! corresponding DE is supported.
 //!
-//! # Cmd 的默认语义
+//! # Default semantics of Cmd
 //!
-//! `Cmd+X` 默认映射为 `Ctrl+X`（而非保留 Super）。依据实测：GNOME 的
-//! 28 个 Super 绑定中涉及字母的仅 `Super+h` 一项，`Super+字母` 基本
-//! 空闲——而 macOS 的 `Cmd+字母` 绝大多数对应的正是 Ctrl。保持 Super
-//! 会让绝大多数组合什么也不发生。
+//! `Cmd+X` maps to `Ctrl+X` by default (rather than keeping Super). Based on
+//! measurement: of GNOME's 28 Super bindings, only `Super+h` involves a letter,
+//! so `Super+letter` is essentially free—whereas the vast majority of macOS's
+//! `Cmd+letter` correspond exactly to Ctrl. Keeping Super would make most
+//! combos do nothing at all.
 //!
-//! Super 相关规则（`Cmd+Tab`/`Cmd+H` 等）暂缓实现，理由见
-//! `docs/macos-shortcuts.md`。
+//! Super-related rules (`Cmd+Tab`/`Cmd+H`, etc.) are deferred; see
+//! `docs/macos-shortcuts.md` for the reasoning.
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-/// 单条修饰键重映射：把 `from` 键改成 `to` 键。
+/// A single modifier remap: change key `from` into key `to`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Remap {
-    /// evdev 键码名，如 "KEY_CAPSLOCK"
+    /// evdev keycode name, e.g. "KEY_CAPSLOCK"
     pub from: String,
-    /// evdev 键码名，如 "KEY_LEFTCTRL"
+    /// evdev keycode name, e.g. "KEY_LEFTCTRL"
     pub to: String,
-    /// 可选说明，仅供人阅读
+    /// Optional description, for human reading only
     #[serde(default)]
     pub desc: Option<String>,
 }
 
-/// 一条映射规则的动作。
+/// The action of a mapping rule.
 ///
-/// **动作即函数**：前两种是「发出固定组合」，后两种在**运行时求值**——
-/// 查 DE 现有的绑定、或查终端自己声明的快捷键。这样表负责命名，
-/// 求值交给函数，不必把动态发现的结果冻结成会过期的快照。
+/// **An action is a function**: the first two emit a fixed combo, and the last
+/// two are **evaluated at runtime**—querying the DE's existing binding, or
+/// querying the terminal's own declared shortcut. This way the table is
+/// responsible for naming and evaluation is left to functions, so dynamically
+/// discovered results need not be frozen into a snapshot that can go stale.
 ///
-/// 参见 `docs/table-driven-design.md`。
+/// See `docs/table-driven-design.md`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
-    /// 发出固定组合，如 `Cmd+Q` → `Alt+F4`
+    /// Emit a fixed combo, e.g. `Cmd+Q` → `Alt+F4`
     Emit {
-        /// 输出侧修饰键
+        /// Output-side modifiers
         #[serde(default)]
         mods: Vec<String>,
-        /// 输出主键
+        /// Output main key
         key: String,
     },
-    /// 读取桌面环境对该功能的现有绑定，发出同样的键。
+    /// Read the desktop environment's existing binding for this feature and
+    /// emit the same keys.
     ///
-    /// 好处是不在用户配置里留下记录，也不覆盖用户自己的设置；
-    /// 用户改了绑定则自动跟上。查不到时**跳过**（不视为错误）。
+    /// The benefit is that no record is left in the user config and the user's
+    /// own settings are not overridden; if the user changes the binding, this
+    /// follows automatically. When it cannot be looked up, **skip** (not
+    /// treated as an error).
     DeAccel {
-        /// 功能标识，如 `overview`。查表见 `de_action_lookup`。
+        /// Feature identifier, e.g. `overview`. For the lookup table see
+        /// `de_action_lookup`.
         feature: String,
     },
-    /// 仅当目标应用**自己**用 `Ctrl+Shift` 绑定了这个键时才加 Shift。
+    /// Add Shift only when the target app **itself** binds this key with
+    /// `Ctrl+Shift`.
     ///
-    /// 加 Shift 的目的是命中应用已有的绑定，而不是笼统躲冲突。
-    /// 该键集在运行时从 GSettings 查得（见 `set_window_id`），
-    /// 故此处无法写成固定输出——这是本表唯一的「条件」动作。
+    /// The purpose of adding Shift is to hit a binding the app already has, not
+    /// to dodge conflicts in general. This key set is obtained at runtime from
+    /// GSettings (see `set_window_id`), so it cannot be written here as a fixed
+    /// output—this is the table's only "conditional" action.
     TerminalCtrlShift,
-    /// 执行一条外部命令。
+    /// Run an external command.
     ///
-    /// 用于「本质是命令而非组合键」的操作，如清倒废纸篓。
-    /// 破坏性命令走 [`crate::exec`] 的确认流程。
+    /// Used for operations that are "essentially a command rather than a
+    /// combo", such as empty trash. Destructive commands go through the
+    /// confirmation flow in [`crate::exec`].
     Exec {
-        /// 可执行文件名，如 `gio`
+        /// Executable name, e.g. `gio`
         program: String,
-        /// 参数
+        /// Arguments
         #[serde(default)]
         args: Vec<String>,
-        /// 是否先要求用户确认，默认 `true`。
+        /// Whether to ask the user for confirmation first; defaults to `true`.
         ///
-        /// 破坏性命令**强制**确认，写 `false` 也不行——
-        /// 免确认的全局热键一旦误按就是永久删除，没有回收站可捞。
+        /// Destructive commands **force** confirmation; writing `false` does
+        /// not work—a confirmation-free global hotkey means an accidental press
+        /// is a permanent delete, with no trash to recover from.
         #[serde(default = "default_true")]
         confirm: bool,
-        /// 确认框正文。省略则用自动生成的说明。
+        /// Confirmation body text. If omitted, an auto-generated description is
+        /// used.
         #[serde(default)]
         prompt: Option<String>,
-        /// 确认按钮文字。省略则用「执行」。
+        /// Confirmation button text. If omitted, "Run" is used.
         #[serde(default)]
         ok_label: Option<String>,
     },
 }
 
-/// 表的一行：`(应用, 按键组合) → 动作`。
+/// A row of the table: `(app, key combo) → action`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
-    /// 适用的应用。省略或 `["*"]` 表示所有应用。
+    /// Applies to which apps. Omitted or `["*"]` means all apps.
     ///
-    /// `"TerminalEmulator"` 是特殊取值——按 `.desktop` 的 `Categories`
-    /// 判定（freedesktop 规范），装新终端自动生效。其余按 wm_class
-    /// 子串匹配。
+    /// `"TerminalEmulator"` is a special value—decided by the `.desktop`
+    /// `Categories` (freedesktop spec), so installing a new terminal takes
+    /// effect automatically. The rest match by substring on wm_class.
     #[serde(default)]
     pub apps: Vec<String>,
-    /// 输入侧组合，**不含 Cmd**（见 `cmd` 字段）。
-    /// 如 `["KEY_Q"]`、`["S-KEY_LEFT"]`。
+    /// Input-side combo, **excluding Cmd** (see the `cmd` field).
+    /// e.g. `["KEY_Q"]`, `["S-KEY_LEFT"]`.
     pub keys: Vec<String>,
-    /// 本规则是否**要求按住 Cmd**。默认 `true`。
+    /// Whether this rule **requires holding Cmd**. Defaults to `true`.
     ///
-    /// 表内绝大多数行都是「Cmd+某键」，故默认要求 Cmd。
-    /// 少数不含 Cmd 的组合（如 macOS 的 `Option+Delete`）须显式写
-    /// `cmd = false`。
+    /// The vast majority of rows in the table are "Cmd+some key", so Cmd is
+    /// required by default. The few combos without Cmd (such as macOS's
+    /// `Option+Delete`) must explicitly write `cmd = false`.
     ///
-    /// **必须有这个区分**：查表对所有组合生效（否则非 Cmd 组合无法
-    /// 配置），若规则不再校验 Cmd 是否按住，则**裸按空格也会命中
-    /// `Cmd+空格` 那条规则**，直接触发 GNOME 概览。
+    /// **This distinction is essential**: the table lookup applies to all
+    /// combos (otherwise non-Cmd combos could not be configured), and if a rule
+    /// no longer checks whether Cmd is held, then **a bare space press would
+    /// also match the `Cmd+space` rule**, directly triggering the GNOME
+    /// overview.
     #[serde(default = "default_true")]
     pub cmd: bool,
-    /// 动作
+    /// Action
     #[serde(rename = "action")]
     pub act: Action,
-    /// 可选说明，仅供人阅读
+    /// Optional description, for human reading only
     #[serde(default)]
     pub desc: Option<String>,
 }
 
-/// 桌面环境类型。
+/// Desktop environment type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DesktopType {
-    /// GNOME / Mutter 系（含 ptyxis、GNOME 应用）
+    /// GNOME / Mutter family (including ptyxis and GNOME apps)
     #[default]
     Gnome,
     /// KDE Plasma
     Kde,
-    /// Sway、Hyprland、i3 等 WM，或其他无法查表的环境
+    /// WMs such as Sway, Hyprland, i3, or other environments that cannot be
+    /// looked up
     None,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DesktopConfig {
-    /// 桌面环境类型，决定 DE 相关规则的查表来源
+    /// Desktop environment type; determines the lookup source for DE-related
+    /// rules
     pub r#type: DesktopType,
-    /// 是否把 macOS 的 `Cmd+空格`（Spotlight）映射为桌面环境的概览。
+    /// Whether to map macOS's `Cmd+space` (Spotlight) to the desktop
+    /// environment's overview.
     ///
-    /// 默认开启。实现方式是**读取** DE 现有的绑定并发出同样的键，
-    /// 而不是改写绑定——因此不会在用户配置里留下任何记录，
-    /// 也不影响用户自己对该键的设置。
+    /// Enabled by default. The implementation **reads** the DE's existing
+    /// binding and emits the same keys rather than rewriting the binding—so it
+    /// leaves no record in the user config and does not affect the user's own
+    /// setting for that key.
     ///
-    /// 查不到对应动作时（如 DE 未提供概览）自动跳过，不视为错误。
+    /// When the corresponding action cannot be found (e.g. the DE provides no
+    /// overview), it is skipped automatically and not treated as an error.
     #[serde(default = "default_true")]
     pub spotlight: bool,
 }
 
-/// `#[serde(default)]` 用的真值常量——多数布尔配置项默认开启。
+/// The true-value constant used by `#[serde(default)]`—most boolean config
+/// items are enabled by default.
 ///
-/// 不能用 `true` 字面量：`Deserialize` 的 `default` 要求可调用。
+/// A `true` literal cannot be used: `Deserialize`'s `default` requires a
+/// callable.
 fn default_true() -> bool {
     true
 }
 
-/// Fn 键优先级模式。
+/// Fn key priority mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FnMode {
-    /// F 键优先，按住 Fn 出亮度/媒体键（同内核 fnmode=2）
+    /// F keys take priority; holding Fn produces brightness/media keys (same as
+    /// kernel fnmode=2)
     #[default]
     Fkeysfirst,
-    /// 媒体键优先，按住 Fn 出 F 键（同内核 fnmode=1）
+    /// Media keys take priority; holding Fn produces F keys (same as kernel
+    /// fnmode=1)
     Fkeyslast,
-    /// 不做转换
+    /// No conversion
     Disabled,
 }
 
-/// 完整配置。字段全部可选——不写即用内置默认值。
+/// Complete configuration. All fields are optional—omitting one uses the
+/// built-in default.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// 修饰键互换/替换。默认为 CapsLock ↔ 左 Ctrl 互换。
+    /// Modifier swap/replace. Defaults to the CapsLock ↔ Left Ctrl swap.
     ///
-    /// **不在规则表内**：它作用于按键本身而非组合，发生在组合判定之前。
+    /// **Not part of the rule table**: it acts on the key itself rather than a
+    /// combo, and happens before combo matching.
     pub remap: Vec<Remap>,
-    /// 映射规则表。**唯一的映射真源**——查表即遍历此列表。
+    /// Mapping rule table. **The single source of truth for mappings**—a lookup
+    /// just walks this list.
     ///
-    /// 查找顺序即声明顺序，首个命中者生效。用户配置在默认值之后追加，
-    /// 故用户条目天然优先。
+    /// Lookup order is declaration order, and the first match wins. The user
+    /// config is appended after the defaults, so user entries naturally take
+    /// priority.
     pub rules: Vec<Rule>,
-    /// Fn 键优先级。`None` 表示未指定，保留默认值。
+    /// Fn key priority. `None` means unspecified, keeping the default value.
     #[serde(default)]
     pub fn_mode: Option<FnMode>,
-    /// 桌面环境相关配置
+    /// Desktop-environment-related config
     pub desktop: DesktopConfig,
-    /// 「Ctrl 已被占用」的额外应用，Cmd 在其中映射为 Ctrl+Shift。
+    /// Extra apps where "Ctrl is already taken", and Cmd maps to Ctrl+Shift
+    /// within them.
     ///
-    /// 默认为空。**终端无需列举**——由 `.desktop` 条目的
-    /// `Categories=TerminalEmulator` 判定（见 `src/desktop.rs`），
-    /// 按 freedesktop 规范自动覆盖新装的终端。
+    /// Empty by default. **Terminals need not be listed**—they are decided by
+    /// the `.desktop` entry's `Categories=TerminalEmulator` (see
+    /// `src/desktop.rs`), automatically covering newly installed terminals per
+    /// the freedesktop spec.
     ///
-    /// 此项用于终端之外、Ctrl 有非标准含义的应用，如独立窗口的 gvim。
+    /// This item is for apps outside terminals where Ctrl has a non-standard
+    /// meaning, such as gvim in a standalone window.
     ///
-    /// 与规则表里的 `TerminalCtrlShift` 动作配合：命中此名单的应用，
-    /// 该动作才可能生效。
+    /// It works together with the `TerminalCtrlShift` action in the rule table:
+    /// the action can only take effect for apps that match this list.
     pub ctrl_busy_apps: Vec<String>,
 }
 
-/// 终端特化的**兜底**键集。
+/// The **fallback** key set for terminal specialization.
 ///
-/// 运行时优先从终端自己的 GSettings 查得实际绑定（`set_window_id`），
-/// 查不到才用这份名单——适用于不走 GSettings 的终端（kitty、wezterm）。
+/// At runtime the actual bindings are preferably looked up from the terminal's
+/// own GSettings (`set_window_id`), and this list is used only when that
+/// fails—it applies to terminals that do not go through GSettings (kitty,
+/// wezterm).
 ///
-/// 这份名单**必然不完整**：走 GSettings 的终端各自声明不同绑定，
-/// 例如 ptyxis 有 `new-window = Ctrl+Shift+N`，而 `N` 不在此列。
-/// 故表中另有一条 `keys = ["*"]` 的通配行承接运行时发现的键。
+/// This list is **necessarily incomplete**: terminals that go through GSettings
+/// each declare different bindings—for example ptyxis has
+/// `new-window = Ctrl+Shift+N`, and `N` is not in this list. So the table has a
+/// separate `keys = ["*"]` wildcard row to catch keys discovered at runtime.
 pub const DEFAULT_TERMINAL_SHIFT_KEYS: &[&str] = &[
-    "KEY_C",          // 复制
-    "KEY_V",          // 粘贴
-    "KEY_X",          // 剪切
-    "KEY_T",          // 新标签页
-    "KEY_W",          // 关标签页
-    "KEY_D",          // 水平分屏（部分终端）
-    "KEY_F",          // 查找（部分终端）
-    "KEY_S",          // 保存（部分终端）
-    "KEY_EQUAL",      // 放大字号
-    "KEY_MINUS",      // 缩小字号
-    "KEY_LEFTBRACE",  // 上一个标签页
-    "KEY_RIGHTBRACE", // 下一个标签页
+    "KEY_C",          // copy
+    "KEY_V",          // paste
+    "KEY_X",          // cut
+    "KEY_T",          // new tab
+    "KEY_W",          // close tab
+    "KEY_D",          // horizontal split (some terminals)
+    "KEY_F",          // find (some terminals)
+    "KEY_S",          // save (some terminals)
+    "KEY_EQUAL",      // increase font size
+    "KEY_MINUS",      // decrease font size
+    "KEY_LEFTBRACE",  // previous tab
+    "KEY_RIGHTBRACE", // next tab
 ];
 
-/// 会把 `Ctrl+Shift+C` 漏发成 SIGINT 的终端。
+/// Terminals that leak `Ctrl+Shift+C` as SIGINT.
 ///
-/// ptyxis 与 konsole 在**无选中文本**时把该组合穿透给子进程当作
-/// SIGINT——「复制」会杀掉正在跑的任务。wezterm、ghostty、
-/// gnome-terminal（VTE 系）无条件吞掉该组合，无此问题。
+/// ptyxis and konsole, when there is **no selected text**, pass this combo
+/// through to the child process as SIGINT—so "copy" kills the running task.
+/// wezterm, ghostty, and gnome-terminal (the VTE family) swallow the combo
+/// unconditionally and do not have this problem.
 ///
-/// 改用 `Ctrl+Insert`（X11 传统复制键）：终端均支持，且不会被当作
-/// 控制字符发给进程。判定依据是**行为差异**，不是应用名单——故此行
-/// 的 `apps` 只是「哪些终端有此行为」，换终端时按行为增删即可。
+/// Use `Ctrl+Insert` instead (the traditional X11 copy key): all terminals
+/// support it, and it is not sent to the process as a control character. The
+/// basis for the decision is the **behavioral difference**, not an app list—so
+/// the `apps` here are just "which terminals have this behavior"; when swapping
+/// terminals, add or remove by behavior.
 const SIGINT_LEAKY_TERMINALS: &[&str] = &["org.gnome.Ptyxis", "org.gnome.konsole", "konsole"];
 
-/// 内置默认规则表。
+/// The built-in default rule table.
 ///
-/// **这是唯一的映射真源**——用户配置在其之上追加（后者优先命中）。
-/// 完整设计见 `docs/table-driven-design.md`。
+/// **This is the single source of truth for mappings**—the user config is
+/// appended on top of it (later entries win).
+/// For the full design see `docs/table-driven-design.md`.
 fn default_rules() -> Vec<Rule> {
     let mut v: Vec<Rule> = Vec::new();
 
@@ -265,29 +306,32 @@ fn default_rules() -> Vec<Rule> {
         });
     };
 
-    // ── 光标移动（macOS 用 Cmd/Option，Linux 用 Ctrl/Alt）──
-    push_emit(&[], "KEY_LEFT", "C", "Left", "行首 (Cmd+←)");
-    push_emit(&[], "KEY_RIGHT", "C", "Right", "行尾 (Cmd+→)");
-    push_emit(&[], "KEY_UP", "C", "Up", "文稿开头 (Cmd+↑)");
-    push_emit(&[], "KEY_DOWN", "C", "Down", "文稿末尾 (Cmd+↓)");
-    push_emit(&[], "S-KEY_LEFT", "C-S", "Left", "选中到行首");
-    push_emit(&[], "S-KEY_RIGHT", "C-S", "Right", "选中到行尾");
-    push_emit(&[], "S-KEY_UP", "C-S", "Up", "选中到文稿开头");
-    push_emit(&[], "S-KEY_DOWN", "C-S", "Down", "选中到文稿末尾");
-    push_emit(&[], "A-KEY_LEFT", "A", "Left", "上一词 (Option+←)");
-    push_emit(&[], "A-KEY_RIGHT", "A", "Right", "下一词 (Option+→)");
-    // ── 访达导航（Cmd+[ / Cmd+]）──
-    push_emit(&[], "KEY_LEFTBRACE", "A", "Left", "上一文件夹 (Cmd+[)");
-    push_emit(&[], "KEY_RIGHTBRACE", "A", "Right", "下一文件夹 (Cmd+])");
-    // ── 删除 ──
-    // ── 窗口管理 ──
-    // 跨应用的全局规则，故不受终端特化影响。
-    // macOS 的 Cmd+Q 是「退出应用」，Linux 侧最接近的通用绑定是
-    // Alt+F4（GNOME 的 wm.keybindings close）。Toshy 用的是同一条。
-    push_emit(&[], "KEY_Q", "A", "KEY_F4", "退出应用 (Cmd+Q → Alt+F4)");
+    // ── Cursor movement (macOS uses Cmd/Option, Linux uses Ctrl/Alt) ──
+    push_emit(&[], "KEY_LEFT", "C", "Left", "start of line (Cmd+←)");
+    push_emit(&[], "KEY_RIGHT", "C", "Right", "end of line (Cmd+→)");
+    push_emit(&[], "KEY_UP", "C", "Up", "start of document (Cmd+↑)");
+    push_emit(&[], "KEY_DOWN", "C", "Down", "end of document (Cmd+↓)");
+    push_emit(&[], "S-KEY_LEFT", "C-S", "Left", "select to start of line");
+    push_emit(&[], "S-KEY_RIGHT", "C-S", "Right", "select to end of line");
+    push_emit(&[], "S-KEY_UP", "C-S", "Up", "select to start of document");
+    push_emit(&[], "S-KEY_DOWN", "C-S", "Down", "select to end of document");
+    push_emit(&[], "A-KEY_LEFT", "A", "Left", "previous word (Option+←)");
+    push_emit(&[], "A-KEY_RIGHT", "A", "Right", "next word (Option+→)");
+    // ── Finder navigation (Cmd+[ / Cmd+]) ──
+    push_emit(&[], "KEY_LEFTBRACE", "A", "Left", "previous folder (Cmd+[)");
+    push_emit(&[], "KEY_RIGHTBRACE", "A", "Right", "next folder (Cmd+])");
+    // ── Delete ──
+    // ── Window management ──
+    // A cross-app global rule, so it is not affected by terminal
+    // specialization.
+    // macOS's Cmd+Q is "quit app"; the closest generic binding on Linux is
+    // Alt+F4 (GNOME's wm.keybindings close). Toshy uses the same one.
+    push_emit(&[], "KEY_Q", "A", "KEY_F4", "quit app (Cmd+Q → Alt+F4)");
 
-    // ── 桌面环境功能：读 DE 现有绑定后发出同样的键 ──
-    // 放在末尾：它按主键（空格）匹配，不该被上面的行抢走。
+    // ── Desktop environment features: read the DE's existing binding and emit
+    // the same keys ──
+    // Placed last: it matches by main key (space) and should not be stolen by
+    // the rows above.
     v.push(Rule {
         apps: vec![],
         keys: vec!["KEY_SPACE".into()],
@@ -295,20 +339,24 @@ fn default_rules() -> Vec<Rule> {
         act: Action::DeAccel {
             feature: "overview".into(),
         },
-        desc: Some("Cmd+空格 → 概览（读 DE 现有绑定）".into()),
+        desc: Some("Cmd+space → overview (read DE's existing binding)".into()),
     });
 
-    // ── Ctrl+Cmd 组合：macOS 上有独立含义，不可由默认语义推导 ──
+    // ── Ctrl+Cmd combos: they have a distinct meaning on macOS and cannot be
+    // derived from the default semantics ──
     //
-    // 前提是「Cmd 映射为 Ctrl」。用户已按住 Ctrl 时，Cmd 再变 Ctrl 就是
-    // Ctrl+Ctrl ——同一槽位，组合退化，故此类组合**不能**转换。
-    // 但也不能当 Cmd+X 处理（见 `default_semantics` 的说明）。
-    // 表里有的按表走，没有的原样放行。
+    // The premise is "Cmd maps to Ctrl". When the user is already holding Ctrl,
+    // turning Cmd into Ctrl yields Ctrl+Ctrl—the same slot, a degenerate
+    // combo—so such combos **cannot** be converted. Nor can they be treated as
+    // Cmd+X (see the note on `default_semantics`). If the table has an entry,
+    // follow the table; otherwise pass through unchanged.
     //
-    // 放在全局规则之后、`*` 通配之前：优先级高于终端特化。
+    // Placed after the global rules and before the `*` wildcard: priority above
+    // terminal specialization.
     //
-    // Ctrl+Cmd+Q 锁屏：读 GNOME 现有的 screensaver 绑定（本机 Super+l），
-    // 与 Cmd+空格 → 概览同一路子——不改写用户配置。
+    // Ctrl+Cmd+Q lock screen: read GNOME's existing screensaver binding (on
+    // this machine Super+l), the same approach as Cmd+space → overview—without
+    // rewriting the user config.
     v.push(Rule {
         apps: vec![],
         keys: vec!["C-KEY_Q".into()],
@@ -316,12 +364,13 @@ fn default_rules() -> Vec<Rule> {
         act: Action::DeAccel {
             feature: "lock-screen".into(),
         },
-        desc: Some("锁屏（Ctrl+Cmd+Q，读 DE 现有绑定）".into()),
+        desc: Some("lock screen (Ctrl+Cmd+Q, read DE's existing binding)".into()),
     });
 
-    // Ctrl+Cmd+F 全屏：应用级全屏的标准键。
-    // GNOME 的 toggle-fullscreen 动作存在但默认未绑定（@as []），
-    // 故直接发 F11，无需改写用户设置。
+    // Ctrl+Cmd+F fullscreen: the standard app-level fullscreen key.
+    // GNOME's toggle-fullscreen action exists but is unbound by default
+    // (@as []), so emit F11 directly, with no need to rewrite the user
+    // settings.
     v.push(Rule {
         apps: vec![],
         keys: vec!["C-KEY_F".into()],
@@ -330,36 +379,40 @@ fn default_rules() -> Vec<Rule> {
             mods: vec![],
             key: "KEY_F11".into(),
         },
-        desc: Some("全屏 (Ctrl+Cmd+F → F11)".into()),
+        desc: Some("fullscreen (Ctrl+Cmd+F → F11)".into()),
     });
 
-    // ── 截图：对应 macOS 的 Cmd+Shift+3/4/5 ──
+    // ── Screenshot: corresponds to macOS's Cmd+Shift+3/4/5 ──
     //
-    // 读 GNOME 现有绑定后发出同样的键，不改写用户配置。
+    // Read GNOME's existing binding and emit the same keys, without rewriting
+    // the user config.
     //
-    // **与直觉相反的一点**（实测）：GNOME 的
-    //   screenshot        (Shift+Print) = **直接截全屏**，不弹界面
-    //   show-screenshot-ui(Print)       = **弹出截图界面**
-    // 而 macOS 是 Cmd+Shift+3 直接截全屏、Cmd+Shift+4/5 进选择模式。
-    // 故按功能对齐，3 对「直接截」、4/5 对「界面」：
-    //   Cmd+Shift+3 → screenshot          直接截全屏
-    //   Cmd+Shift+4 → show-screenshot-ui  截图界面（选区/窗口在其中选）
-    //   Cmd+Shift+5 → show-screenshot-ui  同上
+    // **One counter-intuitive point** (measured): GNOME's
+    //   screenshot        (Shift+Print) = **captures full screen directly**, no UI
+    //   show-screenshot-ui(Print)       = **pops up the screenshot UI**
+    // whereas macOS is Cmd+Shift+3 for a direct full-screen capture and
+    // Cmd+Shift+4/5 for selection mode. So align by function: 3 to "direct
+    // capture", 4/5 to "UI":
+    //   Cmd+Shift+3 → screenshot          direct full-screen capture
+    //   Cmd+Shift+4 → show-screenshot-ui  screenshot UI (pick region/window in it)
+    //   Cmd+Shift+5 → show-screenshot-ui  same as above
     //
-    // 4 与 5 行为相同是妥协：GNOME 只有三个截图动作，其中
-    // `screenshot` 与 `screenshot-window` 实测都直接截全屏，
-    // 无法据此区分选区与窗口。选区/窗口仍可在界面里选到。
+    // 4 and 5 behaving the same is a compromise: GNOME has only three
+    // screenshot actions, of which `screenshot` and `screenshot-window` were
+    // both measured to capture the full screen directly, so region and window
+    // cannot be distinguished from them. Region/window can still be selected in
+    // the UI.
     for (keys, feature, desc) in [
-        ("S-KEY_3", "screenshot", "截全屏 (Cmd+Shift+3，直接截不弹界面)"),
+        ("S-KEY_3", "screenshot", "full-screen capture (Cmd+Shift+3, capture directly without UI)"),
         (
             "S-KEY_4",
             "screenshot-ui",
-            "截图界面 (Cmd+Shift+4，选区/窗口在其中选)",
+            "screenshot UI (Cmd+Shift+4, pick region/window in it)",
         ),
         (
             "S-KEY_5",
             "screenshot-ui",
-            "截图界面 (Cmd+Shift+5，同上)",
+            "screenshot UI (Cmd+Shift+5, same as above)",
         ),
     ] {
         v.push(Rule {
@@ -373,24 +426,25 @@ fn default_rules() -> Vec<Rule> {
         });
     }
 
-    // ── Ctrl+↑ 调度中心 → GNOME 概览 ──
+    // ── Ctrl+↑ Mission Control → GNOME overview ──
     //
-    // 与 `Cmd+空格` 是同一个动作，只是触发键不同。
+    // The same action as `Cmd+space`, just triggered by a different key.
     v.push(Rule {
         apps: vec![],
         keys: vec!["C-KEY_UP".into()],
-        // Ctrl+↑ 不含 Cmd——标成 true 会导致规则永不命中
+        // Ctrl+↑ does not include Cmd—marking it true would make the rule never match
         cmd: false,
         act: Action::DeAccel {
             feature: "overview".into(),
         },
-        desc: Some("调度中心 (Ctrl+↑ → 概览)".into()),
+        desc: Some("Mission Control (Ctrl+↑ → overview)".into()),
     });
 
-    // ── Shift+Cmd+Q 退出登录 ──
+    // ── Shift+Cmd+Q log out ──
     //
-    // GNOME 的 logout 绑在 media-keys 的 `logout`（本机 Ctrl+Alt+Delete），
-    // 与锁屏同一 schema。同样读现有绑定发出，不改写用户设置。
+    // GNOME's logout is bound to media-keys' `logout` (on this machine
+    // Ctrl+Alt+Delete), the same schema as lock screen. Also read the existing
+    // binding and emit it, without rewriting the user settings.
     v.push(Rule {
         apps: vec![],
         keys: vec!["S-KEY_Q".into()],
@@ -398,30 +452,35 @@ fn default_rules() -> Vec<Rule> {
         act: Action::DeAccel {
             feature: "logout".into(),
         },
-        desc: Some("退出登录 (Shift+Cmd+Q，读 DE 现有绑定)".into()),
+        desc: Some("log out (Shift+Cmd+Q, read DE's existing binding)".into()),
     });
 
-    // ── 删除类：macOS 的 "Delete" 键 = 其他键盘的 Backspace(⌫) ──
+    // ── Delete family: macOS's "Delete" key = other keyboards' Backspace(⌫) ──
     //
-    // macOS 把退格键叫 Delete，把向前删除键（MacBook 上不存在）叫
-    // Forward Delete。日常说的「Cmd+Delete 移到废纸篓」按的就是 ⌫。
+    // macOS calls the backspace key Delete and calls the forward-delete key
+    // (which does not exist on MacBooks) Forward Delete. The everyday phrase
+    // "Cmd+Delete moves to trash" refers to ⌫.
     //
-    // evdev 里 ⌫ 是 `KEY_BACKSPACE`、向前删除是 `KEY_DELETE`——两者
-    // 不同键。本机（MacBook 键盘）只产生前者，外接键盘才有后者。
-    // 故每个组合都写两条规则，否则在本机上完全失效
-    //（曾因只写 KEY_DELETE 导致全部删除类规则形同虚设）。
+    // In evdev ⌫ is `KEY_BACKSPACE` and forward delete is `KEY_DELETE`—they are
+    // different keys. On this machine (MacBook keyboard) only the former is
+    // produced; an external keyboard is needed for the latter. So every combo
+    // is written as two rules, otherwise it would fail entirely on this machine
+    // (previously only KEY_DELETE was written, making all delete-family rules
+    // useless).
 
-/// 需要同时覆盖的两个删除键。
+/// The two delete keys that need to be covered together.
 const DELETE_KEYS: &[&str] = &["KEY_BACKSPACE", "KEY_DELETE"];
 
 for key in DELETE_KEYS {
-    // Cmd+Delete → 移到废纸篓
+    // Cmd+Delete → move to trash
     //
-    // 发**裸 Delete**（不带 Ctrl）：GNOME 文件管理器把「移到回收站」
-    // 绑在 Delete 键上；Ctrl+Delete 在 GTK 文本控件里是「删下一个词」，
-    // 在文件管理器里也不是回收站。此前误加 Ctrl 导致完全不生效。
+    // Emit a **bare Delete** (without Ctrl): GNOME's file manager binds "move
+    // to trash" to the Delete key; Ctrl+Delete is "delete next word" in GTK
+    // text widgets, and is not trash in the file manager either. Adding Ctrl
+    // before made it not work at all.
     //
-    // 虚拟键盘能发出本机不存在的键码（MacBook 无 ⌦ 键），故可行。
+    // The virtual keyboard can emit keycodes absent on this machine (MacBooks
+    // have no ⌦ key), so this is feasible.
     v.push(Rule {
         apps: vec![],
         keys: vec![(*key).to_string()],
@@ -431,14 +490,15 @@ for key in DELETE_KEYS {
             key: "KEY_DELETE".into(),
         },
         desc: Some(format!(
-            "移到废纸篓 (Cmd+Delete → Delete，不带 Ctrl；key={key})"
+            "move to trash (Cmd+Delete → Delete, without Ctrl; key={key})"
         )),
     });
 
-    // Option+Delete → 删除左边字词
+    // Option+Delete → delete the word to the left
     //
-    // 用 Ctrl+Backspace 而非透传 Alt+Backspace：前者是 X11/GNOME 惯例，
-    // 在编辑器、终端、地址栏里都一致生效。
+    // Use Ctrl+Backspace rather than passing through Alt+Backspace: the former
+    // is the X11/GNOME convention and works consistently in editors, terminals,
+    // and address bars.
     v.push(Rule {
         apps: vec![],
         keys: vec![format!("A-{key}")],
@@ -448,29 +508,33 @@ for key in DELETE_KEYS {
             key: "KEY_BACKSPACE".into(),
         },
         desc: Some(format!(
-            "删除左边字词 (Option+Delete → Ctrl+Backspace，key={key})"
+            "delete word to the left (Option+Delete → Ctrl+Backspace, key={key})"
         )),
     });
 
-    // Shift+Cmd+Delete / Option+Shift+Cmd+Delete → 清倒废纸篓
+    // Shift+Cmd+Delete / Option+Shift+Cmd+Delete → empty trash
     //
-    // **限定在 Nautilus**：macOS 上这两个是 Finder 的菜单项
-    // （桌面也归 Finder 管），并非系统级快捷键——在终端、浏览器、
-    // 文本框里按没有意义。
+    // **Scoped to Nautilus**: on macOS these two are Finder menu items (the
+    // desktop is also Finder's domain) and not system-level shortcuts—pressing
+    // them in a terminal, browser, or text box is meaningless.
     //
-    // 全局绑定有两个实际风险：终端恰恰是删除操作最容易出事的场景，
-    // 而写密码时误按会直接弹确认框。限定后误按在那些地方毫无反应。
-    // 两个键在 macOS 上语义不同，本工具照搬：
-    //   Shift+Cmd+Delete        清倒废纸篓，**有确认**
-    //   Option+Shift+Cmd+Delete 清倒废纸篓，**免确认**（Option 即跳过确认）
+    // A global binding has two real risks: terminals are precisely where delete
+    // operations go wrong most easily, and an accidental press while typing a
+    // password would pop up the confirmation dialog directly. Once scoped, an
+    // accidental press there does nothing at all.
+    // The two keys have different meanings on macOS, and this tool copies that:
+    //   Shift+Cmd+Delete        empty trash, **with confirmation**
+    //   Option+Shift+Cmd+Delete empty trash, **no confirmation** (Option skips it)
     //
-    // 免确认之所以敢做，是因为规则已限定在 Nautilus 内——
-    // 全局绑定时绝不能免确认（误按即永久删除），限定后风险可控。
+    // The reason no-confirmation is dared here is that the rule is already
+    // scoped to Nautilus—a global binding must never skip confirmation (an
+    // accidental press means permanent deletion), but once scoped the risk is
+    // manageable.
     for (mods, desc, confirm) in [
-        (vec!["S".to_string()], "清倒废纸篓 (Shift+Cmd+Delete)", true),
+        (vec!["S".to_string()], "empty trash (Shift+Cmd+Delete)", true),
         (
             vec!["A".to_string(), "S".to_string()],
-            "清倒废纸篓 (Option+Shift+Cmd+Delete，免确认)",
+            "empty trash (Option+Shift+Cmd+Delete, no confirmation)",
             false,
         ),
     ] {
@@ -482,17 +546,18 @@ for key in DELETE_KEYS {
                 program: "gio".into(),
                 args: vec!["trash".into(), "--empty".into(), "--force".into()],
                 confirm,
-                prompt: Some("确定要永久抹掉回收站中的项目吗？".into()),
-                ok_label: Some("清倒回收站".into()),
+                prompt: Some("Are you sure you want to permanently delete the items in the trash?".into()),
+                ok_label: Some("Empty Trash".into()),
             },
-            desc: Some(format!("{desc}，key={key}")),
+            desc: Some(format!("{desc}, key={key}")),
         });
     }
 }
 
-    // ── 会漏发 SIGINT 的终端：复制键改走 Ctrl+Insert ──
-    // 必须放在终端特化**之前**——查找取首个命中者，若在其后，
-    // 通用终端规则会先命中，本条永不生效。
+    // ── Terminals that leak SIGINT: copy key goes through Ctrl+Insert ──
+    // Must be placed **before** terminal specialization—the lookup takes the
+    // first match, and if it were after, the generic terminal rule would match
+    // first and this one would never take effect.
     v.push(Rule {
         apps: SIGINT_LEAKY_TERMINALS.iter().map(|s| s.to_string()).collect(),
         keys: vec!["KEY_C".into()],
@@ -502,77 +567,84 @@ for key in DELETE_KEYS {
             key: "KEY_INSERT".into(),
         },
         desc: Some(
-            "改用 Ctrl+Insert 复制：ptyxis/konsole 在无选中文本时会把 \
-             Ctrl+Shift+C 当作 SIGINT 漏给进程"
+            "use Ctrl+Insert for copy: with no selected text ptyxis/konsole \
+             leak Ctrl+Shift+C to the process as SIGINT"
                 .into(),
         ),
     });
 
-    // ── GVIM：Ctrl 已被占用（Ctrl+V 块选择、Ctrl+C 退出）──
-    // 终端里跑的 vim 其窗口属于终端，已被 TerminalEmulator 覆盖；
-    // 此处针对独立窗口的 gvim。同样须在通用终端规则之前。
+    // ── GVIM: Ctrl is already taken (Ctrl+V block select, Ctrl+C quit) ──
+    // vim running in a terminal has a window belonging to the terminal, already
+    // covered by TerminalEmulator; this targets gvim in a standalone window.
+    // Likewise it must come before the generic terminal rule.
     for key in DEFAULT_TERMINAL_SHIFT_KEYS {
         v.push(Rule {
             apps: vec!["gvim".into()],
             keys: vec![(*key).to_string()],
             cmd: true,
             act: Action::TerminalCtrlShift,
-            desc: Some("GVIM 特化：Ctrl 已被占用".into()),
+            desc: Some("GVIM specialization: Ctrl is already taken".into()),
         });
     }
 
-    // ── 终端特化 ──
-    // 命中条件是「终端自己绑定了该键」，故为条件动作。
+    // ── Terminal specialization ──
+    // The match condition is "the terminal itself bound this key", so it is a
+    // conditional action.
     //
-    // 放在最后：更具体的应用规则（上方）须先于它命中。
+    // Placed last: the more specific app rules (above) must match before it.
     //
-    // 注意 `Cmd+Q` 不在此列：它是 Alt+F4，已被全局规则覆盖。若在此
-    // 列出，Cmd+Q 会变成 Ctrl+Shift+Q——一个谁也不认的组合。
+    // Note that `Cmd+Q` is not in this list: it is Alt+F4, already covered by
+    // the global rule. If listed here, Cmd+Q would become Ctrl+Shift+Q—a combo
+    // no one recognizes.
     //
-    // 用 `keys = ["*"]` 通配而非逐键列举：终端的绑定是**运行时**从
-    // GSettings 查得的，各终端不同（ptyxis 有 `new-window=Ctrl+Shift+N`，
-    // 而 N 不在任何静态名单里）。逐键列举只能覆盖兜底名单，
-    // 运行时发现的键将无处安放——这正是 commit 18c03a2 之前的缺陷。
-    // 通配行承接全部，具体哪些键生效由动作在运行时判定。
+    // Use the `keys = ["*"]` wildcard rather than listing keys one by one: the
+    // terminal's bindings are obtained **at runtime** from GSettings and differ
+    // per terminal (ptyxis has `new-window=Ctrl+Shift+N`, and N is not in any
+    // static list). Listing keys one by one could only cover the fallback list,
+    // leaving runtime-discovered keys nowhere to go—exactly the defect before
+    // commit 18c03a2. The wildcard row catches everything, and which keys
+    // actually take effect is decided by the action at runtime.
     v.push(Rule {
         apps: vec!["TerminalEmulator".into()],
         keys: vec!["*".into()],
         cmd: true,
         act: Action::TerminalCtrlShift,
-        desc: Some("终端特化：终端自己绑定了该键时才加 Shift".into()),
+        desc: Some("terminal specialization: add Shift only when the terminal itself bound this key".into()),
     });
 
     v
 }
 
-/// 「Ctrl 已被占用」的应用：终端之外的特例。
+/// "Ctrl is already taken" apps: special cases outside terminals.
 ///
-/// 终端无需列举——由 `src/desktop.rs` 按 freedesktop 规范的
-/// `Categories=TerminalEmulator` 判定，装了新终端自动生效。
+/// Terminals need not be listed—they are decided by `src/desktop.rs` via the
+/// freedesktop spec's `Categories=TerminalEmulator`, automatically covering a
+/// newly installed terminal.
 ///
-/// 曾在此硬编码 14 个终端，结果 ptyxis 漏判：名单写的是小写
-/// `ptyxis`，实际 wm_class 是 `org.gnome.Ptyxis`。
+/// 14 terminals were once hard-coded here, and ptyxis was missed: the list
+/// wrote the lowercase `ptyxis`, but the actual wm_class is `org.gnome.Ptyxis`.
 const DEFAULT_CTRL_BUSY_APPS: &[&str] = &[
-    // GVIM：Ctrl+C 退出、Ctrl+V 块选择、Ctrl+D 半选。
-    // 注意终端里跑的 vim 其窗口属于终端，已被 TerminalEmulator 覆盖；
-    // 此处针对独立窗口的 gvim。
+    // GVIM: Ctrl+C quit, Ctrl+V block select, Ctrl+D half-select.
+    // Note that vim running in a terminal has a window belonging to the
+    // terminal, already covered by TerminalEmulator; this targets gvim in a
+    // standalone window.
     "gvim",
 ];
 
 impl Config {
-    /// 内置默认配置。用户配置在此基础上叠加。
+    /// Built-in default config. The user config is layered on top of it.
     pub fn with_defaults() -> Self {
         Config {
             remap: vec![
                 Remap {
                     from: "KEY_CAPSLOCK".into(),
                     to: "KEY_LEFTCTRL".into(),
-                    desc: Some("CapsLock → 左 Ctrl".into()),
+                    desc: Some("CapsLock → Left Ctrl".into()),
                 },
                 Remap {
                     from: "KEY_LEFTCTRL".into(),
                     to: "KEY_CAPSLOCK".into(),
-                    desc: Some("左 Ctrl → CapsLock（与上条成对互换）".into()),
+                    desc: Some("Left Ctrl → CapsLock (paired swap with the entry above)".into()),
                 },
             ],
             rules: default_rules(),
@@ -589,9 +661,11 @@ impl Config {
     }
 }
 
-/// 读入并合并系统级与用户级配置，用户级覆盖系统级。
+/// Read and merge the system-level and user-level config; user-level overrides
+/// system-level.
 ///
-/// 从内置默认值开始。没有任何配置文件时，返回完整的默认映射。
+/// Starts from the built-in defaults. When there is no config file at all, the
+/// full default mapping is returned.
 pub fn load() -> Result<Config, ConfigError> {
     let mut cfg = Config::with_defaults();
 
@@ -603,13 +677,13 @@ pub fn load() -> Result<Config, ConfigError> {
             .map_err(|e| ConfigError::Read(path.clone(), e))?;
         let loaded: Config = toml::from_str(&text)
             .map_err(|e| ConfigError::Parse(path.clone(), e))?;
-        // 后读到的覆盖先读到的：用户级在列表末尾
+        // Later reads override earlier ones: user-level is at the end of the list
         cfg.merge(loaded);
     }
     Ok(cfg)
 }
 
-/// 按优先级顺序列出候选配置路径（后者覆盖前者）。
+/// List candidate config paths in priority order (later overrides earlier).
 pub fn candidate_paths() -> Vec<PathBuf> {
     let mut v = Vec::new();
     if let Ok(p) = std::env::var("MACKBIND_CONFIG") {
@@ -622,11 +696,11 @@ pub fn candidate_paths() -> Vec<PathBuf> {
     v
 }
 
-/// 合并用户配置到默认配置之上。
+/// Merge the user config on top of the default config.
 ///
-/// `rules` / `remap` / `ctrl_busy_apps` 采用**追加**——用户条目在默认
-/// 之后，而查找取**首个命中者**，故用户条目天然优先。
-/// `fn_mode` 采用**替换**。
+/// `rules` / `remap` / `ctrl_busy_apps` use **append**—user entries come after
+/// the defaults, and lookup takes the **first match**, so user entries
+/// naturally take priority. `fn_mode` uses **replace**.
 impl Config {
     fn merge(&mut self, other: Config) {
         self.remap.extend(other.remap);
@@ -637,10 +711,10 @@ impl Config {
         }
     }
 
-    /// 人类可读的摘要，用于启动日志。
+    /// Human-readable summary, used for the startup log.
     pub fn summary(&self) -> String {
         format!(
-            "{} 条 remap, {} 条规则, DE={:?}, {} 个 Ctrl 占用应用",
+            "{} remaps, {} rules, DE={:?}, {} Ctrl-busy apps",
             self.remap.len(),
             self.rules.len(),
             self.desktop.r#type,
@@ -658,8 +732,8 @@ pub enum ConfigError {
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConfigError::Read(p, e) => write!(f, "读取配置 {} 失败: {e}", p.display()),
-            ConfigError::Parse(p, e) => write!(f, "解析配置 {} 失败: {e}", p.display()),
+            ConfigError::Read(p, e) => write!(f, "failed to read config {}: {e}", p.display()),
+            ConfigError::Parse(p, e) => write!(f, "failed to parse config {}: {e}", p.display()),
         }
     }
 }

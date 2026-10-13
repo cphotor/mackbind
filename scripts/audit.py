@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-"""核对 docs/macos-shortcuts.md 与 src/ 中实际实现的映射规则。
+"""Cross-check docs/macos-shortcuts.md against the mapping rules actually
+implemented in src/.
 
-背景：本项目的文档与实现曾多次脱节——文档声称「已实现」而代码里
-并无对应规则。两者的成因相同：靠人读文档核对，而不是机器求差集。
-本脚本把两边都规范化成同一种组合表示，直接算差集。
+Background: this project's docs and implementation have drifted apart several
+times -- the docs claimed a rule was "implemented" while the code had no such
+rule. Both cases share the same cause: checking by reading the docs by hand
+instead of computing the difference by machine. This script normalizes both
+sides into the same combo representation and computes the difference directly.
 
-用法：
-    python3 scripts/audit.py            # 报告差异，退出码 0
-    python3 scripts/audit.py --strict   # 有未实现项时退出码 1（供 CI 用）
+Usage:
+    python3 scripts/audit.py            # report differences, exit code 0
+    python3 scripts/audit.py --strict   # exit code 1 on any unimplemented item (for CI)
 
-两侧的规范化表示
-----------------
-文档侧 `Cmd+Shift+←`      → `S-KEY_LEFT`
-代码侧 `"S-KEY_LEFT"`     → `S-KEY_LEFT`
+Normalized representation on both sides
+---------------------------------------
+Doc side `Cmd+Shift+←`      → `S-KEY_LEFT`
+Code side `"S-KEY_LEFT"`    → `S-KEY_LEFT`
 
-Cmd 键在内部表示里是隐含的——按下 Meta 本身不输出任何事件，只有
-「Meta + 某个主键 + 某些修饰键」的组合才会命中规则。因此文档里的
-`Cmd` 不参与编码，其余修饰键照常编码（Shift→S、Option→A、Ctrl→C）。
+The Cmd key is implicit in the internal representation -- pressing Meta itself
+emits no event; only a combo of "Meta + some main key + some modifiers" matches
+a rule. So `Cmd` in the docs is not encoded, while the other modifiers are
+encoded as usual (Shift→S, Option→A, Ctrl→C).
 """
 
 from __future__ import annotations
@@ -30,8 +34,8 @@ DOC = ROOT / "docs" / "macos-shortcuts.md"
 CONFIG_RS = ROOT / "src" / "config.rs"
 MAPPER_RS = ROOT / "src" / "mapper.rs"
 
-# ── 键名映射 ──────────────────────────────────────────────────────────
-# 文档里的写法 → evdev 键名主干（不带 KEY_ 前缀）
+# ── Key-name mapping ──────────────────────────────────────────────────
+# Doc spelling → evdev key-name stem (without the KEY_ prefix)
 
 SPECIAL_KEYS = {
     "←": "LEFT",
@@ -68,7 +72,8 @@ SPECIAL_KEYS = {
     "Print": "SYSRQ",
 }
 
-# 修饰键 → 内部缩写。注意没有 Cmd/M：它被当作隐含项，见模块 docstring。
+# Modifier → internal abbreviation. Note there is no Cmd/M: it is treated as
+# implicit, see the module docstring.
 MOD_ABBREV = {
     "Shift": "S",
     "Option": "A",
@@ -79,14 +84,15 @@ MOD_ABBREV = {
 
 
 def encode_key(token: str) -> str | None:
-    """单个键 token → 键名主干。未知返回 None。"""
+    """A single key token → key-name stem. Returns None for unknown tokens."""
     token = token.strip()
     if not token:
         return None
     if token in SPECIAL_KEYS:
         return SPECIAL_KEYS[token]
-    # 亮度/音量/调度中心等键在 Linux 侧无独立键码，不参与比对
-    if "亮度" in token or "音量" in token or "调度中心" in token:
+    # Keys like brightness/volume/dashboard have no dedicated keycode on Linux,
+    # so they are not compared.
+    if "Brightness" in token or "Volume" in token or "Dashboard" in token:
         return None
     if re.fullmatch(r"[A-Za-z]", token):
         return token.upper()
@@ -98,10 +104,11 @@ def encode_key(token: str) -> str | None:
 
 
 def encode_combo(combo: str) -> list[str]:
-    """`Cmd+Shift+←` → ['S-KEY_LEFT']。
+    """`Cmd+Shift+←` → ['S-KEY_LEFT'].
 
-    处理 `/` 交替（`Cmd+←/→` → 左右两键）与 `3/4/5` 这类数字并列。
-    修饰键前缀在交替时共享。无法编码的返回空列表。
+    Handles `/` alternation (`Cmd+←/→` → both left and right) and numeric lists
+    such as `3/4/5`. Modifier prefixes are shared across the alternation. Returns
+    an empty list when it cannot encode.
     """
     combo = combo.strip().strip("`")
     if not combo:
@@ -114,7 +121,7 @@ def encode_combo(combo: str) -> list[str]:
     main = parts[-1]
     mods = parts[:-1]
 
-    # `Cmd+Shift+3/4/5` → 主键有多个候选
+    # `Cmd+Shift+3/4/5` → several candidate main keys
     candidates = [main]
     if "/" in main:
         head, *rest = main.split("/")
@@ -130,9 +137,9 @@ def encode_combo(combo: str) -> list[str]:
         unsupported = False
         for m in mods:
             if m in ("Cmd", "Command", "Super", "Meta"):
-                continue  # 隐含，不编码
+                continue  # implicit, not encoded
             if m == "Fn":
-                unsupported = True  # Fn 走单独的键位切换层
+                unsupported = True  # Fn goes through a separate key-stage layer
                 break
             if m in MOD_ABBREV:
                 modset.append(MOD_ABBREV[m])
@@ -148,7 +155,7 @@ def encode_combo(combo: str) -> list[str]:
 
 
 def _has_cmd(raw_combos: list[str]) -> bool:
-    """该行是否含 Cmd——默认语义只对 Cmd 组合生效。"""
+    """Whether the row contains Cmd -- the default semantics only apply to Cmd combos."""
     return any(
         m in ("Cmd", "Command", "Super", "Meta")
         for combo in raw_combos
@@ -157,12 +164,13 @@ def _has_cmd(raw_combos: list[str]) -> bool:
 
 
 def norm_target(target: str) -> str:
-    """把文档里的目标写法归一化成 `Ctrl+LEFT` 形式。
+    """Normalize a doc target spelling into the `Ctrl+LEFT` form.
 
-    目标列的写法比组合列松散：可能是 `Ctrl+←/→`（含交替）、
-    `Ctrl+B/I/U`（多主键并列）、也可能带反引号。这里统一成
-    「修饰键+主键」的单键字符串，多主键时返回全部可能值的 joined
-    形式由调用方比较——实践中带 `/` 的目标两边都会展开。
+    The target column is looser than the combo column: it may be `Ctrl+←/→`
+    (with alternation), `Ctrl+B/I/U` (several main keys in parallel), or carry
+    backticks. Here we unify it into a single "modifiers+main key" string; when
+    several main keys are present, the caller compares the joined form of all
+    candidates -- in practice a target containing `/` is expanded on both sides.
     """
     t = target.strip().strip("`").strip()
     if "/" in t:
@@ -185,16 +193,18 @@ def norm_target(target: str) -> str:
     return "+".join(out + [key])
 
 
-# ── 解析文档 ──────────────────────────────────────────────────────────
+# ── Parse the docs ────────────────────────────────────────────────────
 
-# 分类含义见 docs/macos-shortcuts.md「判定分类」
-# A: 默认语义覆盖；C: 终端特化；D: 需显式规则；E: 主动实现
-# F: 概念不存在；B: Super 相关（暂缓）；其余（应用处理等）不比对
+# For the meaning of the classes see docs/macos-shortcuts.md "Classification".
+# A: covered by default semantics; C: terminal specialization; D: needs an
+# explicit rule; E: proactively implemented
+# F: concept does not exist; B: Super-related (deferred); the rest (app-handled,
+# etc.) are not compared.
 NEEDS_RULE = {"D", "E"}
 
 
 def parse_doc() -> list[dict]:
-    """抽取文档中所有三列表格行。"""
+    """Extract every three-column table row from the docs."""
     rows = []
     for line in DOC.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -219,19 +229,20 @@ def parse_doc() -> list[dict]:
     return rows
 
 
-# ── 解析代码 ──────────────────────────────────────────────────────────
+# ── Parse the code ────────────────────────────────────────────────────
 
 
 def parse_rules() -> set[str]:
-    """src/config.rs 的 default_rules()，取每条规则的输入侧组合。
+    """The input-side combos of every rule in src/config.rs's default_rules().
 
-    表驱动重构后，映射真源是 `default_rules()` 里的 `push_emit` 调用。
-    形如 `push_emit(&[], "KEY_LEFT", "C", "Left", "…")`——
-    第二个参数即输入侧组合（不含隐含的 Cmd）。
+    After the table-driven refactor, the single source of truth for mappings is
+    the `push_emit` calls inside `default_rules()`. They look like
+    `push_emit(&[], "KEY_LEFT", "C", "Left", "...")` -- the second argument is
+    the input-side combo (without the implicit Cmd).
 
-    注意：只取 `push_emit` 生成的固定输出规则。`TerminalCtrlShift`
-    与 `DeAccel` 走的是条件/运行时动作，由 parse_conditional_rules
-    单独统计。
+    Note: this only takes the fixed-output rules produced by `push_emit`.
+    `TerminalCtrlShift` and `DeAccel` are conditional/runtime actions and are
+    counted separately by parse_conditional_rules.
     """
     text = CONFIG_RS.read_text(encoding="utf-8")
     out = set()
@@ -239,12 +250,13 @@ def parse_rules() -> set[str]:
         apps, combo = m.group(1), m.group(2).strip()
         if combo:
             out.add(combo)
-    # 规则表中所有形如组合的字符串。
+    # All combo-shaped strings in the rule table.
     #
-    # 不用 `keys: vec![...]` 定位：部分规则在循环里生成
-    # （`keys: vec![keys.into()]`），正则抓不到字面量。
-    # 改为在 default_rules() 正文里匹配「修饰前缀 + KEY_xxx」形态，
-    # desc 是中文不会误命中。
+    # We do not locate them via `keys: vec![...]`: some rules are generated in a
+    # loop (`keys: vec![keys.into()]`), so the regex cannot grab a literal.
+    # Instead we match the "modifier prefixes + KEY_xxx" shape inside the body of
+    # default_rules(); the desc strings are plain prose and will not match by
+    # accident.
     body = _body_of(text, "fn default_rules")
     for k in re.findall(r'"([ASCM-]*KEY_[A-Z0-9]+)"', body):
         out.add(k)
@@ -252,10 +264,11 @@ def parse_rules() -> set[str]:
 
 
 def _body_of(text: str, marker: str) -> str:
-    """取 `marker` 之后到下一个顶层 `fn`/`impl` 之前的正文。
+    """Return the body from after `marker` up to the next top-level `fn`/`impl`.
 
-    `default_rules()` 是文件里最后一个大函数，其后直接是别的顶层
-    定义，故找不到下一个 `\nfn ` 时退回文件末尾。
+    `default_rules()` is the last big function in the file, followed directly by
+    other top-level definitions, so when no further `\\nfn ` is found we fall back
+    to the end of the file.
     """
     i = text.index(marker)
     m = re.search(r"\n(fn |impl |const |#\[cfg)", text[i + len(marker):])
@@ -264,14 +277,15 @@ def _body_of(text: str, marker: str) -> str:
 
 
 def parse_conditional_rules() -> set[str]:
-    """条件动作规则覆盖的输入侧组合。
+    """Input-side combos covered by conditional-action rules.
 
-    `keys = vec!["*"]` 表示主键通配——运行时才决定哪些键生效，
-    故不能逐键计入（那正是它存在的理由：终端绑定各终端不同）。
+    `keys = vec!["*"]` means a main-key wildcard -- which keys apply is decided
+    at runtime, so they cannot be counted key by key (that is precisely why it
+    exists: terminal bindings differ per terminal).
     """
     text = CONFIG_RS.read_text(encoding="utf-8")
     out = set()
-    # push_emit 之外的、显式写了 keys 的规则
+    # Rules outside push_emit that spell out `keys` explicitly
     for m in re.finditer(r'keys:\s*vec!\[([^\]]*)\]', text, re.S):
         for k in re.findall(r'"([^"]+)"', m.group(1)):
             k = k.strip()
@@ -281,7 +295,7 @@ def parse_conditional_rules() -> set[str]:
 
 
 def parse_terminal_shift_keys() -> set[str]:
-    """终端特化的兜底键集（通配规则之外的静态部分）。"""
+    """The fallback key set for terminal specialization (the static part outside the wildcard rule)."""
     text = CONFIG_RS.read_text(encoding="utf-8")
     m = re.search(r"DEFAULT_TERMINAL_SHIFT_KEYS[^=]*=\s*&\[(.*?)\n\];", text, re.S)
     if not m:
@@ -298,12 +312,12 @@ def parse_remap() -> set[str]:
 
 
 def parse_fn_rules() -> set[str]:
-    """mapper.rs 里的 Fn 键位切换规则，形如 KEY_F11 → KEY_VOLUMEDOWN。"""
+    """Fn key-stage switching rules in mapper.rs, of the form KEY_F11 → KEY_VOLUMEDOWN."""
     text = MAPPER_RS.read_text(encoding="utf-8")
     return set(re.findall(r"\(KeyCode::(KEY_\w+),\s*KeyCode::(KEY_\w+)\)", text))
 
 
-# ── 报告 ──────────────────────────────────────────────────────────────
+# ── Report ────────────────────────────────────────────────────────────
 
 
 def main() -> int:
@@ -316,9 +330,9 @@ def main() -> int:
     remap = parse_remap()
     fn_rules = parse_fn_rules()
 
-    print(f"文档条目 {len(rows)} 条；显式规则 {len(implemented)} 条")
+    print(f"{len(rows)} doc entries; {len(implemented)} explicit rules")
     print(f"remap {sorted(remap)}")
-    print(f"Fn 规则 {sorted(fn_rules) or '（无）'}")
+    print(f"Fn rules {sorted(fn_rules) or '(none)'}")
     print()
 
     missing: list[tuple[str, str, str]] = []
@@ -327,19 +341,21 @@ def main() -> int:
     for row in rows:
         combos = [c for combo in row["combos"] for c in encode_combo(combo)]
         if not combos:
-            continue  # Fn / 亮度键 / 应用处理，不比对
+            continue  # Fn / brightness keys / app-handled: not compared
 
         if row["cls"] in NEEDS_RULE:
             hit = [c for c in combos if c in implemented]
             if not hit:
                 missing.append((row["macos"], row["target"], " / ".join(combos)))
         elif row["cls"] == "A":
-            # A 类声称「默认 Cmd+X → Ctrl+X 覆盖」。默认语义的实际输出是
-            # Ctrl + <同主键> + 原样保留的非 Cmd 修饰键——只有目标恰好
-            # 等于它时才成立。否则默认映射给不出该目标。
+            # Class A claims "covered by the default Cmd+X → Ctrl+X". What the
+            # default semantics actually produce is Ctrl + <same main key> + the
+            # non-Cmd modifiers kept as-is -- the claim holds only when the target
+            # is exactly that. Otherwise the default mapping cannot yield it.
             #
-            # 不含 Cmd 的行（如 macOS 的 `Ctrl+H`）不参与比对：默认语义
-            # 只作用于 Cmd 组合，这些键在 Linux 上本就同名。
+            # Rows without Cmd (e.g. macOS's `Ctrl+H`) are not compared: the
+            # default semantics apply only to Cmd combos, and these keys already
+            # have the same name on Linux.
             cmd_rows = [c for c in combos if len(c.split("-")) >= 1 and _has_cmd(row["combos"])]
             if not cmd_rows:
                 continue
@@ -349,28 +365,29 @@ def main() -> int:
                 parts = combo.split("-")
                 key = parts[-1].replace("KEY_", "")
                 outs.append("Ctrl+" + "+".join(parts[:-1] + [key]))
-            # 交替键（`Cmd+←/→`）展开成多个候选：任一命中即算覆盖。
+            # Alternating keys (`Cmd+←/→`) expand into several candidates: a hit
+            # on any one counts as covered.
             if not any(o.upper() == target_norm.upper() for o in outs):
                 misfiled.append((row["macos"], row["target"], " / ".join(outs)))
 
     if misfiled:
-        print("── 分类存疑：标为 A（默认语义覆盖），但目标并非 Ctrl+同一主键 ──")
-        print("   默认映射只会产出 Ctrl+<同键>，给不出这些目标。\n")
+        print("── Questionable classification: marked A (covered by default semantics), but the target is not Ctrl+the same main key ──")
+        print("   The default mapping only produces Ctrl+<same key>; it cannot yield these targets.\n")
         for macos, target, combo in misfiled:
-            print(f"  {macos:<24} 目标 {target:<14} 默认会发出 {combo}")
+            print(f"  {macos:<24} target {target:<14} default would emit {combo}")
         print()
 
     if missing:
-        print("── 声称需显式规则（D/E），代码中无对应条目 ──\n")
+        print("── Claimed to need an explicit rule (D/E), but the code has no such entry ──\n")
         for macos, target, combo in missing:
-            print(f"  {macos:<28} 目标 {target:<22} 应为 {combo}")
+            print(f"  {macos:<28} target {target:<22} expected {combo}")
         print()
 
     if not missing and not misfiled:
-        print("文档与实现一致。")
+        print("Docs and implementation agree.")
         return 0
 
-    print(f"共 {len(missing)} 条缺失、{len(misfiled)} 条分类存疑。")
+    print(f"{len(missing)} missing, {len(misfiled)} questionable classification.")
     return 1 if "--strict" in sys.argv else 0
 
 

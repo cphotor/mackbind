@@ -1,9 +1,10 @@
-//! 加速键（accel）表达式解析：GTK/GSettings 形式。
+//! Accelerator (accel) expression parsing: the GTK/GSettings form.
 //!
-//! # 为什么需要
+//! # Why this is needed
 //!
-//! 终端用 Ctrl+Shift 绑定哪些键，是**终端自己**的事，不是 mackbind 能
-//! 猜的。ptyxis 把全部快捷键列在 `org.gnome.Ptyxis.Shortcuts` 里：
+//! Which keys the terminal binds with Ctrl+Shift is **the terminal's own**
+//! business, not something mackbind can guess. ptyxis lists all of its
+//! shortcuts in `org.gnome.Ptyxis.Shortcuts`:
 //!
 //! ```text
 //! new-window      '<ctrl><shift>n'
@@ -11,35 +12,38 @@
 //! copy-clipboard  '<ctrl><shift>c'
 //! ```
 //!
-//! 手写白名单漏掉过 `n`（新窗口），也漏掉了 `close-window` 实际绑定在
-//! `Ctrl+Shift+Q` 而非 `Alt+F4`。与其维护猜测，不如直接问终端自己。
+//! A hand-written whitelist once missed `n` (new window), and also missed that
+//! `close-window` is actually bound to `Ctrl+Shift+Q` rather than `Alt+F4`.
+//! Rather than maintaining guesses, it is better to just ask the terminal
+//! itself.
 //!
-//! # 格式
+//! # Format
 //!
-//! GTK 加速键形如 `<ctrl><shift>n`、`<ctrl>plus`、`<Primary>F4`：
+//! A GTK accelerator looks like `<ctrl><shift>n`, `<ctrl>plus`, `<Primary>F4`:
 //!
-//! - `<...>` 包裹修饰键，大小写不敏感
-//! - 剩下的是键名，与 evdev 的 `KEY_*` 名大体一致，个别有别名
-//!   （`plus`/`minus`/`equal`）
+//! - `<...>` wraps a modifier, case-insensitive
+//! - what remains is the key name, broadly matching evdev's `KEY_*` names, with
+//!   a few aliases (`plus`/`minus`/`equal`)
 
 use crate::keys::modifier_from_abbrev;
 use evdev::KeyCode;
 use std::process::Command;
 
-/// 判断加速键是否为 `<Ctrl><Shift>+主键` 形式。
+/// Decide whether an accelerator is of the form `<Ctrl><Shift>+main key`.
 ///
-/// 只关心「含 Ctrl 与 Shift」这一类——终端用这类绑定复制、关标签页、
-/// 新窗口等。缺 Ctrl 或缺 Shift 的绑定（`Alt+1` 切标签、
-/// `Ctrl+Page_Down` 移标签）不属于此列。
+/// Only this class—"contains Ctrl and Shift"—is of interest; terminals use such
+/// bindings for copy, close tab, new window, and so on. Bindings missing Ctrl or
+/// Shift (`Alt+1` to switch tabs, `Ctrl+Page_Down` to move a tab) are not part
+/// of this set.
 ///
-/// GTK 的 `<primary>` 是 Ctrl 的别名，此处一并视为 Ctrl。
+/// GTK's `<primary>` is an alias for Ctrl and is treated as Ctrl here too.
 pub fn is_ctrl_shift(accel: &str) -> bool {
     let (mods, _key) = split(accel);
     let has = |want: &[&str]| mods.iter().any(|m| want.iter().any(|w| m == *w));
     has(&["ctrl", "control", "primary"]) && has(&["shift"])
 }
 
-/// 取出加速键的主键名（如 `n`、`plus`、`F4`）。
+/// Take the main key name of an accelerator (e.g. `n`, `plus`, `F4`).
 pub fn main_key(accel: &str) -> Option<&str> {
     let k = split(accel).1;
     if k.is_empty() {
@@ -49,7 +53,7 @@ pub fn main_key(accel: &str) -> Option<&str> {
     }
 }
 
-/// 拆分为 (修饰键列表, 主键名)。修饰键统一小写。
+/// Split into (modifier list, main key name). Modifiers are lowercased.
 fn split(accel: &str) -> (Vec<String>, &str) {
     let mut mods = Vec::new();
     let mut rest = accel;
@@ -65,13 +69,14 @@ fn split(accel: &str) -> (Vec<String>, &str) {
     (mods, rest)
 }
 
-/// 查询某个 GSettings 动作当前绑定的加速键。
+/// Query the accelerator currently bound to a given GSettings action.
 ///
-/// 用于把 macOS 快捷键接到**桌面环境已有的绑定**上，而不去改写绑定。
-/// 例如 GNOME 的概览绑在 `toggle-overview`（默认 `Ctrl+Shift+空格`），
-/// mackbind 只要发出这组键即可，无需在用户配置里留下任何记录。
+/// Used to hook macOS shortcuts onto **the desktop environment's existing
+/// bindings** instead of rewriting the bindings. For example GNOME's overview
+/// is bound to `toggle-overview` (default `Ctrl+Shift+space`); mackbind only
+/// needs to emit that key set, leaving no trace in the user's config.
 ///
-/// 动作未绑定时返回 `None`。
+/// Returns `None` when the action is unbound.
 pub fn action_accel(schema: &str, key: &str) -> Option<String> {
     let out = Command::new("gsettings")
         .args(["get", schema, key])
@@ -81,34 +86,36 @@ pub fn action_accel(schema: &str, key: &str) -> Option<String> {
         return None;
     }
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    // 未绑定时返回 @as [] 或 ''，都不是有效加速键
+    // When unbound it returns @as [] or '', neither of which is a valid accelerator
     if text.is_empty() || text.starts_with("@as") || text == "''" {
         return None;
     }
-    // 形如 "['<ctrl><shift>space']"，取第一个；多绑定时取首个即可
+    // Of the form "['<ctrl><shift>space']"; take the first; with multiple bindings the first suffices
     let inner = text.split('\'').nth(1)?;
     Some(inner.to_string())
 }
 
-/// 把加速键表达式转为「修饰键 + 主键」。
+/// Convert an accelerator expression into "modifiers + main key".
 ///
-/// 用于 mackbind 的输出端——它只认自己的 `C-x` 简写，不认 GTK 的
-/// `<ctrl><shift>space`。
+/// For mackbind's output side—it only understands its own `C-x` shorthand, not
+/// GTK's `<ctrl><shift>space`.
 pub fn parse_accel(accel: &str) -> Option<(Vec<u16>, KeyCode)> {
     let (mods, key) = split(accel);
     let mut out: Vec<u16> = Vec::new();
     for m in mods {
-        // GTK 的修饰键名（ctrl/primary/shalt…）→ 本工具的缩写（C/A/S/M），
-        // 复用键名解析器的表，避免两处映射不一致
+        // GTK modifier name (ctrl/primary/shalt…) → this tool's abbreviation
+        // (C/A/S/M), reusing the key-name parser's table to avoid the two
+        // mappings drifting apart
         let abbrev = match m.as_str() {
-            // GTK 的实际拼写是 `<Control>` / `<Shift>` / `<Alt>` / `<Super>`，
-            // 全小写形式（`<ctrl>`）在部分 schema 里也会出现，一并接受。
-            // 另有 `<Primary>` 表示 Ctrl、`<Mod4>` 表示 Super。
+            // GTK's actual spellings are `<Control>` / `<Shift>` / `<Alt>` /
+            // `<Super>`; the all-lowercase form (`<ctrl>`) also appears in some
+            // schemas and is accepted as well. `<Primary>` also means Ctrl, and
+            // `<Mod4>` means Super.
             "ctrl" | "control" | "primary" => "C",
             "shift" => "S",
             "alt" => "A",
             "super" | "meta" | "mod4" => "M",
-            // hyper、lock 等本工具不产生，跳过
+            // hyper, lock, etc. are not produced by this tool; skip them
             _ => continue,
         };
         if let Some(kc) = modifier_from_abbrev(abbrev) {
@@ -121,18 +128,20 @@ pub fn parse_accel(accel: &str) -> Option<(Vec<u16>, KeyCode)> {
     Some((out, kc))
 }
 
-/// GTK 加速键的主键名 → evdev 键码。
+/// GTK accelerator main key name → evdev keycode.
 ///
-/// 复用 [`crate::keys::parse_external_key`]——与 mapper 侧读取终端
-/// schema 时用的是同一套解析规则。此前两处各写一份，已因此产生过分歧。
+/// Reuses [`crate::keys::parse_external_key`]—the same set of parsing rules the
+/// mapper side uses when reading the terminal schema. Previously the two were
+/// written separately, which already caused a divergence.
 fn key_to_keycode(name: &str) -> Option<KeyCode> {
     crate::keys::parse_external_key(name)
 }
 
-/// 终端的快捷键 schema 名候选。
+/// Candidate schema names for a terminal's shortcuts.
 ///
-/// GNOME 系终端用 `<app_id>.Shortcuts`；其他终端（kitty、wezterm 等）
-/// 不走 GSettings，无从查询——那类终端继续用内置白名单。
+/// GNOME-family terminals use `<app_id>.Shortcuts`; other terminals (kitty,
+/// wezterm, etc.) do not go through GSettings and cannot be queried—that class
+/// of terminal keeps using the built-in whitelist.
 fn schema_candidates(wm_class: &str) -> Vec<String> {
     vec![
         format!("{wm_class}.Shortcuts"),
@@ -141,13 +150,15 @@ fn schema_candidates(wm_class: &str) -> Vec<String> {
     ]
 }
 
-/// 查询某个终端自己用 `<Ctrl><Shift>+键` 绑定了哪些主键名。
+/// Query which main key names a terminal itself binds with `<Ctrl><Shift>+key`.
 ///
-/// 查不到（终端不用 GSettings、或扩展未装）时返回空列表——**不视为
-/// 错误**，调用方退回内置白名单。
+/// Returns an empty list when the query fails (terminal does not use GSettings,
+/// or the extension is not installed)—**not treated as an error**; the caller
+/// falls back to the built-in whitelist.
 pub fn ctrl_shift_keys(wm_class: &str) -> Vec<String> {
     for schema in schema_candidates(wm_class) {
-        // 先确认 schema 存在，避免对每个候选都跑一次 list-recursively
+        // Confirm the schema exists first, to avoid running
+        // list-recursively for every candidate
         let exists = Command::new("gsettings")
             .args(["list-keys", &schema])
             .output()
@@ -167,7 +178,7 @@ pub fn ctrl_shift_keys(wm_class: &str) -> Vec<String> {
 
         let mut keys = Vec::new();
         for line in out.lines() {
-            // 形如：schema key-name '<ctrl><shift>n'
+            // Of the form: schema key-name '<ctrl><shift>n'
             let Some(rest) = line.split_once(" '") else {
                 continue;
             };
@@ -180,7 +191,7 @@ pub fn ctrl_shift_keys(wm_class: &str) -> Vec<String> {
         }
         if !keys.is_empty() {
             if std::env::var("MACKBIND_VERBOSE").is_ok() {
-                eprintln!("[accel] {schema} 提供 Ctrl+Shift 绑定: {keys:?}");
+                eprintln!("[accel] {schema} provides Ctrl+Shift bindings: {keys:?}");
             }
             return keys;
         }
@@ -199,18 +210,18 @@ mod tests {
     #[test]
     fn detects_ctrl_shift() {
         assert!(is_ctrl_shift("<ctrl><shift>n"));
-        assert!(is_ctrl_shift("<Shift><Ctrl>c"), "大小写不敏感");
-        assert!(is_ctrl_shift("<primary><shift>t"), "primary 即 Ctrl");
-        // GNOME 实际写出的拼法（本机 toggle-overview 即此形式）
+        assert!(is_ctrl_shift("<Shift><Ctrl>c"), "case-insensitive");
+        assert!(is_ctrl_shift("<primary><shift>t"), "primary is Ctrl");
+        // The spelling GNOME actually writes (on this machine toggle-overview uses this form)
         assert!(is_ctrl_shift("<Shift><Control>space"));
     }
 
     #[test]
     fn rejects_other_combos() {
-        assert!(!is_ctrl_shift("<ctrl>c"), "缺 Shift");
-        assert!(!is_ctrl_shift("<shift>n"), "缺 Ctrl");
-        assert!(!is_ctrl_shift("<alt>1"), "两者都缺");
-        assert!(!is_ctrl_shift(""), "空串");
+        assert!(!is_ctrl_shift("<ctrl>c"), "missing Shift");
+        assert!(!is_ctrl_shift("<shift>n"), "missing Ctrl");
+        assert!(!is_ctrl_shift("<alt>1"), "both missing");
+        assert!(!is_ctrl_shift(""), "empty string");
     }
 
     #[test]
@@ -218,12 +229,12 @@ mod tests {
         assert_eq!(main_key("<ctrl><shift>n"), Some("n"));
         assert_eq!(main_key("<ctrl>plus"), Some("plus"));
         assert_eq!(main_key("<Primary>F4"), Some("F4"));
-        assert_eq!(main_key(""), None, "空串无主键");
+        assert_eq!(main_key(""), None, "empty string has no main key");
     }
 
     #[test]
     fn parses_real_gnome_accel() {
-        // 本机 GNOME 对 toggle-overview 的实际绑定
+        // The real GNOME binding for toggle-overview on this machine
         let (mods, key) = parse_accel("<Shift><Control>space").unwrap();
         assert_eq!(key, KeyCode::KEY_SPACE);
         assert!(mods.contains(&KeyCode::KEY_LEFTCTRL.0), "{mods:?}");
@@ -238,14 +249,14 @@ mod tests {
 
     #[test]
     fn reads_ptyxis_own_bindings() {
-        // ptyxis 用 GSettings 声明快捷键；本机应装有
+        // ptyxis declares its shortcuts via GSettings; this machine should have it installed
         let keys = ctrl_shift_keys("org.gnome.Ptyxis");
         if std::path::Path::new("/usr/share/glib-2.0/schemas").exists() {
-            assert!(keys.contains(&"n".to_string()), "新窗口 Ctrl+Shift+N: {keys:?}");
-            assert!(keys.contains(&"c".to_string()), "复制 Ctrl+Shift+C: {keys:?}");
-            assert!(keys.contains(&"w".to_string()), "关标签页 Ctrl+Shift+W: {keys:?}");
-            // 不应包含只有 Ctrl 的绑定（如 Ctrl+Page_Down 移标签）
-            assert!(!keys.contains(&"1".to_string()), "Alt+1 不该入选: {keys:?}");
+            assert!(keys.contains(&"n".to_string()), "new window Ctrl+Shift+N: {keys:?}");
+            assert!(keys.contains(&"c".to_string()), "copy Ctrl+Shift+C: {keys:?}");
+            assert!(keys.contains(&"w".to_string()), "close tab Ctrl+Shift+W: {keys:?}");
+            // Should not include Ctrl-only bindings (e.g. Ctrl+Page_Down to move a tab)
+            assert!(!keys.contains(&"1".to_string()), "Alt+1 should not be included: {keys:?}");
         }
     }
 
