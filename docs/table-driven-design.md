@@ -27,7 +27,7 @@ The problem is not the number of lines but that **"what it does" cannot be seen 
 
 ## The structure now
 
-One table answers everything, 29 rows:
+One table answers everything, 44 rows:
 
 |App|Key combo|Action|
 |---|---|---|
@@ -35,8 +35,12 @@ One table answers everything, 29 rows:
 |`*`|`Cmd+[`|`emit` `Alt+Left`|
 |`*`|`Cmd+Space`|`de_accel` `overview`|
 |`org.gnome.Ptyxis` etc.|`Cmd+C`|`emit` `Ctrl+Insert`|
+|`org.gnome.Ptyxis`|`Shift+Enter` (no Cmd)|`emit` `Ctrl+J`|
 |`gvim`|`Cmd+any key`|`terminal_ctrl_shift`|
 |`TerminalEmulator`|`Cmd+any key`|`terminal_ctrl_shift`|
+
+Cmd is implicit for almost every row. The handful of non-Cmd combos (macOS's `Option+Delete`,
+`Ctrl+↑`, and the terminal `Shift+Enter` above) write `cmd = false` and are listed here without a Cmd prefix.
 
 **Order is priority** -- the priority relationships formerly scattered across three places are now decided solely by
 a rule's position in the table. Lookup is a linear scan taking the first hit; user config is appended at the end, so it naturally takes priority.

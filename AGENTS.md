@@ -290,8 +290,8 @@ stops the next person (or future me) from doubting.
 ## 8. Conventions for the mapping rule table
 
 After the refactor, `default_rules()` in `src/config.rs` is the **single source of
-truth** for mappings: 29 rows, each `(app, key combo) → action`. See
-`docs/table-driven-design.md`.
+truth** for mappings, each row `(app, key combo) → action`; `mackbind --verbose`
+prints the table and the current row count. See `docs/table-driven-design.md`.
 
 Two easy-to-miss points when editing the rule table:
 

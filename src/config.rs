@@ -267,6 +267,30 @@ pub const DEFAULT_TERMINAL_SHIFT_KEYS: &[&str] = &[
     "KEY_RIGHTBRACE", // next tab
 ];
 
+/// Terminals that **cannot tell `Shift+Enter` from `Enter`**.
+///
+/// These are the VTE family. VTE implements neither the kitty keyboard protocol
+/// nor xterm's `modifyOtherKeys`, so a modified Return has nowhere to be
+/// encoded: `_vte_keymap_GDK_Return` holds only an Alt variant, and
+/// `_vte_keymap_key_get_modifier_encoding_method` lists the arrows, Insert,
+/// Delete, Home, End, Page Up/Down, F1-F35 and the keypad operators (including
+/// the keypad's own `KP_Enter`) but **not Return**. `Shift+Enter` and
+/// `Ctrl+Enter` therefore reach the application as the very same `\r` (0x0D) as
+/// bare `Enter` -- which is exactly how a terminal coding agent loses
+/// "Shift+Enter inserts a newline" and submits the prompt instead.
+///
+/// `Ctrl+J` is the escape hatch: 0x0A is a **different** control character that
+/// every terminal transmits unchanged, and readline, vim and the agent TUIs all
+/// read it as a newline.
+///
+/// The criterion is that **behavior**, not an app list -- the same rule as
+/// `SIGINT_LEAKY_TERMINALS` below: add a terminal here only after checking that
+/// it really drops the modifier, and delete it once upstream implements the
+/// protocol. Terminals that *do* implement it (kitty, foot, wezterm, ghostty,
+/// alacritty) must never be listed: there `Shift+Enter` already works, and this
+/// rule would take that away.
+const SHIFT_ENTER_BLIND_TERMINALS: &[&str] = &["org.gnome.Ptyxis"];
+
 /// Terminals that leak `Ctrl+Shift+C` as SIGINT.
 ///
 /// ptyxis and konsole, when there is **no selected text**, pass this combo
@@ -569,6 +593,36 @@ for key in DELETE_KEYS {
         desc: Some(
             "use Ctrl+Insert for copy: with no selected text ptyxis/konsole \
              leak Ctrl+Shift+C to the process as SIGINT"
+                .into(),
+        ),
+    });
+
+    // ── Terminals that cannot report Shift+Enter: send Ctrl+J instead ──
+    //
+    // A table row is all this needs -- no mapper change. The combo-convert path
+    // releases everything currently down on the output side (which includes the
+    // Shift that was passed through on press -- invariant 4 requires that, for
+    // fcitx5) and then presses exactly this rule's modifiers, so what reaches
+    // the terminal is a clean `Ctrl+J` and never `Ctrl+Shift+J`. The
+    // `Option+Delete` row above relies on the same path.
+    //
+    // A `cmd = false` row is **not** skipped while Cmd is held (the lookup only
+    // gates on `requires_cmd && !cmd_held`), so `Cmd+Shift+Enter` lands here
+    // too. That matches the existing `Option+Delete` row.
+    v.push(Rule {
+        apps: SHIFT_ENTER_BLIND_TERMINALS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        keys: vec!["S-KEY_ENTER".into()],
+        cmd: false,
+        act: Action::Emit {
+            mods: vec!["C".into()],
+            key: "KEY_J".into(),
+        },
+        desc: Some(
+            "soft newline (Shift+Enter → Ctrl+J): this terminal cannot report \
+             Shift+Enter separately from Enter"
                 .into(),
         ),
     });

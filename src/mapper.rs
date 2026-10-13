@@ -1345,6 +1345,80 @@ mod tests {
         }
     }
 
+    /// `Shift+Enter` in a terminal that cannot report it becomes `Ctrl+J`.
+    ///
+    /// The pass-through Shift must be released first: leaving it down would make
+    /// the output `Ctrl+Shift+J`, a different combo from what the rule says.
+    #[test]
+    fn shift_enter_becomes_ctrl_j_in_blind_terminals() {
+        let mut m = default_mapper();
+        m.set_window_id("org.gnome.Ptyxis");
+
+        let shift_down = desc(&m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 1)));
+        assert_eq!(
+            shift_down,
+            vec![(KeyCode::KEY_LEFTSHIFT.0, 1)],
+            "Shift is passed through on press (fcitx5 watches a bare Shift)"
+        );
+
+        let down = desc(&m.translate(&k(KeyCode::KEY_ENTER.0, 1)));
+        assert!(
+            down.contains(&(KeyCode::KEY_LEFTSHIFT.0, 0)),
+            "the pass-through Shift must be released: {down:?}"
+        );
+        assert!(
+            down.contains(&(KeyCode::KEY_LEFTCTRL.0, 1)) && down.contains(&(KeyCode::KEY_J.0, 1)),
+            "Shift+Enter should become Ctrl+J: {down:?}"
+        );
+
+        let up = desc(&m.translate(&k(KeyCode::KEY_ENTER.0, 0)));
+        assert!(
+            up.contains(&(KeyCode::KEY_J.0, 0)) && up.contains(&(KeyCode::KEY_LEFTCTRL.0, 0)),
+            "releasing Enter must lift both, or Ctrl stays stuck: {up:?}"
+        );
+
+        let shift_up = desc(&m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 0)));
+        assert!(
+            shift_up.is_empty(),
+            "Shift was already released by the translation: {shift_up:?}"
+        );
+        assert!(m.held.is_empty(), "nothing may stay held: {:?}", m.held);
+    }
+
+    /// The rule is per-app: a terminal that *does* implement the protocol keeps
+    /// `Shift+Enter`, and a bare `Enter` is untouched everywhere.
+    ///
+    /// kitty/foot/wezterm/ghostty/alacritty report `Shift+Enter` properly
+    /// (`CSI 13;2u`), and a global remap would also break GUI apps, where
+    /// `Shift+Enter` has its own meaning (VS Code inserts a line below, chat
+    /// apps insert a newline).
+    #[test]
+    fn shift_enter_is_untouched_elsewhere() {
+        for wm in ["com.mitchellh.ghostty", "org.gnome.Nautilus"] {
+            let mut m = default_mapper();
+            m.set_window_id(wm);
+            m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 1));
+            let out = desc(&m.translate(&k(KeyCode::KEY_ENTER.0, 1)));
+            assert!(
+                !out.iter().any(|(c, _)| *c == KeyCode::KEY_J.0),
+                "{wm}: Shift+Enter must not become Ctrl+J: {out:?}"
+            );
+            assert!(
+                out.contains(&(KeyCode::KEY_ENTER.0, 1)),
+                "{wm}: Shift+Enter passes through as-is: {out:?}"
+            );
+        }
+
+        let mut m = default_mapper();
+        m.set_window_id("org.gnome.Ptyxis");
+        let out = desc(&m.translate(&k(KeyCode::KEY_ENTER.0, 1)));
+        assert_eq!(
+            out,
+            vec![(KeyCode::KEY_ENTER.0, 1)],
+            "a bare Enter is still Enter, even in that terminal"
+        );
+    }
+
         /// Terminals that do not leak SIGINT still take the normal terminal path (Ctrl+Shift+C).
     ///
         /// Switching them all to Ctrl+Insert would cost these terminals their standard copy key — so

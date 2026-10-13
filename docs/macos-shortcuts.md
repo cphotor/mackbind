@@ -433,7 +433,13 @@ Terminals that do not use GSettings (kitty, wezterm, etc.) have no schema to que
 
 These two terminals, **when no text is selected**, pass `Ctrl+Shift+C` through to the child process as SIGINT, so "copy" kills the running task. wezterm, ghostty, and gnome-terminal do not have this problem (they swallow the combo unconditionally).
 
-So these two instead use `Ctrl+Insert` (the traditional X11 copy key, supported by all terminals and never sent as a control character). It is carried by the `app_cmd_map` config option, and the criterion is a **behavioral difference**, not an app list.
+So these two instead use `Ctrl+Insert` (the traditional X11 copy key, supported by all terminals and never sent as a control character). It is a row in the rule table, and the criterion is a **behavioral difference**, not an app list.
+
+### Shift+Enter in a terminal that cannot report it
+
+`Shift+Enter` ("insert a soft newline" in agent TUIs) requires the terminal to report the modifier, which only the kitty keyboard protocol can do. VTE — hence gnome-terminal, ptyxis, Tilix, Terminator, Guake — implements neither it nor xterm's `modifyOtherKeys` in any released version. VTE's keymap gives plain Return no modifier encoding at all: `_vte_keymap_GDK_Return` holds only an Alt variant, and `_vte_keymap_key_get_modifier_encoding_method` lists the arrows, Insert/Delete/Home/End/Page Up/Down, F1–F35 and the keypad operators (including the keypad's own `KP_Enter`) but **not Return**. So `Shift+Enter` and `Ctrl+Enter` arrive as the same `\r` (0x0D) as bare `Enter`, and the application cannot tell them apart.
+
+mackbind therefore emits `Ctrl+J` instead inside those terminals: 0x0A is a **distinct** control character that every terminal transmits unchanged, and readline, vim and the agent TUIs all read it as a newline. The row is deliberately app-scoped — terminals that do implement the protocol (kitty, foot, wezterm, ghostty, alacritty) must keep the real `Shift+Enter`, and a global remap would also cost GUI apps their own `Shift+Enter` (VS Code inserts a line below, chat apps insert a newline). Same criterion as the copy key above: a **behavioral difference**, not an app list, so a terminal is added only after being checked on the real machine. That list currently holds only `org.gnome.Ptyxis`.
 
 ---
 
