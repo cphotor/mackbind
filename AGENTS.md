@@ -1,254 +1,320 @@
 # AGENTS.md
 
-给后续在此仓库工作的 agent（含未来的我）的硬性提醒。
-**这些不是风格偏好，是本项目已经付出代价换来的教训。**
+Hard reminders for agents (including future me) working in this repo.
+**These are not style preferences. They are lessons this project paid for.**
 
-## 一、断言「某能力不存在」之前，先确认是不是找错了地方
+## 0. Language: everything pushed must be English
 
-本项目三次因「找错地方」而下错结论，症状都是 `ServiceUnknown` /
-「不存在」/ 空结果：
+**All content that is committed and pushed must be written in English. No Chinese
+characters may appear anywhere in the repository** — including code comments,
+docstrings, `eprintln!`/log messages, test assertion messages, `README.md`,
+`DESIGN.md`, `docs/**`, shell-script output, `config.example.toml` comments, and
+**commit messages**.
 
-|断言|真相|
+Rationale: the repository is public (https://github.com/cphotor/mackbind) and its
+audience is not assumed to read Chinese.
+
+Consequences to keep in mind:
+
+- When you change user-visible behavior, also update the English wording in the
+  matching docs. Do not leave a Chinese description behind "because it's clearer".
+- `scripts/audit.py` machine-parses `docs/macos-shortcuts.md`; a few of its
+  matchers key off the **literal wording** in that doc (e.g. the tokens
+  `Brightness` / `Volume` / `Dashboard` in the macOS-combo column). If you reword
+  the doc, update `audit.py` in the same commit — otherwise `audit.py --strict`
+  fails.
+- Before committing, grep the tree for CJK to be sure:
+  `grep -rlP '[\x{4e00}-\x{9fff}]' $(git ls-files)` should print nothing.
+
+## 1. Before claiming a capability does not exist, check that you are looking in the right place
+
+This project drew the wrong conclusion three times by "looking in the wrong
+place"; the symptom was always `ServiceUnknown` / "does not exist" / empty result:
+
+|Claim|Truth|
 |---|---|
-|概览动作需写入用户设置，属侵入式|它在 `org.gnome.shell.keybindings`，不在 `wm.keybindings`|
-|`focused-window-dbus` 扩展不可用|D-Bus 地址写错。该扩展由 Shell 进程直接导出对象，`--dest` 必须是 `org.gnome.Shell`，不是 `org.gnome.Shell.Extensions.Dbus`|
-|`Ctrl+Cmd+Q` 锁屏无法实现（依据：GNOME 无此绑定）|结论对，但当时是**碰巧**对的——真实理由是该功能不在 wm.keybindings schema 内，且不构成「用户按了没反应」|
+|Overview action must be written to user settings — too invasive|It lives in `org.gnome.shell.keybindings`, not `wm.keybindings`|
+|The `focused-window-dbus` extension is unavailable|The D-Bus address was wrong. The extension exports its object directly from the Shell process, so `--dest` must be `org.gnome.Shell`, not `org.gnome.Shell.Extensions.Dbus`|
+|`Ctrl+Cmd+Q` lock-screen cannot be implemented (basis: GNOME has no such binding)|The conclusion was right, but only *by luck* — the real reason is that this action is not in the `wm.keybindings` schema and does not constitute "the user pressed it and nothing happened"|
 
-`gsettings` 报「没有 xxx 这个键」有两种含义：功能真不存在，或它在**另一个
-schema**。区分方法是先 `list-keys` 整个相关 schema，而不是直接下结论。
+When `gsettings` reports "there is no such key xxx", it has two meanings: the
+capability truly does not exist, or it lives in **another schema**. To tell them
+apart, first `list-keys` the whole relevant schema instead of jumping to a
+conclusion.
 
-**搜索范围要先覆盖整个域**，而不是只查最可能的那一个。
+**Search the whole domain first**, not just the single most likely place.
 
-### 同类错误的第四种形态：「实测无反应」≠「不存在」
+### A fourth form of the same mistake: "measured no effect" ≠ "does not exist"
 
-`Option+Cmd+W`（关闭 App 全部窗口）在 Chrome 里按了没反应，一度被标为
-**F（概念不存在）**。实际 Apple 官方文档明确有这条快捷键——只是
-**由应用自行实现**，访达有，Chrome 没有。
+`Option+Cmd+W` (close all app windows) did nothing in Chrome, so it was once
+tagged **F (capability does not exist)**. In fact Apple's official docs clearly
+list this shortcut — it is just **implemented by each app**: Finder has it,
+Chrome does not.
 
-三种「查不到」必须分开：
+Three kinds of "can't find it" must be kept apart:
 
-|症状|真实含义|
+|Symptom|Real meaning|
 |---|---|
-|命令报错 / 返回空|找错地方或 schema 不对|
-|应用里按了没反应|**可能只是该应用没实现**|
-|官方文档也没有|才是真不存在|
+|The command errors / returns empty|Wrong place, or wrong schema|
+|Pressing it in the app does nothing|**Maybe that app just hasn't implemented it**|
+|It is absent from the official docs too|Only then does it truly not exist|
 
-下「不存在」结论前，先问一句：**是不是只有这一个对象没实现它？**
-换应用复测，或查官方文档。
+Before concluding "does not exist", ask: **is it only this one target that has not
+implemented it?** Retest with a different app, or check the official docs.
 
-## 二、不要靠读代码推断行为——写探针实测
+## 2. Do not infer behavior by reading code — write a probe and measure
 
-**首选工具：`mackbind --trace`。** 不 grab、不创建虚拟设备、
-不注入任何事件——键盘保持原生行为，**可以正常打字**，
-同时把「输入事件 → 本应发出的事件」打到 stderr：
+**Preferred tool: `mackbind --trace`.** It does not grab, create a virtual device,
+or inject any event — the keyboard keeps its native behavior, **you can still
+type normally**, and it prints "input event → what should have been emitted" to
+stderr:
 
 ```bash
 setsid ./target/release/mackbind --trace > trace.log 2>&1 < /dev/null &
-# 用户按键后
+# after the user presses keys
 grep '^\[trace\] IN' trace.log
 ```
 
-**为什么这个工具不可替代**：映射一旦生效，键盘就由本程序接管，
-出问题时用户**无法打字，也就无法观察现场**。trace 模式绕开这一点。
-诊断任何映射问题时，先用它拿证据，不要靠读代码推演。
+**Why this tool is irreplaceable**: once mapping is active the keyboard is owned
+by this program, and **when it misbehaves the user cannot type, so they cannot
+observe the situation**. Trace mode sidesteps exactly that. For any mapping
+problem, get evidence with it first; do not reason it out by reading code.
 
-单元测试里的临时 `mod probe` 是次选手段。
+A throwaway `mod probe` inside a unit test is the second-best option.
 
-### 一次误诊，两次走偏
+### One misdiagnosis, then two wrong turns
 
-用户报「A 变成了 Cmd+A」，我先后追了两个方向：
+The user reported "A became Cmd+A". I chased two directions in turn:
 
-1. 放行路径漏发 Meta 释放 → 改了，但没解决
-2. GNOME 侧残留修饰键状态 → 加了启动清理，还是没解决
+1. The pass-through path failed to emit the Meta release → fixed it, did not help.
+2. Residual modifier state on the GNOME side → added startup cleanup, still did not help.
 
-用户说「**重启还是这样**」——这句话本该让我立刻放弃「残留状态」的假设，
-因为重启会清空所有内存状态。当时没反应过来，又多绕了一圈。
+The user said "**it's still like this after a reboot**" — that sentence should have
+made me drop the "residual state" hypothesis immediately, because a reboot clears
+all in-memory state. I didn't react, and burned another round.
 
-真正的根因是：**裸按空格命中了 `Cmd+空格` 那条规则**，
-弹出 GNOME 概览吃掉后续按键，观感上就像按键被改了。
-是确定性 bug，不是状态残留。**「重启无效」是区分这两类问题的关键信号。**
+The real root cause: **a bare space press matched the `Cmd+Space` rule**, popped
+up the GNOME overview, which swallowed the following keystrokes — so it looked
+like the key had been remapped. It was a deterministic bug, not residual state.
+**"A reboot doesn't fix it" is the key signal that separates the two classes.**
 
-教训：遇到「状态类」症状（卡住、粘住、失效），先问一句
-**「重启/重启服务能不能恢复」**。能恢复 → 状态问题；
-不能 → 逻辑问题。顺序反了会浪费大量时间。
+Lesson: for any "state-like" symptom (stuck, sticky, stops working), first ask
+**"does a reboot / restarting the service recover it?"** If yes → a state problem;
+if no → a logic problem. Getting this order backwards wastes a lot of time.
 
-**流程红线：改动核心路径（查表范围、匹配条件、默认语义）后，
-必须用 `--trace` 在真机验证过才能部署。** 89 个单元测试全绿
-也挡不住这次的问题——测试覆盖的是我写下来的用例，
-不是「裸按键不该触发 Cmd 规则」这种常识。
+**Process red line: after changing a core path (lookup scope, match conditions,
+default semantics), you must verify with `--trace` on the real machine before
+deploying.** 89 unit tests all green (the count at the time) did not stop that bug
+— the tests covered the cases I had written down, not common sense like "a bare
+keypress must not trigger a Cmd rule".
 
-### 部署流程（两次踩坑后固定下来）
+### Deploy procedure (fixed after two mishaps)
 
 ```bash
 cargo build --release
-systemctl --user stop mackbind        # 必须先停，否则 cp 报「文本文件忙」
+systemctl --user stop mackbind        # must stop first, or cp fails with "text file busy"
 cp target/release/mackbind ~/.local/bin/mackbind
 systemctl --user start mackbind
-# 核对：不一致就不要让用户测
+# verify:
 md5sum ~/.local/bin/mackbind target/release/mackbind
 ```
 
-**核对 MD5 是硬性步骤。** 曾两次在没核对的情况下让用户测旧版本：
-一次 `cargo build` 后忘了 `cp` 就直接 `start`，一次服务本来就在跑、
-`cp` 因「文本文件忙」失败但被 `&&` 吞掉。用户测的是旧二进制，
-白费两轮验证，而且报上来的现象（「Ctrl+↑ 没反应」）会把我引向
-错误的排查方向。
+**Checking the MD5 is mandatory.** Twice the user tested an old version because it
+was skipped: once I ran `cargo build` but forgot to `cp` and just `start`ed; once
+the service was already running and `cp` failed with "text file busy" but the
+failure was swallowed by `&&`. The user tested the old binary, two rounds of
+verification were wasted, and the reported symptom ("Ctrl+↑ does nothing") sent me
+down the wrong path.
 
-**服务是否在跑、跑的是哪个版本，是两个独立问题，必须分别确认。**
-我曾因为服务是 active 就以为部署成功了。
+**Whether the service is running and which version it runs are two separate
+questions and must be confirmed separately.** I once assumed deployment succeeded
+just because the service was active.
 
-### 停服务做诊断前，先想清楚怎么恢复
+### Before stopping the service to diagnose, plan how to restore it
 
-为了用 `--trace` 抓证据需要停服务（trace 不 grab，但服务占着设备时
-trace 读不到事件）。**曾因此让用户对着一个没运行的程序测了三轮**——
-键盘是原生的，Cmd 只是个被忽略的修饰键，于是 `Cmd+Shift+4` 等同于
-`Shift+4`，输出了 `$`。我还据此得出「映射错了」的结论往错误方向排查。
+To capture evidence with `--trace` you must stop the service (trace does not grab,
+but while the service holds the device, trace cannot read events). **This once led
+me to have the user test three rounds against a program that was not running** —
+the keyboard was native, Cmd was just an ignored modifier, so `Cmd+Shift+4` acted
+as `Shift+4` and typed `$`. I then concluded "the mapping is wrong" and hunted in
+the wrong direction.
 
-规则：
+Rules:
 
-1. **诊断开始前先告诉用户「服务已停，键盘恢复原生」**，并说明测什么
-2. **诊断结束立刻恢复服务**，不要留到下一轮
-3. 报告现象前先 `systemctl --user is-active mackbind` 确认一次——
-   「映射没生效」和「程序根本没跑」的现象几乎一样
+1. **Before starting a diagnosis, tell the user "the service is stopped, the
+   keyboard is native again"** and say what to test.
+2. **Restore the service as soon as the diagnosis ends** — don't defer it to the
+   next round.
+3. Before reporting a symptom, run `systemctl --user is-active mackbind` once —
+   "the mapping didn't take effect" and "the program isn't running at all" look
+   nearly identical.
 
-**现象发生时，先确认前提，再分析原因。** 服务没跑的时候，
-所有映射相关的结论都是无效的。
+**When a symptom appears, confirm the premises before analyzing the cause.** With
+the service not running, every mapping-related conclusion is invalid.
 
-## 三、文档与实现必须机器核对，不能人工核对
+## 3. Docs and implementation must be checked by machine, not by hand
 
-`scripts/audit.py` 是为此存在的。人工核对的代价已经付过两次
-（详见 DESIGN.md 与 `docs/table-driven-design.md`）。
+`scripts/audit.py` exists for this. Hand-checking has already cost twice
+(see DESIGN.md and `docs/table-driven-design.md`).
 
-**改动映射规则后跑一遍：**
+**After changing mapping rules, run it once:**
 
 ```bash
-python3 scripts/audit.py            # 报告差异
-python3 scripts/audit.py --strict   # 有差异退出码 1，供 CI 用
+python3 scripts/audit.py            # report differences
+python3 scripts/audit.py --strict   # exit code 1 on any difference, for CI
 ```
 
-新增映射规则时，同步在 `docs/macos-shortcuts.md` 里更新对应行，
-否则脚本会把它报成「文档声称需实现但代码没有」。
+When adding a mapping rule, update the matching row in
+`docs/macos-shortcuts.md` at the same time, or the script reports it as
+"the docs claim it must be implemented but the code does not have it".
 
-## 四、涉及 macOS 原始行为时，标注置信度
+## 4. When touching original macOS behavior, state your confidence
 
-`docs/macos-shortcuts.md` 里的条目部分是凭记忆写的，不是查 Apple 官方
-文档得来的。已知存疑的如 `Option+Shift+←/→` 扩展到词首尾。
+Some entries in `docs/macos-shortcuts.md` were written from memory, not from
+Apple's official documentation. Known-suspect ones include
+`Option+Shift+←/→` extending to word boundaries.
 
-**不要在未验证的条目上实现规则。** 标 F（放弃）比猜一个实现更诚实。
+**Do not implement rules on top of unverified entries.** Marking something F
+(give up) is more honest than guessing an implementation.
 
-## 五、改动前先跑测试，探针代码不要留下
+## 5. Run the tests before changing things, and leave no probe code behind
 
 ```bash
 cargo test
 ```
 
-临时探针（打印实际输出用的 `mod probe`）用完必须删除。
-`git status` 应当干净后再提交。
+Temporary probes (the `mod probe` used to print actual output) must be deleted
+when done. `git status` should be clean before committing.
 
-## 六、本项目的核心不变量（改动时勿破坏）
+## 6. Core invariants of this project (do not break them while editing)
 
-1. **CapsLock ↔ LeftCtrl 成对互换** —— 目标是两个键都发**真 Ctrl**，
-   不是互相变成对方。若只做单向互换，物理 Ctrl 键会失效。
-2. **释放事件必须与按下时决策一致** —— 否则输出侧残留按下态。
-   任何新增的按键翻译都要考虑 release 路径。
-3. **抑制的键不得发出事件** —— Meta 被抑制后，其 release 也不发。
-   **判据是「输出侧是否仍按着」，不是「是否曾被抑制」**：曾被抑制的键
-   可能在后续路径里被主动发出（如 `Ctrl+Cmd+Q` 锁屏发出 `Super+L`），
-   此时按「曾被抑制」提前返回会吞掉释放。见下方事故记录。
-4. **修饰键按下时抑制输出，等组合确定后再决定** —— 单个修饰键按下
-   不直接透传（Meta），但 Shift/Alt/Ctrl 需要透传（fcitx5 等监听裸 Shift）。
-5. **发事件必须用真实按下的键，查表才用归一化的键**。两者混用会导致
-   释放路径对不上，修饰键卡死。
-6. **自动重复事件（`value=2`）与 `MISC` 事件须过滤** —— 否则产生成对的
-   按下/释放。
-7. **退出必须真的退得出** —— 否则 `Cleanup` 不执行，修饰键会残留，
-   后果与下面两次 Super 卡死同类。见下方说明。
+1. **CapsLock ↔ LeftCtrl is a paired swap** — the goal is for both keys to emit a
+   **real Ctrl**, not for them to become each other. A one-way swap leaves the
+   physical Ctrl key dead.
+2. **A release event must match the decision made on press** — otherwise the
+   output side is left with a stuck-down key. Any new key translation must
+   consider the release path.
+3. **A suppressed key must not emit an event** — after Meta is suppressed, its
+   release is not emitted either. **The test is "is the output side still holding
+   it", not "was it ever suppressed"**: a key that was suppressed may later be
+   emitted deliberately on another path (e.g. `Ctrl+Cmd+Q` lock-screen emits
+   `Super+L`), and returning early on "was suppressed" would swallow the release.
+   See the incident record below.
+4. **Suppress output while a modifier is held, and decide after the combo is
+   known** — a lone modifier is not passed through directly (Meta), but
+   Shift/Alt/Ctrl must be passed through (fcitx5 and friends watch a bare Shift).
+5. **Emit using the physically pressed key; look up using the normalized key.**
+   Mixing the two makes the release path mismatch and leaves modifiers stuck.
+6. **Auto-repeat events (`value=2`) and `MISC` events must be filtered** —
+   otherwise they produce paired press/release.
+7. **Exit must actually exit** — otherwise `Cleanup` does not run, modifiers are
+   left behind, with the same consequences as the two Super-stuck incidents
+   below. See the note below.
 
-### 退出路径：别用 `libc::signal()`
+### Exit path: don't use `libc::signal()`
 
-现象：关机卡 90 秒，报「A stop job is running for User Manager for UID 1000」，
-最后被 SIGKILL，`Cleanup` 的 Drop 从未执行。
+Symptom: shutdown hung for 90 seconds with "A stop job is running for User
+Manager for UID 1000", then SIGKILLed, and `Cleanup`'s Drop never ran.
 
-原因：`libc::signal()` 是 BSD 语义，隐含 `SA_RESTART` —— 处理函数返回后，
-内核会**自动重启**被它打断的 `read()`。而主循环正阻塞在 `fetch_events()` 上，
-于是永远回不到循环顶部检查 `SHUTDOWN`，程序一直不退出。
+Cause: `libc::signal()` has BSD semantics and implies `SA_RESTART` — after the
+handler returns, the kernel **automatically restarts** the `read()` it
+interrupted. The main loop was blocked in `fetch_events()`, so it could never get
+back to the top of the loop to check `SHUTDOWN`, and the program never exited.
 
-要点：
+Key points:
 
-1. 用 `sigaction` 且 `sa_flags = 0`，让阻塞读返回 `EINTR`
-2. 主循环必须把 `ErrorKind::Interrupted` 当作「继续」，不能当读取错误退出 ——
-   否则任何一次无关信号的 `EINTR` 都会让程序直接退出
-3. **每个**阻塞循环都要能响应 `SHUTDOWN`。`run_trace` 曾漏检查，
-   于是 trace 模式下同样卡死
-4. 签名是 `-> !` 的函数里用 `exit(0)`，不能用 `break`
+1. Use `sigaction` with `sa_flags = 0`, so the blocking read returns `EINTR`.
+2. The main loop must treat `ErrorKind::Interrupted` as "continue", not as a read
+   error that exits — otherwise any unrelated signal's `EINTR` would make the
+   program exit.
+3. **Every** blocking loop must respond to `SHUTDOWN`. `run_trace` once missed the
+   check, so trace mode hung the same way.
+4. In a function whose signature is `-> !`, use `exit(0)`, not `break`.
 
-排查这类卡顿时，先看耗时是否**恰好等于某个超时值**（本例 90 秒 =
-`DefaultTimeoutStopSec=1min 30s`），相等就说明是等超时被 KILL，
-而不是某个 unit 真的在干慢活；`journalctl -b -1` 里搜
-`timed out. Killing` 能直接指出是谁。
+When diagnosing such a hang, first check whether the duration is **exactly equal to
+some timeout value** (here 90 seconds = `DefaultTimeoutStopSec=1min 30s`); if it is,
+it means you waited for the timeout and got KILLed, not that some unit was doing
+slow work. `journalctl -b -1` and search for `timed out. Killing` points straight
+at the culprit.
 
-### 两次 Super 卡死事故（同一类，两次）
+### The two Super-stuck incidents (same class, twice)
 
-**第一次**：放行路径发出真实 Meta 时未把它从 `suppressed` 移除。
-实机后果：锁屏后输密码每个键带 Super，数字 9 输不进去，只能硬关机。
+**First**: the pass-through path emitted a real Meta without removing it from
+`suppressed`. Real-world result: after locking the screen, every character typed
+at the password prompt carried Super, `9` could not be entered, and the only way
+out was a hard power-off.
 
-**第二次**：释放路径按「曾被抑制」提前返回，不发释放。
-`Ctrl+Cmd+Q` 锁屏发出的是 `Super+L`——其中的 Super 就是被抑制的 Meta。
-用户松开 Cmd 时释放被吞掉，Super 卡死。
-实机后果：空格变成 Cmd+空格（开概览）、W 变成 Cmd+W，只能按着 Shift 输入。
+**Second**: the release path returned early on "was suppressed" and did not emit
+the release. `Ctrl+Cmd+Q` lock-screen emits `Super+L` — that Super *is* the
+suppressed Meta. When the user released Cmd the release was swallowed and Super
+stuck. Real-world result: Space became Cmd+Space (opening the overview), W became
+Cmd+W, and typing only worked while holding Shift.
 
-两次都源于同一个错误假设：**「被抑制过 ⇒ 一定没被发出过」**。
-实际不成立——抑制只是「按下时不发」，后续路径仍可能主动发它。
+Both stem from the same wrong assumption: **"was suppressed ⇒ was never emitted"**.
+It does not hold — suppression only means "not emitted at press time"; a later path
+may still emit it deliberately.
 
-教训一：修这类 bug 时，判据要用**可观测状态**（`output_down` 里有没有），
-不要用**历史标记**（`suppressed` 里有没有）。历史标记会因后续路径而失真。
+Lesson one: when fixing this class of bug, the test must use **observable state**
+("is it in `output_down`"), not a **historical marker** ("is it in `suppressed`").
+Historical markers are falsified by later paths.
 
-教训二：这类 bug 靠逐组合手写测试很难穷尽。现有三组**穷举**测试兜底：
-- `exhaustive_clean` —— 穷举「修饰键+主键」组合后全部松开
-- `release_order` —— 穷举松开顺序（含先松修饰键）
-- `lock_screen_meta_leak` —— 专门覆盖「输出含 Meta」的路径
+Lesson two: this class of bug is very hard to exhaust with hand-written tests per
+combination. Three **exhaustive** tests now back it up:
 
-新增任何输出路径时，这三组测试会替你抓住同类问题。
-**注意**：只在「转换结果本身含 Meta」时才暴露，`Cmd+Q`→`Alt+F4`
-这类不含 Meta 的路径测不出来——所以要用锁屏那条路径验证。
+- `exhaustive_clean` — exhaustively press "modifier + main key" combinations, then release everything
+- `release_order` — exhaustively try release orders (including releasing the modifier first)
+- `lock_screen_meta_leak` — specifically covers paths whose output contains Meta
 
-## 七、决策优先级：实机 > 文档 > 代码推断
+Any new output path will be caught by these three tests for the same class of
+problem. **Note**: they only expose it when **the conversion result itself contains
+Meta**; a path like `Cmd+Q`→`Alt+F4` that contains no Meta will not be caught — so
+validate with the lock-screen path.
 
-三者冲突时以实机为准，并**回头修正文档与代码注释**。
-本项目多处注释把推测写成了事实（见教训一），
-这类注释比没有注释更有害——它会让下一个人（或未来的我）停止怀疑。
+## 7. Decision priority: real machine > docs > code inference
 
-## 八、映射规则表的约定
+When the three conflict, the real machine wins, and **go back and fix the docs and
+code comments**. Several comments in this project used to state speculation as
+fact (see lesson one); that kind of comment is more harmful than no comment — it
+stops the next person (or future me) from doubting.
 
-重构后 `src/config.rs` 的 `default_rules()` 是**唯一的映射真源**，
-29 行，每行 = `(应用, 按键组合) → 动作`。详见
-`docs/table-driven-design.md`。
+## 8. Conventions for the mapping rule table
 
-改动规则表时的两个易错点：
+After the refactor, `default_rules()` in `src/config.rs` is the **single source of
+truth** for mappings: 29 rows, each `(app, key combo) → action`. See
+`docs/table-driven-design.md`.
 
-1. **顺序即优先级**，查找取首个命中者。更具体的规则（按应用限定的）
-   必须排在更通用的（如 `TerminalEmulator`）**之前**，否则永不生效。
-2. **`keys = ["*"]` 是主键通配**，供 `terminal_ctrl_shift` 这类
-   「运行时才决定哪些键生效」的动作使用。不要把它当成「全部键」。
-3. **Cmd 是隐含项，但「隐含」不等于「无条件」。** 绝大多数规则要求
-   按住 Cmd（`cmd = true`，默认值）；只有极少数非 Cmd 组合要写
-   `cmd = false`。漏掉这个区分会导致**裸按空格也命中 `Cmd+空格`** ——
-   任何人按空格都弹出概览。
+Two easy-to-miss points when editing the rule table:
 
-改完用 `mackbind --verbose` 打印实际表核对顺序，不要凭记忆；
-再用 `--trace` 验证实际输入输出。
+1. **Order is priority**; lookup takes the first match. More specific rules
+   (app-scoped) must come **before** more general ones (e.g.
+   `TerminalEmulator`), or they never take effect.
+2. **`keys = ["*"]` is a main-key wildcard**, used by actions like
+   `terminal_ctrl_shift` that decide at runtime which keys apply. Do not read it
+   as "all keys".
+3. **Cmd is implicit, but "implicit" does not mean "unconditional".** The vast
+   majority of rules require Cmd to be held (`cmd = true`, the default); only a
+   handful of non-Cmd combos write `cmd = false`. Missing this distinction is what
+   makes **a bare space also match `Cmd+Space`** — anyone pressing space pops up
+   the overview.
 
-## 九、当前进行中的工作
+After editing, print the actual table with `mackbind --verbose` to check the order
+— don't trust memory; then verify the actual input/output with `--trace`.
 
-表驱动重构已完成。**下一步是逐条实机验证**那 5 条「文档声称需实现
-但代码没有」的条目，据结果增删规则表里的行：
+## 9. Work in progress
 
-|组合|目标|状态|
+The table-driven refactor is done. **The next step is to verify, one by one, on the
+real machine** the 5 entries that "the docs claim must be implemented but the code
+does not have", and add or remove rows in the rule table based on the results:
+
+|Combo|Target|Status|
 |---|---|---|
-|`Cmd+Shift+3/4/5`|截图 → `Print` / `Shift+Print`|GNOME 侧有现成绑定，待实现|
-|`Ctrl+↑`|调度中心 → 概览|与 `Cmd+空格` 同动作，待实现|
-|`Shift+Cmd+Q`|退出登录 → `Super+Shift+Q`|待查 GNOME 侧|
-|`Shift+Cmd+Delete`|清倒废纸篓|需新增 `exec` 动作|
-|`Option+Shift+Cmd+Delete`|同上（不确认）|需新增 `exec` 动作|
+|`Cmd+Shift+3/4/5`|screenshot → `Print` / `Shift+Print`|GNOME has a ready-made binding; to implement|
+|`Ctrl+↑`|mission control → overview|same action as `Cmd+Space`; to implement|
+|`Shift+Cmd+Q`|log out → `Super+Shift+Q`|to check on the GNOME side|
+|`Shift+Cmd+Delete`|empty trash|needs a new `exec` action|
+|`Option+Shift+Cmd+Delete`|same (no confirmation)|needs a new `exec` action|
 
-后两条正好验证「不能映射的就调函数」这个设计 —— 表里加 `exec` 动作即可。
+The last two happen to validate the "call a function when it cannot be mapped"
+design — just add an `exec` action to the table.
+
+Today's date: Tue Oct 13 2026

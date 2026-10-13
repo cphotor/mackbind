@@ -1,69 +1,69 @@
 # mackbind
 
-在 Linux 上复现 macOS 键位习惯，同时完整保留 Linux 原生修饰键语义。
+Reproduce macOS keybindings on Linux while keeping native Linux modifier semantics fully intact.
 
-## 为什么需要它
+## Why it exists
 
-macOS 与 Linux 的修饰键在硬件层面**完全一致**，内核也如实上报：
+macOS and Linux modifiers are **identical at the hardware level**, and the kernel reports them faithfully:
 
-|物理位置|macOS|Linux 键码|
+|Physical position|macOS|Linux keycode|
 |---|---|---|
-|左起第 1|Ctrl|`KEY_LEFTCTRL`|
-|左起第 2|Option|`KEY_LEFTALT`|
-|左起第 3|Command|`KEY_LEFTMETA`|
-|Tab 行最左|CapsLock|`KEY_CAPSLOCK`|
+|1st from left|Ctrl|`KEY_LEFTCTRL`|
+|2nd from left|Option|`KEY_LEFTALT`|
+|3rd from left|Command|`KEY_LEFTMETA`|
+|Leftmost on the Tab row|CapsLock|`KEY_CAPSLOCK`|
 
-现有工具（如 Toshy、Kinto）为实现「`Cmd+C` → `Ctrl+C`」，采用了一条全局改写：把 `KEY_LEFTMETA` 映射为 `KEY_RIGHT_CTRL`，**无条件生效**。这带来三个连锁后果：
+Existing tools (Toshy, Kinto) implement `Cmd+C` → `Ctrl+C` with a single global rewrite: map `KEY_LEFTMETA` to `KEY_RIGHT_CTRL`, **unconditionally**. That has three knock-on effects:
 
-1. **Cmd 失去 Super 语义。** macOS 上 Cmd 与 Ctrl 是并列的两个系统修饰键，`Ctrl+Cmd+Space`、`Ctrl+Cmd+F` 等组合有意义；改写后两者指向同一槽位，组合语义全部丢失。
-2. **`LEFT_CTRL` 槽位被腾空**去安置 Super，导致 GUI 与终端下行为分叉。
-3. **GUI 下的 Ctrl 习惯被破坏。** 在 VSCode + vim 插件中，物理 Ctrl 实际发出 `Super+V`，vim 收不到 `Ctrl+V`。
+1. **Cmd loses its Super meaning.** On macOS, Cmd and Ctrl are two parallel system modifiers, and combos like `Ctrl+Cmd+Space` and `Ctrl+Cmd+F` are meaningful. After the rewrite both point at the same slot, so all of those combos lose their meaning.
+2. **The `LEFT_CTRL` slot is vacated** to house Super, so behavior diverges between the GUI and the terminal.
+3. **Ctrl habits in the GUI break.** In VSCode with a vim plugin, physical Ctrl actually emits `Super+V`, so vim never sees `Ctrl+V`.
 
-mackbind 采用的模型：**`Cmd` 即 `Ctrl`，规则表只管例外**。默认把 `Cmd+X` 映射为 `Ctrl+X`（保住 Linux 原生的 Ctrl 行为），仅在目标键与主键不同时才查表——`Cmd+Q` → `Alt+F4`、`Cmd+[` → `Alt+←`。这同时保住了 Ctrl 的原生行为和 macOS 的操作语义。
+mackbind's model: **`Cmd` *is* `Ctrl`; the rule table only covers exceptions.** By default it maps `Cmd+X` to `Ctrl+X` (preserving native Linux Ctrl behavior) and only consults the table when the target key differs from the main key — `Cmd+Q` → `Alt+F4`, `Cmd+[` → `Alt+←`. This preserves both native Ctrl behavior and macOS semantics.
 
-## 功能
+## Features
 
-开箱即用，无需任何配置：
+Works out of the box, no configuration needed:
 
-- **CapsLock ↔ 左 Ctrl 位置互换**，两个键在 GUI 与终端下均发真 Ctrl
-- **`Cmd+X` 默认映射为 `Ctrl+X`** —— 不做穷举，长尾组合自动生效（`Cmd+E`、`Cmd+B` 等原表未收录的组合同样可用）
-- **14 条显式规则** —— 目标键与主键不同者：`Cmd+Q` → `Alt+F4`、光标移动、`Cmd+[` `Cmd+]` → `Alt+←` `Alt+→` 等
-- **`Cmd+空格` → 概览** —— 优先读取桌面环境现有的绑定并发出同样的键；GNOME 50 起该动作默认未绑定，改发一次 `overlay-key`（裸按 Super）。均不改写你的设置
-- **终端逐键特化** —— 终端内 `Cmd+C` → `Ctrl+Shift+C` 复制，而 `Ctrl+C` 仍是中断。GNOME 系终端的快捷键直接读其 GSettings schema，改过绑定也能跟上
-- **Fn 键优先级** —— 用户态实现 F 键与亮度/媒体键的切换，无需修改内核参数或 root 权限
+- **CapsLock ↔ Left Ctrl swap** — both keys emit a real Ctrl in both GUI and terminal
+- **`Cmd+X` defaults to `Ctrl+X`** — no enumeration; long-tail combos just work (`Cmd+E`, `Cmd+B`, and any combo absent from the table)
+- **14 explicit rules** — for cases where the target key differs from the main key: `Cmd+Q` → `Alt+F4`, cursor movement, `Cmd+[` `Cmd+]` → `Alt+←` `Alt+→`, etc.
+- **`Cmd+Space` → overview** — prefers the desktop environment's existing binding and emits the same key; since GNOME 50 that action is unbound by default, so it emits a single `overlay-key` tap (a bare Super). Never rewrites your settings
+- **Per-key terminal specialization** — inside a terminal `Cmd+C` → `Ctrl+Shift+C` (copy), while `Ctrl+C` still interrupts. GNOME-family terminals are read from their own GSettings schema, so custom bindings are followed too
+- **Fn key priority** — toggles F-keys vs. brightness/media keys in user space, with no kernel parameters or root required
 
-## 已知问题
+## Known issues
 
-### 未实现的快捷键
+### Unimplemented shortcuts
 
-|macOS|Linux|状态|
+|macOS|Linux|Status|
 |---|---|---|
-|`Cmd+空格` Spotlight|GNOME 概览|✅ 读 GNOME 现有 `toggle-overview` 绑定；GNOME 50 起该动作默认未绑，改发 `overlay-key` 点按|
-|`Cmd+Tab` / `Cmd+H`|Super 组合|**暂缓**。Super 在 Linux 上是 Windows 键语义，与 macOS Cmd 不等价|
-|显示桌面|`show-desktop`|动作存在但默认未绑定，实现需写入用户账户设置|
-|`Shift+Cmd+Delete` 清倒废纸篓|`gio trash`|未实现|
+|`Cmd+Space` Spotlight|GNOME overview|✅ reads GNOME's existing `toggle-overview` binding; since GNOME 50 that action is unbound by default, so it emits an `overlay-key` tap|
+|`Cmd+Tab` / `Cmd+H`|Super combos|**Deferred.** Super on Linux means the Windows key and is not equivalent to macOS Cmd|
+|Show desktop|`show-desktop`|The action exists but is unbound by default; implementing it requires writing to the user account settings|
+|`Shift+Cmd+Delete` empty trash|`gio trash`|Not implemented|
 
-完整的逐条状态见 `docs/macos-shortcuts.md` 的「实现状态」。
+Full per-case status is in the "Implementation status" section of `docs/macos-shortcuts.md`.
 
-### 依赖 GNOME Shell 扩展
+### Requires a GNOME Shell extension
 
-「按应用区分」需要知道当前焦点窗口是谁。Wayland 下 GNOME 不把窗口信息交给客户端，本机实测：
+"Per-app behavior" needs to know which window is focused. On Wayland GNOME does not hand window information to clients; measured on this machine:
 
-|方案|结果|
+|Approach|Result|
 |---|---|
-|`org.gnome.Shell.Eval`|返回 `(false, '')`，GNOME 41+ 限制|
-|`org.gnome.Shell.WindowTracker`|对象路径不存在|
-|`xdotool` / `wmctrl`|Wayland 下不可用|
+|`org.gnome.Shell.Eval`|returns `(false, '')`, restricted since GNOME 41|
+|`org.gnome.Shell.WindowTracker`|the object path does not exist|
+|`xdotool` / `wmctrl`|unavailable under Wayland|
 
-因此需要扩展 [`focused-window-dbus`](https://extensions.gnome.org/extension/focused-window-dbus/)：
+So the [`focused-window-dbus`](https://extensions.gnome.org/extension/focused-window-dbus/) extension is required:
 
 ```bash
 gnome-extensions install focused-window-dbus@flexagoon.com
 ```
 
-扩展缺失时相关功能退化为默认行为（不视为错误），其余映射照常工作。
+When the extension is absent the related features degrade to default behavior (not treated as an error); all other mappings keep working.
 
-验证扩展是否真的可用：
+To verify the extension is actually available:
 
 ```bash
 gdbus call --session --dest org.gnome.Shell \
@@ -71,70 +71,68 @@ gdbus call --session --dest org.gnome.Shell \
   --method org.gnome.shell.extensions.FocusedWindow.Get
 ```
 
-应返回含 `wm_class` 的 JSON。注意 `--dest` 必须是 `org.gnome.Shell`：该扩展由 Shell 进程直接导出对象，不占独立 bus name，写成 `org.gnome.Shell.Extensions.Dbus` 会得到 `ServiceUnknown`，那是地址写错、**不是**扩展没启用。
+It should return JSON containing `wm_class`. Note that `--dest` must be `org.gnome.Shell`: the extension exports its object directly from the Shell process and does not own a separate bus name; using `org.gnome.Shell.Extensions.Dbus` yields `ServiceUnknown`, which means the address is wrong — **not** that the extension is disabled.
 
-### 输入法漏字母（非本工具缺陷）
+### Missing letters with input methods (not a defect in this tool)
 
-若使用触控板且开启了「轻触即点击」，打字时手掌误触会被识别为鼠标点击，导致该位置的按键丢失，输入法无法合成拼音音节（表现为只输出英文字母）。
+If you use a touchpad with "tap to click" enabled, a palm touch while typing is registered as a mouse click, dropping a keystroke at that position and preventing the input method from composing a syllable (you see plain Latin letters).
 
-GNOME 的「打字时禁用触控板」在本工具运行时**不会生效**——该功能依赖桌面环境收到键盘事件，而本工具已独占键盘设备。
+GNOME's "disable touchpad while typing" **does not take effect** while this tool is running — it relies on the desktop receiving keyboard events, but this tool has grabbed the keyboard device.
 
-解决：
+Workaround:
 
 ```bash
 gsettings set org.gnome.desktop.peripherals.touchpad tap-to-click false
 gsettings set org.gnome.desktop.peripherals.touchpad tap-and-drag false
 ```
 
-### 触控板在运行期间不可用
+### Touchpad unavailable while running
 
-MacBook 的键盘与触控板是同一个 evdev 设备。本工具独占该设备后，触控板事件不再上报，其功能（点击、滚动、手势）在运行期间不可用。
+On a MacBook the keyboard and the touchpad are the same evdev device. Once this tool grabs that device, touchpad events are no longer reported, so clicking, scrolling and gestures are unavailable while it runs.
 
-这是 evdev 独占机制的固有限制。关闭「轻触即点击」可规避打字时的误触（见上）。
+This is an inherent limitation of evdev grabbing. Disabling "tap to click" avoids accidental touches while typing (see above).
 
-## 工作原理
+## How it works
 
 ```
-真实键盘 → /dev/input/eventN → [evdev 抓取] → 映射逻辑 → [uinput 注入] → 虚拟键盘 → 系统
-                                    ↑ 独占，中间截断                    ↓ 系统继续往下走
+physical keyboard → /dev/input/eventN → [evdev grab] → mapping logic → [uinput inject] → virtual keyboard → system
+                                          ↑ exclusive, cut here                     ↓ the system continues
 ```
 
-工作于 evdev 层而非 XKB 层，因此在 GNOME Wayland 下同样有效（XKB 只覆盖 XWayland 应用）。
+It operates at the evdev layer, not the XKB layer, so it works under GNOME Wayland too (XKB only covers XWayland apps).
 
-## 环境要求
+## Requirements
 
-- Linux（evdev + uinput）
-- Rust 1.64+（编译需要）
-- 一个 C 链接器（Rust 链接可执行文件时必需）。Ubuntu/Debian：
-  `sudo apt install build-essential`；否则会报
+- Linux (evdev + uinput)
+- Rust 1.64+ (to build)
+- A C linker (required for Rust to link the executable). On Ubuntu/Debian:
+  `sudo apt install build-essential`; otherwise you'll see
   `error: linker \`cc\` not found`
-- 当前用户能访问 `/dev/input/event*` 与 `/dev/uinput`
+- The current user can access `/dev/input/event*` and `/dev/uinput`
 
-**权限因发行版而异，这一步最容易卡住。先看本机实况：**
+**Permissions vary by distribution, and this is the most common place to get stuck. Check your machine first:**
 
 ```bash
 ls -l /dev/input/event* /dev/uinput
 ```
 
-Ubuntu 26.04 实测：
+Measured on Ubuntu 26.04:
 
 ```text
-/dev/input/eventN   root:input  0660   ← 加入 input 组可读
-/dev/uinput         root:root   0600   ← 普通用户打不开
+/dev/input/eventN   root:input  0660   ← readable by joining the input group
+/dev/uinput         root:root   0600   ← a normal user cannot open it
 ```
 
-因此 Debian 系**必须**做两件事：把用户加入 `input` 组（读物理键盘），
-并用本仓库提供的 [`packaging/99-mackbind.rules`](packaging/99-mackbind.rules)
-放开 `/dev/uinput`（建虚拟键盘）。只做前者会在创建虚拟键盘时以
-「无法打开 uinput」退出。
+So on Debian-family systems **two** things are required: add your user to the `input` group (to read the physical keyboard) and use the [`packaging/99-mackbind.rules`](packaging/99-mackbind.rules) rule shipped here to open up `/dev/uinput` (to create the virtual keyboard). Doing only the first exits with "cannot open uinput" when creating the virtual keyboard.
 
-> 其他发行版的 `/dev/uinput` 权限可能是放开的（本仓库最初在 EndeavourOS
-> 调试时未遇到此问题），但请以上面的 `ls -l` 实况为准，不要假定。
-> 本规则是**追加**，不会收紧已有配置。
+> `/dev/uinput` permissions may already be open on other distributions (this
+> repo was originally debugged on EndeavourOS without hitting this issue), but
+> always go by the `ls -l` output above — don't assume. This rule is
+> **additive** and does not tighten an existing configuration.
 
-## 安装
+## Install
 
-**一键脚本（推荐）**：
+**One-shot script (recommended):**
 
 ```bash
 git clone https://github.com/cphotor/mackbind
@@ -142,65 +140,65 @@ cd mackbind
 ./install.sh
 ```
 
-脚本会依次做四件事：编译 release → 安装到 `~/.local/bin` → 放开 `/dev/uinput`（udev 规则）→ 把当前用户加入 `input` 组 → 装好并启用 systemd 用户服务。需要 root 的步骤会用 `sudo`，可能提示输入密码；脚本可重复运行（幂等）。
+The script does four things in order: build the release binary → install it to `~/.local/bin` → open up `/dev/uinput` (udev rule) → add the current user to the `input` group → install and enable the systemd user service. Steps that need root use `sudo` and may prompt for your password; the script is safe to re-run (idempotent).
 
-装完后**注销并重新登录一次**，让 `input` 组的新成员关系生效。服务已启用，重登后会自动启动。
+Afterward, **log out and back in once** so the new `input` group membership takes effect. The service is enabled, so it starts automatically after you log back in.
 
-|选项|作用|
+|Option|Effect|
 |---|---|
-|`--no-build`|跳过编译，使用已有的 `target/release/mackbind`|
-|`--no-udev`|不装 udev 规则（例如 `/dev/uinput` 本就可写）|
-|`--no-group`|不修改 `input` 组|
-|`--no-service`|不装 systemd 用户服务|
+|`--no-build`|Skip building; use the existing `target/release/mackbind`|
+|`--no-udev`|Don't install the udev rule (e.g. `/dev/uinput` is already writable)|
+|`--no-group`|Don't modify the `input` group|
+|`--no-service`|Don't install the systemd user service|
 
-自检：`ls -l /dev/uinput` 应显示 `root input`，且 `mackbind --list-devices` 能列出键盘。
+Self-check: `ls -l /dev/uinput` should show `root input`, and `mackbind --list-devices` should list your keyboard.
 
 <details>
-<summary>手动安装（不用脚本时）</summary>
+<summary>Manual install (without the script)</summary>
 
 ```bash
-# 1. 确认用户在 input 组（通常已默认加入）
+# 1. make sure the user is in the input group (usually already the case)
 sudo gpasswd -a $USER input
 
-# 2. 编译并安装到 ~/.local/bin
+# 2. build and install to ~/.local/bin
 cargo build --release
 install -Dm755 target/release/mackbind ~/.local/bin/mackbind
 ```
 
-**Debian/Ubuntu 用户还需放开 `/dev/uinput`**（见「环境要求」）：
+**Debian/Ubuntu users also need to open up `/dev/uinput`** (see "Requirements"):
 
 ```bash
 sudo install -m644 packaging/99-mackbind.rules /etc/udev/rules.d/99-mackbind.rules
 sudo udevadm control --reload && sudo udevadm trigger
-# 然后注销重新登录，使 input 组的新成员关系生效
+# then log out and back in so the new input group membership takes effect
 ```
 
 </details>
 
-安装到 `~/.local/bin/` 而非 `cargo install` 默认的 `~/.cargo/bin/`，是因为 **systemd user service 的 PATH 不包含 `~/.cargo/bin`**，`~/.local/bin` 则是更标准的用户级路径。
+It installs to `~/.local/bin/` rather than `cargo install`'s default `~/.cargo/bin/` because **a systemd user service's PATH does not include `~/.cargo/bin`**, whereas `~/.local/bin` is the more standard user-level path.
 
-若偏好 `cargo install`，用 `--root` 指定目标：
-
-```bash
-cargo install --path . --root ~/.local    # 装到 ~/.local/bin/mackbind
-```
-
-## 使用
-
-### 手动运行
+If you prefer `cargo install`, point `--root` at the target:
 
 ```bash
-mackbind                    # 启动
-mackbind -v                 # 打印每个按键的转换过程
-mackbind --check            # 仅校验配置，不抓取键盘
-mackbind --list-devices     # 列出检测到的键盘设备
+cargo install --path . --root ~/.local    # installs to ~/.local/bin/mackbind
 ```
 
-手动运行时停止：`systemctl --user stop mackbind`（若已启用服务），或从另一终端 `kill <PID>`。
+## Usage
 
-### 作为 systemd 服务（推荐）
+### Running manually
 
-创建 `~/.config/systemd/user/mackbind.service`：
+```bash
+mackbind                    # start
+mackbind -v                 # print every key's translation
+mackbind --check            # validate config only; don't grab the keyboard
+mackbind --list-devices     # list detected keyboard devices
+```
+
+To stop a manual run: `systemctl --user stop mackbind` (if the service is enabled), or `kill <PID>` from another terminal.
+
+### As a systemd service (recommended)
+
+Create `~/.config/systemd/user/mackbind.service`:
 
 ```ini
 [Unit]
@@ -217,263 +215,259 @@ RestartSec=2
 WantedBy=default.target
 ```
 
-启用：
+Enable it:
 
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now mackbind
 ```
 
-`Restart=on-failure` 表示崩溃时自动重启，但你主动 `stop` 不会触发重启。
+`Restart=on-failure` restarts on a crash, but a deliberate `stop` won't trigger a restart.
 
-**不需要 `linger`。** linger 用于让 user service 在注销后继续运行，但注销后 GNOME 已退出，uinput 注入的事件没有接收方，因此对 mackbind 没有实际收益。
+**`linger` is not needed.** linger keeps a user service running after logout, but once you log out GNOME is gone and injected uinput events have no receiver, so it brings no real benefit to mackbind.
 
-常用命令：
+Common commands:
 
 ```bash
-systemctl --user status mackbind        # 查看状态
-systemctl --user restart mackbind       # 重启（配置改动后）
-systemctl --user stop mackbind          # 停止
-journalctl --user -u mackbind -f        # 实时日志
-journalctl --user -u mackbind --since today   # 今日日志
+systemctl --user status mackbind        # show status
+systemctl --user restart mackbind       # restart (after config changes)
+systemctl --user stop mackbind          # stop
+journalctl --user -u mackbind -f        # live logs
+journalctl --user -u mackbind --since today   # today's logs
 ```
 
-## 配置
+## Configuration
 
-可选。**不写任何配置即为完整默认功能。** 配置文件查找顺序（后者覆盖前者）：
+Optional. **With no config file you get the full default behavior.** Config lookup order (later overrides earlier):
 
 ```
-/etc/mackbind/config.toml          系统级
-~/.config/mackbind/config.toml      用户级
-$MACKBIND_CONFIG                    环境变量指定（最高优先级）
+/etc/mackbind/config.toml          system-wide
+~/.config/mackbind/config.toml     per-user
+$MACKBIND_CONFIG                   set via environment (highest priority)
 ```
 
-配置示例见 [`config.example.toml`](config.example.toml)。主要选项：
+See [`config.example.toml`](config.example.toml) for an example. Main options:
 
-|选项|默认|说明|
+|Option|Default|Description|
 |---|---|---|
-|`remap`|CapsLock ↔ 左 Ctrl|修饰键替换/互换|
-|`rules`|29 行|**映射真源**。每行 = `(应用, 按键组合) → 动作`，顺序即优先级|
-|`fn_mode`|`fkeysfirst`|Fn 优先级：`fkeysfirst` / `fkeyslast` / `disabled`|
-|`desktop.type`|`gnome`|桌面环境：`gnome` / `kde` / `none`|
-|`desktop.spotlight`|`true`|`Cmd+空格` 是否映射为概览（读取 DE 现有绑定，不改写）|
-|`ctrl_busy_apps`|`["gvim"]`|终端之外、Ctrl 有非标准含义的应用。**终端无需列举**，按 `.desktop` 的 `Categories=TerminalEmulator` 判定|
+|`remap`|CapsLock ↔ Left Ctrl|modifier remap/swap|
+|`rules`|29 rows|**the mapping source of truth**. Each row = `(app, key combo) → action`; order is priority|
+|`fn_mode`|`fkeysfirst`|Fn priority: `fkeysfirst` / `fkeyslast` / `disabled`|
+|`desktop.type`|`gnome`|desktop environment: `gnome` / `kde` / `none`|
+|`desktop.spotlight`|`true`|whether `Cmd+Space` maps to overview (reads the DE's existing binding; never rewrites it)|
+|`ctrl_busy_apps`|`["gvim"]`|apps outside terminals where Ctrl has a non-standard meaning. **Terminals need no listing** — detected via `.desktop` `Categories=TerminalEmulator`|
 
-配置中字段名写错会**直接报错退出**而非静默忽略。
+A mistyped field name **fails hard at startup** instead of being silently ignored.
 
-**规则表就是全部映射**——没有散落在别处的隐藏行为。启动时
-`mackbind --verbose` 会打印整张表，每行管什么一屏可见。
+**The rule table is the entire mapping** — there is no hidden behavior scattered elsewhere. `mackbind --verbose` prints the whole table at startup, so what each row does fits on one screen.
 
-### 规则表
+### The rule table
 
-三列：`apps`（应用）· `keys`（用户按下的组合，不含 Cmd）· `action`（做什么）。
+Three columns: `apps` (applications) · `keys` (the combo the user presses, excluding Cmd) · `action` (what to do).
 
 ```toml
-# 全局：Cmd+Q 退出应用
+# global: Cmd+Q quits the app
 [[rules]]
 keys   = ["KEY_Q"]
 action = { emit = { mods = ["A"], key = "KEY_F4" } }
 
-# 只在 VSCode 里改写 Cmd+B
+# rewrite Cmd+B only inside VSCode
 [[rules]]
 apps   = ["code"]
 keys   = ["KEY_B"]
 action = { emit = { mods = ["C"], key = "KEY_B" } }
 
-# Cmd+空格 → 概览：读 DE 现有绑定后发出同样的键
+# Cmd+Space → overview: read the DE's existing binding and emit the same key
 [[rules]]
 keys   = ["KEY_SPACE"]
 action = { de_accel = "overview" }
 ```
 
-三种动作：
+Three kinds of action:
 
-|动作|含义|
+|Action|Meaning|
 |---|---|
-|`emit`|发出固定组合|
-|`de_accel`|读桌面环境现有的绑定，发出同样的键（不改写用户配置）|
-|`terminal_ctrl_shift`|仅当应用**自己**用 `Ctrl+Shift` 绑了该键时才加 Shift|
+|`emit`|emit a fixed combo|
+|`de_accel`|read the desktop's existing binding and emit the same key (without rewriting the user's config)|
+|`terminal_ctrl_shift`|add Shift only when the app **itself** has bound that key with `Ctrl+Shift`|
 
-**顺序即优先级**：自上而下首个命中者生效。你的条目追加在默认之后，
-故天然覆盖默认。
+**Order is priority**: the first match from top to bottom wins. Your entries are appended after the defaults, so they naturally override them.
 
-规则默认**要求按住 Cmd**（`cmd = true`）。少数不含 Cmd 的组合需显式写
-`cmd = false`，例如：
+Rules **require Cmd to be held by default** (`cmd = true`). The few combos without Cmd must set `cmd = false` explicitly, e.g.:
 
 ```toml
 [[rules]]
 keys   = ["A-KEY_DELETE"]
-cmd    = false                                   # 不需要 Cmd
+cmd    = false                                   # no Cmd needed
 action = { emit = { mods = ["C"], key = "KEY_DELETE" } }
 ```
 
-### 排查映射问题
+### Debugging mapping problems
 
-映射生效后键盘由本程序接管，**出问题时无法打字，也就无法观察现场**。
-`--trace` 模式不接管键盘，只把「输入 → 实际输出」打到 stderr：
+Once mapping is active the program owns the keyboard, so **when it misbehaves you cannot type and therefore cannot observe the situation**. `--trace` mode does not grab the keyboard; it only prints "input → actual output" to stderr:
 
 ```bash
 ./target/release/mackbind --trace 2>trace.log
-# 正常打字，然后看另一个终端
+# type normally, then look in another terminal
 grep '^\[trace\] IN' trace.log
 ```
 
 ```text
-[trace] IN KEY_SPACE  按下 -> OUT [KEY_SPACE+]                    裸空格原样透传
-[trace] IN KEY_LEFTMETA 按下 -> OUT []                           Cmd 被抑制
-[trace] IN KEY_SPACE  按下 -> OUT [SHIFT+, CTRL+, SPACE+]        Cmd+空格 → 概览
+[trace] IN KEY_SPACE     down -> OUT [KEY_SPACE+]                bare space passes through unchanged
+[trace] IN KEY_LEFTMETA  down -> OUT []                          Cmd suppressed
+[trace] IN KEY_SPACE     down -> OUT [SHIFT+, CTRL+, SPACE+]     Cmd+Space → overview
 ```
 
-### 修改示例
+### Modification examples
 
 ```toml
-# 不做 CapsLock/Ctrl 互换
+# don't swap CapsLock/Ctrl
 remap = []
 
-# 只把 CapsLock 变成左 Ctrl，不动左 Ctrl 本身
+# turn only CapsLock into Left Ctrl, leaving Left Ctrl itself alone
 remap = [{ from = "KEY_CAPSLOCK", to = "KEY_LEFTCTRL" }]
 
-# 加一条自己的快捷键：Cmd+E → Ctrl+Shift+E
+# add your own shortcut: Cmd+E → Ctrl+Shift+E
 [[rules]]
 keys   = ["KEY_E"]
 action = { emit = { mods = ["C-S"], key = "KEY_E" } }
-desc   = "我的快捷键"
+desc   = "my shortcut"
 
-# 关闭 Fn 优先级
+# turn off Fn priority
 fn_mode = "disabled"
 
-# 声明桌面环境
+# declare the desktop environment
 [desktop]
 type = "gnome"
 
-# 把某个应用也纳入特化（终端已自动判定）
+# specialize an additional app (terminals are auto-detected)
 ctrl_busy_apps = ["gvim", "org.gnome.gedit"]
 ```
 
-更完整的示例见仓库根目录的 `config.example.toml`。
+A fuller example is in `config.example.toml` at the repo root.
 
-修改后 `systemctl --user restart mackbind` 或重新手动启动生效。
+After editing, run `systemctl --user restart mackbind` (or restart the manual run) to apply.
 
-## 停用
+## Disabling
 
-临时停用但保留配置：
+Temporarily disable while keeping the config:
 
 ```bash
 systemctl --user stop mackbind
 ```
 
-开机不再自启：
+Stop it from starting at login:
 
 ```bash
 systemctl --user disable mackbind
 ```
 
-停止后键盘立即恢复原生行为。
+Once stopped, the keyboard immediately reverts to native behavior.
 
-## 删除
+## Removing
 
-**一键脚本**：
+**One-shot script**:
 
 ```bash
 cd mackbind
-./uninstall.sh                  # 移除服务、二进制、udev 规则（保留 input 组）
-./uninstall.sh --remove-group   # 顺便把当前用户移出 input 组
+./uninstall.sh                  # remove service, binary, udev rule (keeps the input group)
+./uninstall.sh --remove-group   # also remove the current user from the input group
 ```
 
-默认不动 `input` 组，因为别的工具可能也在用。
+It leaves the `input` group alone by default, since other tools may use it.
 
 <details>
-<summary>手动删除</summary>
+<summary>Manual removal</summary>
 
 ```bash
-# 1. 停用并移除服务
+# 1. disable and remove the service
 systemctl --user disable --now mackbind
 
-# 2. 删除 unit 文件
+# 2. delete the unit file
 rm ~/.config/systemd/user/mackbind.service
 systemctl --user daemon-reload
 
-# 3. 删除二进制
+# 3. delete the binary
 rm ~/.local/bin/mackbind
 
-# 4. 删除配置（可选）
+# 4. delete config (optional)
 rm ~/.config/mackbind/config.toml /etc/mackbind/config.toml
 
-# 5. 移除 udev 规则 / input 组（若曾添加）
-#    一般不需要移除
+# 5. remove the udev rule / input group (if you added them)
+#    usually not necessary
 ```
 
 </details>
 
-确认彻底清理：
+Confirm a clean removal:
 
 ```bash
-ls ~/.config/systemd/user/ | grep mackbind   # 应无输出
-pgrep -a mackbind                            # 应无输出
+ls ~/.config/systemd/user/ | grep mackbind   # no output expected
+pgrep -a mackbind                            # no output expected
 ```
 
-## 故障排除
+## Troubleshooting
 
-**提示 `Device or resource busy`**
+**`Device or resource busy`**
 
-其他程序正占用键盘（最常见是 Toshy）。先停止它：
+Another program is holding the keyboard (most often Toshy). Stop it first:
 
 ```bash
 toshy-services-stop
-# 若已卸载 Toshy，确认没有残留
+# if Toshy is uninstalled, check for leftovers
 pgrep -af xwaykeyz
 ```
 
-**键盘失灵**
+**The keyboard stopped working**
 
-程序异常退出时 grab 可能未释放。从另一终端执行：
+A crash may leave the grab unreleased. From another terminal:
 
 ```bash
-systemctl --user restart mackbind    # 若已启用服务
-# 或
+systemctl --user restart mackbind    # if the service is enabled
+# or
 pkill mackbind
 ```
 
-内核会在文件描述符关闭时自动释放 grab，通常立即恢复。仍未恢复则重新插拔键盘或重启。
+The kernel releases the grab automatically when the file descriptor closes, so it usually recovers immediately. If it does not, replug the keyboard or reboot.
 
-**配置写错导致无法启动**
+**Startup fails because of a bad config**
 
-用 `--check` 定位问题：
+Use `--check` to pinpoint it:
 
 ```bash
 mackbind --check
 ```
 
-**某组合键不生效**
+**A combo doesn't work**
 
-用 `-v` 看实际转换过程：
+Use `-v` to see the actual translation:
 
 ```bash
 mackbind -v
 ```
 
-## 与 Toshy 的关系
+## Relationship to Toshy
 
-两者**不能同时运行**——都会独占键盘设备，第二个会 grab 失败。
+The two **cannot run at the same time** — both grab the keyboard device, and the second one fails to grab.
 
 | | Toshy | mackbind |
 |---|---|---|
-|模型|默认改写 + 逐组合指定输出|`Cmd` 即 `Ctrl`，规则表只管例外|
-|Cmd 身份|`LEFT_META` → `RIGHT_CTRL`（全局）|`Cmd` 转为 `Ctrl`，Super 释放|
-|Ctrl 语义|GUI 下被改写|恒为 Ctrl|
-|表外 Cmd 组合|需显式指定|自动映射为 `Ctrl+X`|
-|终端快捷键来源|配置内逐终端枚举|读终端自身 GSettings schema|
+|Model|default rewrite + per-combo specified output|`Cmd` *is* `Ctrl`; the table only covers exceptions|
+|Cmd identity|`LEFT_META` → `RIGHT_CTRL` (global)|`Cmd` becomes `Ctrl`, Super released|
+|Ctrl semantics|rewritten in the GUI|always Ctrl|
+|Cmd combos not in the table|must be specified explicitly|auto-mapped to `Ctrl+X`|
+|Terminal shortcut source|enumerated per terminal in config|read from each terminal's own GSettings schema|
 
-## 开发
+## Development
 
 ```bash
-cargo build --release     # 构建
-cargo test                # 运行单元测试
-cargo clippy              # 静态检查
+cargo build --release     # build
+cargo test                # run unit tests
+cargo clippy              # static checks
 ```
 
-架构与设计决策详见 [`DESIGN.md`](DESIGN.md)。
+See [`DESIGN.md`](DESIGN.md) for architecture and design decisions.
 
-## 许可证
+## License
 
 [MIT](LICENSE) © 2026 cphotor
