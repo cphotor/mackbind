@@ -13,8 +13,9 @@
 //! |`xdotool` / `wmctrl`|unusable under Wayland|
 //!
 //! So a GNOME Shell extension is needed to export focused-window information.
-//! This module uses `focused-window-dbus@flexagoon.com` (measured working as
-//! version 11 on the real machine); its D-Bus interface is:
+//! This module uses `focused-window-dbus@flexagoon.com` (version 11 declares
+//! `shell-version: ["49", "50"]`; `./install.sh` installs and enables it on
+//! GNOME). Its D-Bus interface is:
 //!
 //! ```text
 //! dest:   org.gnome.Shell
@@ -35,7 +36,10 @@
 //! When the extension is missing or unavailable, `focused_wm_class()` returns
 //! `None` and the caller treats it as an "unknown app". That is **not treated
 //! as an error**—the other mapping rules still work; only the "distinguish by
-//! app" part degrades to the default behavior.
+//! app" part degrades to the default behavior. The degradation is silent, and
+//! the default behavior is `Cmd → Ctrl`: in a terminal the result is that
+//! `Cmd+C` becomes `Ctrl+C` (SIGINT) rather than copy. So when per-app
+//! behavior looks wrong, query the interface above *first*.
 
 use std::process::Command;
 

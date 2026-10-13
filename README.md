@@ -57,13 +57,22 @@ Full per-case status is in the "Implementation status" section of `docs/macos-sh
 |`org.gnome.Shell.WindowTracker`|the object path does not exist|
 |`xdotool` / `wmctrl`|unavailable under Wayland|
 
-So the [`focused-window-dbus`](https://extensions.gnome.org/extension/focused-window-dbus/) extension is required:
+So the [`focused-window-dbus`](https://extensions.gnome.org/extension/focused-window-dbus/) extension is required. `./install.sh` installs and enables it automatically when it detects a GNOME session (skip it with `--no-extension`).
+
+To do it by hand instead — the CLI takes a downloaded bundle, not a UUID, so resolve the release matching your Shell version first:
 
 ```bash
-gnome-extensions install focused-window-dbus@flexagoon.com
+shell_major=$(gnome-shell --version | sed -E 's/[^0-9]*([0-9]+).*/\1/')
+path=$(curl -fsSL "https://extensions.gnome.org/extension-info/?uuid=focused-window-dbus@flexagoon.com&shell_version=$shell_major" \
+       | sed -n 's/.*"download_url": *"\([^"]*\)".*/\1/p')
+curl -fLo /tmp/fwd.zip "https://extensions.gnome.org$path"
+gnome-extensions install --force /tmp/fwd.zip
+gnome-extensions enable focused-window-dbus@flexagoon.com
 ```
 
-When the extension is absent the related features degrade to default behavior (not treated as an error); all other mappings keep working.
+A newly installed extension is only loaded when the Shell starts, so log out and back in once.
+
+When the extension is absent the per-app rules silently never match and the mapping degrades to the generic `Cmd → Ctrl` behavior — in a terminal that means `Cmd+C` sends `Ctrl+C` (SIGINT) instead of copying. It is not reported as an error; all other mappings keep working.
 
 To verify the extension is actually available:
 

@@ -408,9 +408,11 @@ not "which keys are bound". The mapping target is determined by a static table;
 the application only needs to receive the correct `Ctrl+X` and will interpret it
 correctly itself.
 
-Under GNOME Wayland, a Shell extension must provide the focused-window info. This
-machine already has `focused-window-dbus@flexagoon.com` installed (version 11),
-**verified working**, with the interface:
+Under GNOME Wayland, a Shell extension must provide the focused-window info. The
+project therefore depends on `focused-window-dbus@flexagoon.com` (version 11 at
+the time of writing; its `metadata.json` declares
+`shell-version: ["49", "50"]`), which `./install.sh` installs and enables on
+GNOME. Its interface is:
 
 ```text
 dest:   org.gnome.Shell
@@ -425,6 +427,14 @@ itself. Using `org.gnome.Shell.Extensions.Dbus` by mistake yields
 is disabled, but that the address is wrong. The criterion: querying
 `org.gnome.Shell` returns JSON normally, while `metadata.json` exists in the
 extension directory and `enabled-extensions` contains that uuid.
+
+**When the extension is missing the failure is silent.** `focused_wm_class()`
+returns `None`, so *every* app-scoped rule stops matching and the mapping falls
+back to the generic `Cmd → Ctrl` semantics. In a terminal that turns `Cmd+C`
+into `Ctrl+C`, i.e. SIGINT instead of copy, and nothing logs an error — the
+keys simply have the wrong meaning. So the first diagnostic step for any
+"per-app behavior is wrong" report is the `gdbus call` above, not reading the
+rule table: this exact silent degradation was once mistaken for a mapping bug.
 
 ## Implementation choice
 
