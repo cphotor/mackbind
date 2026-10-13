@@ -134,13 +134,35 @@ Ubuntu 26.04 实测：
 
 ## 安装
 
+**一键脚本（推荐）**：
+
+```bash
+git clone https://github.com/cphotor/mackbind
+cd mackbind
+./install.sh
+```
+
+脚本会依次做四件事：编译 release → 安装到 `~/.local/bin` → 放开 `/dev/uinput`（udev 规则）→ 把当前用户加入 `input` 组 → 装好并启用 systemd 用户服务。需要 root 的步骤会用 `sudo`，可能提示输入密码；脚本可重复运行（幂等）。
+
+装完后**注销并重新登录一次**，让 `input` 组的新成员关系生效。服务已启用，重登后会自动启动。
+
+|选项|作用|
+|---|---|
+|`--no-build`|跳过编译，使用已有的 `target/release/mackbind`|
+|`--no-udev`|不装 udev 规则（例如 `/dev/uinput` 本就可写）|
+|`--no-group`|不修改 `input` 组|
+|`--no-service`|不装 systemd 用户服务|
+
+自检：`ls -l /dev/uinput` 应显示 `root input`，且 `mackbind --list-devices` 能列出键盘。
+
+<details>
+<summary>手动安装（不用脚本时）</summary>
+
 ```bash
 # 1. 确认用户在 input 组（通常已默认加入）
 sudo gpasswd -a $USER input
 
 # 2. 编译并安装到 ~/.local/bin
-git clone https://github.com/<you>/mackbind
-cd mackbind
 cargo build --release
 install -Dm755 target/release/mackbind ~/.local/bin/mackbind
 ```
@@ -153,8 +175,7 @@ sudo udevadm control --reload && sudo udevadm trigger
 # 然后注销重新登录，使 input 组的新成员关系生效
 ```
 
-自检：`ls -l /dev/uinput` 应显示 `root input`，且 `mackbind --list-devices`
-能列出键盘。
+</details>
 
 安装到 `~/.local/bin/` 而非 `cargo install` 默认的 `~/.cargo/bin/`，是因为 **systemd user service 的 PATH 不包含 `~/.cargo/bin`**，`~/.local/bin` 则是更标准的用户级路径。
 
@@ -351,6 +372,19 @@ systemctl --user disable mackbind
 
 ## 删除
 
+**一键脚本**：
+
+```bash
+cd mackbind
+./uninstall.sh                  # 移除服务、二进制、udev 规则（保留 input 组）
+./uninstall.sh --remove-group   # 顺便把当前用户移出 input 组
+```
+
+默认不动 `input` 组，因为别的工具可能也在用。
+
+<details>
+<summary>手动删除</summary>
+
 ```bash
 # 1. 停用并移除服务
 systemctl --user disable --now mackbind
@@ -368,6 +402,8 @@ rm ~/.config/mackbind/config.toml /etc/mackbind/config.toml
 # 5. 移除 udev 规则 / input 组（若曾添加）
 #    一般不需要移除
 ```
+
+</details>
 
 确认彻底清理：
 
