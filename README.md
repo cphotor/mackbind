@@ -476,4 +476,4 @@ cargo clippy              # 静态检查
 
 ## 许可证
 
-待定
+[MIT](LICENSE) © 2026 cphotor

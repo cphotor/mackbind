@@ -2,6 +2,8 @@
 name = "mackbind"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/cphotor/mackbind"
 
 [dependencies]
 evdev = "0.13"
