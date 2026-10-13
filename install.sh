@@ -109,7 +109,9 @@ fi
 [ -x "$BIN_SRC" ] || die "Build artifact does not exist or is not executable: $BIN_SRC"
 
 # ── 2. Install the binary (stop the service first, or you get "text file busy") ──
+SERVICE_WAS_RUNNING=0
 if systemctl --user is-active --quiet mackbind 2>/dev/null; then
+  SERVICE_WAS_RUNNING=1
   info "A mackbind service is already running; stopping it to replace the binary"
   systemctl --user stop mackbind || true
 fi
@@ -119,6 +121,16 @@ install -Dm755 "$BIN_SRC" "$BIN_DST"
 # Verifying is mandatory: twice the user ended up testing an old binary
 cmp -s "$BIN_SRC" "$BIN_DST" || die "Installed binary differs from the build artifact (MD5 check failed)"
 dim "MD5 $(md5sum "$BIN_DST" | awk '{print $1}') (matches the build artifact)"
+
+# Stopping the service was a means to replace the binary, not a requested
+# outcome. With --no-service nothing later starts it again, and the keyboard is
+# left silently un-mapped — which looks exactly like "the mapping is broken" —
+# so put it back the way we found it.
+if [ "$SERVICE_WAS_RUNNING" -eq 1 ] && [ "$DO_SERVICE" -eq 0 ]; then
+  info "Restarting the service that was stopped to replace the binary"
+  systemctl --user start mackbind \
+    || warn "Could not restart the service; run: systemctl --user start mackbind"
+fi
 
 # ── 3. input group ──────────────────────────────────────────────────────
 NEED_RELOGIN=0
