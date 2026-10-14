@@ -118,10 +118,10 @@ pub fn parse_accel(accel: &str) -> Option<(Vec<u16>, KeyCode)> {
             // hyper, lock, etc. are not produced by this tool; skip them
             _ => continue,
         };
-        if let Some(kc) = modifier_from_abbrev(abbrev) {
-            if !out.contains(&kc.0) {
-                out.push(kc.0);
-            }
+        if let Some(kc) = modifier_from_abbrev(abbrev)
+            && !out.contains(&kc.0)
+        {
+            out.push(kc.0);
         }
     }
     let kc = key_to_keycode(key)?;
@@ -183,10 +183,10 @@ pub fn ctrl_shift_keys(wm_class: &str) -> Vec<String> {
                 continue;
             };
             let accel = rest.1.trim_end_matches('\'');
-            if is_ctrl_shift(accel) {
-                if let Some(k) = main_key(accel) {
-                    keys.push(k.to_string());
-                }
+            if is_ctrl_shift(accel)
+                && let Some(k) = main_key(accel)
+            {
+                keys.push(k.to_string());
             }
         }
         if !keys.is_empty() {

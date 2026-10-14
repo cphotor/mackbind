@@ -56,11 +56,6 @@ pub fn is_modifier(code: KeyCode) -> bool {
 // The point of specialization is "translate Cmd into a combo the app recognizes", not "dodge all conflicts".
 // Judging key by key whether a combo is idle would actually miss correspondences like this.
 
-/// The set of modifiers already replaced by remap.
-///
-/// These keys enter `pending` on press instead of passing through directly, because their downstream behavior
-/// depends on the following combo (Cmd+C → Ctrl+C) and Fn priority.
-
 /// One line of the compiled rule table.
 ///
 /// The input-side index is `(main key, modifier set)` — the main key alone is not enough: `"KEY_Z"`
@@ -370,15 +365,14 @@ enum DeKeys {
 /// When the DE has not bound that action it falls back to [`de_feature_fallback`], rather than
 /// directly declaring the feature unavailable.
 fn de_feature_accel(dt: &DesktopType, feature: &str) -> Option<DeKeys> {
-    if let Some((schema, action)) = de_action_lookup(dt, feature) {
-        if let Some(accel) = crate::accel::action_accel(&schema, &action) {
-            if let Some((mods, key)) = crate::accel::parse_accel(&accel) {
-                return Some(DeKeys::Combo(
-                    mods.into_iter().map(KeyCode::new).collect(),
-                    key,
-                ));
-            }
-        }
+    if let Some((schema, action)) = de_action_lookup(dt, feature)
+        && let Some(accel) = crate::accel::action_accel(&schema, &action)
+        && let Some((mods, key)) = crate::accel::parse_accel(&accel)
+    {
+        return Some(DeKeys::Combo(
+            mods.into_iter().map(KeyCode::new).collect(),
+            key,
+        ));
     }
     de_feature_fallback(dt, feature)
 }
@@ -756,10 +750,10 @@ impl Mapper {
             if !r.app.matches(&self.wm_class, self.is_terminal) {
                 continue;
             }
-            if self.verbose {
-                if let Some(d) = &r.desc {
-                                        eprintln!("[mapper] rule hit: Cmd+{:?} — {d}", code);
-                }
+            if self.verbose
+                && let Some(d) = &r.desc
+            {
+                eprintln!("[mapper] rule hit: Cmd+{:?} — {d}", code);
             }
             match &r.act {
                 CompiledAction::Emit(mods, key) => {
@@ -910,7 +904,7 @@ impl Mapper {
                                         // so its release event (`handle_release`) will naturally produce nothing because "the output side is not pressed".
                     // naturally produce nothing.
                     let mut out = Vec::new();
-                    for h in self.output_down.drain(..).collect::<Vec<_>>() {
+                    for h in std::mem::take(&mut self.output_down) {
                         out.extend(self.emit_key(h, 0));
                     }
                                         // The injected modifiers have already been released along with output_down above, so clear the record,
@@ -950,7 +944,7 @@ impl Mapper {
                 Default::Passthrough => {
                                         // A Cmd combo with no way to convert: hand what the user pressed to the app as-is.
                     let mut out = Vec::new();
-                    for h in self.output_down.drain(..).collect::<Vec<_>>() {
+                    for h in std::mem::take(&mut self.output_down) {
                         out.extend(self.emit_key(h, 0));
                     }
                     for m in &held_mods {
@@ -999,7 +993,7 @@ impl Mapper {
             //
                         // This operates on output_down (output state), not held (physical state) —
                         // while the user is still holding Cmd, held must not change because events were sent.
-            let down_now: Vec<KeyCode> = self.output_down.drain(..).collect();
+            let down_now: Vec<KeyCode> = std::mem::take(&mut self.output_down);
             for h in down_now {
                 out.extend(self.emit_key(h, 0));
             }
@@ -2888,16 +2882,16 @@ mod trash_scoped_to_nautilus {
     #[test]
     fn trash_rules_target_nautilus_only() {
         let cfg = Config::with_defaults();
-                let rules = compile_table(&cfg.rules).expect("the rule table should compile");
+        let rules = compile_table(&cfg.rules).expect("the rule table should compile");
         for r in &rules {
-            if let CompiledAction::Exec { program, .. } = &r.act {
-                if program == "gio" {
-                    assert_eq!(
-                        r.app,
-                        AppMatch::Contains(vec!["org.gnome.Nautilus".to_string()]),
-                                                "emptying the trash must be scoped to Nautilus"
-                    );
-                }
+            if let CompiledAction::Exec { program, .. } = &r.act
+                && program == "gio"
+            {
+                assert_eq!(
+                    r.app,
+                    AppMatch::Contains(vec!["org.gnome.Nautilus".to_string()]),
+                    "emptying the trash must be scoped to Nautilus"
+                );
             }
         }
     }
@@ -2955,8 +2949,8 @@ mod exec_confirm_logic {
             args,
                         label: Some("Test"),
             confirm,
-                        prompt: Some("Test".into()),
-                        ok_label: Some("Test".into()),
+                        prompt: Some("Test"),
+                        ok_label: Some("Test"),
             confirm_key: Some("Cmd+Shift+⌫"),
             scoped: !matches!(r.app, AppMatch::Any),
         }

@@ -127,7 +127,7 @@ fn looks_like_keyboard(dev: &Device) -> bool {
 
 /// List all keyboard devices, for `--list-devices` and troubleshooting.
 fn list_devices() {
-    println!("{:<52} {}", "device name", "path");
+    println!("{:<52} path", "device name");
     println!("{}", "-".repeat(80));
     for (path, dev) in evdev::enumerate() {
         if looks_like_keyboard(&dev) {
@@ -198,78 +198,7 @@ fn main() {
     };
     println!("[config] {}", cfg.summary());
     if verbose {
-        // The desc field is by nature "for humans only"; print it under verbose,
-        // otherwise a description that can never be seen may as well not exist.
-        for r in &cfg.remap {
-            if let Some(d) = &r.desc {
-                println!("[config]   remap {} → {}{}", r.from, r.to,
-                    if r.desc.is_some() { format!("   # {d}") } else { String::new() });
-            }
-        }
-        // Print the whole rule table — not just the rows that have a desc.
-        //
-        // This is the only authoritative view of "what it actually does": how
-        // many rows the table has and what each governs, all on one screen. desc
-        // is for humans only; a missing desc does not affect the listing.
-        println!(
-            "[config] rule table ({} rows; a row without a Cmd+ prefix does not require Cmd):",
-            cfg.rules.len()
-        );
-        for r in &cfg.rules {
-            let app = if r.apps.is_empty() {
-                "*".to_string()
-            } else {
-                r.apps.join(",")
-            };
-            let act = match &r.act {
-                crate::config::Action::Emit { mods, key } => {
-                    let mut s = String::new();
-                    for m in mods {
-                        for seg in m.split('-') {
-                            let name = match seg {
-                                "C" => "Ctrl+",
-                                "A" => "Alt+",
-                                "S" => "Shift+",
-                                "M" => "Super+",
-                                o => {
-                                    s.push_str(o);
-                                    s.push('+');
-                                    ""
-                                }
-                            };
-                            s.push_str(name);
-                        }
-                    }
-                    // Strip the KEY_ prefix from the main key and lowercase it:
-                    // `KEY_DELETE` → `delete`, `KEY_LEFTBRACE` → `leftbrace`
-                    let k = key.strip_prefix("KEY_").unwrap_or(key).to_lowercase();
-                    s.push_str(&k);
-                    s
-                }
-                crate::config::Action::DeAccel { feature } => format!("ReadDE({feature})"),
-                crate::config::Action::TerminalCtrlShift => {
-                    "Ctrl+Shift (if the app binds it so)".to_string()
-                }
-                crate::config::Action::Exec {
-                    program,
-                    args,
-                    confirm,
-                    ..
-                } => format!(
-                    "exec {}{}{}",
-                    program,
-                    if args.is_empty() { "" } else { " " },
-                    args.join(" ")
-                ) + if *confirm { " (needs confirmation)" } else { "" },
-            };
-            println!(
-                "[config]   {:<28} {:<20} → {}{}",
-                format!("{app}"),
-                format!("{}{}", if r.cmd { "Cmd+" } else { "" }, r.keys.join("+")),
-                act,
-                r.desc.as_deref().map(|d| format!("   # {d}")).unwrap_or_default()
-            );
-        }
+        print_rule_table(&cfg);
     }
 
     let mut mapper = match Mapper::new(&cfg, verbose) {
@@ -437,13 +366,12 @@ fn main() {
             // Skip set_window_id when wm_class is the same as last time — it
             // parses .desktop entries internally, which should not run repeatedly
             // on the key hot path.
-            if batch.iter().any(|e| e.event_type() == EventType::KEY) {
-                if let Some(wm_class) = focus::focused_wm_class() {
-                    if last_focus.as_deref() != Some(wm_class.as_str()) {
-                        last_focus = Some(wm_class.clone());
-                        mapper.set_window_id(&wm_class);
-                    }
-                }
+            if batch.iter().any(|e| e.event_type() == EventType::KEY)
+                && let Some(wm_class) = focus::focused_wm_class()
+                && last_focus.as_deref() != Some(wm_class.as_str())
+            {
+                last_focus = Some(wm_class.clone());
+                mapper.set_window_id(&wm_class);
             }
 
             // Map the whole batch, then inject it in one shot.
@@ -483,10 +411,10 @@ fn main() {
                         cleanup.mapper_keys.push(KeyCode(e.code()));
                     }
                 }
-                if let Some(v) = cleanup.virtual_device.as_mut() {
-                    if let Err(err) = v.emit(&out) {
-                        eprintln!("[error] failed to inject events: {err}");
-                    }
+                if let Some(v) = cleanup.virtual_device.as_mut()
+                    && let Err(err) = v.emit(&out)
+                {
+                    eprintln!("[error] failed to inject events: {err}");
                 }
             }
         }
@@ -500,6 +428,82 @@ fn main() {
     let n = cleanup.mapper_keys.len();
     drop(cleanup); // trigger cleanup
     eprintln!("\n[exit] processed {ev_count} events, released {n} pressed keys");
+}
+
+/// Print the whole rule table under `--verbose`.
+///
+/// This is the only authoritative view of "what it actually does": how many rows
+/// the table has and what each governs, all on one screen. `desc` is for humans
+/// only — a missing one does not affect the listing. A row printed without a
+/// `Cmd+` prefix does not require Cmd.
+fn print_rule_table(cfg: &config::Config) {
+    // The desc field is by nature "for humans only"; print it under verbose,
+    // otherwise a description that can never be seen may as well not exist.
+    for r in &cfg.remap {
+        if let Some(d) = &r.desc {
+            println!("[config]   remap {} → {}   # {d}", r.from, r.to);
+        }
+    }
+    // Print every row — not just the ones that have a desc.
+    println!(
+        "[config] rule table ({} rows; a row without a Cmd+ prefix does not require Cmd):",
+        cfg.rules.len()
+    );
+    for r in &cfg.rules {
+        let app = if r.apps.is_empty() {
+            "*".to_string()
+        } else {
+            r.apps.join(",")
+        };
+        let act = match &r.act {
+            crate::config::Action::Emit { mods, key } => {
+                let mut s = String::new();
+                for m in mods {
+                    for seg in m.split('-') {
+                        let name = match seg {
+                            "C" => "Ctrl+",
+                            "A" => "Alt+",
+                            "S" => "Shift+",
+                            "M" => "Super+",
+                            o => {
+                                s.push_str(o);
+                                s.push('+');
+                                ""
+                            }
+                        };
+                        s.push_str(name);
+                    }
+                }
+                // Strip the KEY_ prefix from the main key and lowercase it:
+                // `KEY_DELETE` → `delete`, `KEY_LEFTBRACE` → `leftbrace`
+                let k = key.strip_prefix("KEY_").unwrap_or(key).to_lowercase();
+                s.push_str(&k);
+                s
+            }
+            crate::config::Action::DeAccel { feature } => format!("ReadDE({feature})"),
+            crate::config::Action::TerminalCtrlShift => {
+                "Ctrl+Shift (if the app binds it so)".to_string()
+            }
+            crate::config::Action::Exec {
+                program,
+                args,
+                confirm,
+                ..
+            } => format!(
+                "exec {}{}{}",
+                program,
+                if args.is_empty() { "" } else { " " },
+                args.join(" ")
+            ) + if *confirm { " (needs confirmation)" } else { "" },
+        };
+        println!(
+            "[config]   {:<28} {:<20} → {}{}",
+            app,
+            format!("{}{}", if r.cmd { "Cmd+" } else { "" }, r.keys.join("+")),
+            act,
+            r.desc.as_deref().map(|d| format!("   # {d}")).unwrap_or_default()
+        );
+    }
 }
 
 /// Automatically pick a keyboard: prefer a built-in Apple keyboard, otherwise the first one.

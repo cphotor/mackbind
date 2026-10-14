@@ -101,8 +101,8 @@ fn notify(summary: &str, body: &str) -> bool {
             "0",           // replaces_id
             "mackbind",    // app_name
             "dialog-warning",
-            &format!("{summary}"), // summary
-            &format!("{body}"),    // body
+            summary, // summary
+            body,    // body
             "[]",          // actions
             "{}",          // hints
             "-1",          // expire_timeout: never auto-dismiss
