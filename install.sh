@@ -4,7 +4,10 @@
 #
 # Does the following, in order:
 #   1. Build and install the binary to ~/.local/bin/mackbind
-#   2. Install the udev rule that opens up /dev/uinput (to create a virtual keyboard)
+#   2. Install the udev rule that opens up /dev/uinput (to create a virtual
+#      keyboard) and tags the virtual keyboard as internal, so libinput's
+#      "disable touchpad while typing" keeps working while mackbind grabs
+#      the physical keyboard
 #   3. Add the current user to the input group (to read the physical keyboard)
 #   4. Install and enable the GNOME Shell extension that reports the focused window
 #      (GNOME only; without it all per-app rules silently degrade)

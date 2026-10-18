@@ -25,3 +25,21 @@
 # tighten any existing config.
 
 KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
+
+# ── Why this is needed (part 2): keep "disable touchpad while typing" alive
+#
+# libinput's DWT ("disable touchpad while typing") only listens to keyboards
+# tagged ID_INTEGRATION=internal; systemd's 65-integration.rules derives that
+# tag from the physical path (PCI / fixed internal USB port), which a uinput
+# device does not have. Since mackbind grabs the physical keyboard, the
+# virtual keyboard is the **only** keyboard the desktop ever sees — without
+# this tag libinput never pairs a keyboard with the touchpad, DWT never
+# fires, and palm touches move the pointer while typing (measured on
+# Arch + GNOME Wayland + libinput 1.32: physical keyboard
+# ID_INTEGRATION=internal, virtual one had no tag at all).
+#
+# ATTR{name} matches the virtual device created in src/main.rs
+# ("mackbind (virtual)"); the event node is what libinput opens and reads
+# udev properties from, hence KERNEL=="event*".
+
+ACTION=="add|change", KERNEL=="event*", ATTRS{name}=="mackbind (virtual)", ENV{ID_INTEGRATION}="internal"
