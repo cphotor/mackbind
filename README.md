@@ -60,6 +60,8 @@ Full per-case status is in the "Implementation status" section of `docs/macos-sh
 
 So the [`focused-window-dbus`](https://extensions.gnome.org/extension/focused-window-dbus/) extension is required. `./install.sh` installs and enables it automatically when it detects a GNOME session (skip it with `--no-extension`).
 
+A Shell only loads an extension whose `metadata.json` declares the running Shell version; otherwise it is marked `OUT OF DATE` and silently skipped, and releases on extensions.gnome.org tend to lag behind new Shell versions. `./install.sh` sets `org.gnome.shell disable-extension-version-validation` to `true` so a Shell upgrade cannot silently take the per-app rules down. If you installed the extension by hand and `gnome-extensions info focused-window-dbus@flexagoon.com` reports `OUT OF DATE`, run the installer or add your Shell version to the extension's `metadata.json`, then log out and back in.
+
 To do it by hand instead — the CLI takes a downloaded bundle, not a UUID, so resolve the release matching your Shell version first:
 
 ```bash
@@ -152,7 +154,7 @@ cd mackbind
 ./install.sh
 ```
 
-The script runs the whole setup in order: build the release binary → install it to `~/.local/bin` → add the current user to the `input` group → install the udev rule that opens up `/dev/uinput` → install and enable the GNOME Shell extension the per-app rules need (GNOME sessions only) → install and enable the systemd user service. Steps that need root use `sudo` and may prompt for your password; the script is safe to re-run (idempotent).
+The script runs the whole setup in order: build the release binary → install it to `~/.local/bin` → add the current user to the `input` group → install the udev rule that opens up `/dev/uinput` → install and enable the GNOME Shell extension the per-app rules need and disable GNOME's extension version check (GNOME sessions only) → install and enable the systemd user service. Steps that need root use `sudo` and may prompt for your password; the script is safe to re-run (idempotent).
 
 Afterward, **log out and back in once**: the new `input` group membership applies only to a new session, and a newly installed GNOME Shell extension is loaded only when the Shell starts. The service is enabled, so it starts automatically after you log back in.
 

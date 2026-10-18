@@ -10,7 +10,8 @@
 #      the physical keyboard
 #   3. Add the current user to the input group (to read the physical keyboard)
 #   4. Install and enable the GNOME Shell extension that reports the focused window
-#      (GNOME only; without it all per-app rules silently degrade)
+#      (GNOME only; without it all per-app rules silently degrade), and opt out of
+#      GNOME's extension version check so a Shell upgrade cannot silently unload it
 #   5. Install and enable the systemd user service
 #
 # Usage:
@@ -225,7 +226,31 @@ enable_extension() {
   return 0
 }
 
+# GNOME refuses to load an extension whose metadata does not declare the
+# running Shell version, and the failure is silent: the extension stays
+# "enabled" but is not loaded, so every per-app rule quietly stops matching.
+# That is exactly how a system reinstall + Shell upgrade (49/50 → 51) broke
+# Cmd+C copy in terminals. Extensions usually keep working across Shell
+# upgrades — this one only uses stable Meta/Shell APIs — and release bundles
+# on extensions.gnome.org lag behind new Shell versions, so opt out of the
+# version check. Measured on GNOME 51: the key exists, Eval/unsafe-mode is
+# gone, and this is the only lever against the version churn.
+relax_extension_version_check() {
+  is_gnome_session || return 0
+  command -v gsettings >/dev/null 2>&1 || return 0
+  [ "$(gsettings get org.gnome.shell disable-extension-version-validation 2>/dev/null)" = "true" ] \
+    && return 0
+  if gsettings set org.gnome.shell disable-extension-version-validation true 2>/dev/null; then
+    dim "Disabled GNOME extension version validation (keeps $EXT_UUID working across Shell upgrades)"
+  else
+    warn "Could not disable extension version validation; a Shell upgrade may silently disable $EXT_UUID"
+  fi
+}
+
 EXT_INSTALLED=0
+if [ "$DO_EXT" -eq 1 ]; then
+  relax_extension_version_check
+fi
 if [ "$DO_EXT" -eq 0 ]; then
   dim "--no-extension was given, skipping the GNOME Shell extension"
 elif ! is_gnome_session; then
