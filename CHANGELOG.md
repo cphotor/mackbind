@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > versions. `scripts/audit.py` fails if the newest heading below disagrees with
 > `Cargo.toml`, so the number cannot drift.
 
+## [0.1.4] - 2026-10-22
+
+### Changed
+
+- `[terminal] shift_enter` is now a simple `on` / `off` switch, defaulting to
+  `on`. `"ctrl_j"` is still accepted as a legacy alias.
+- Removed `shift_enter_apps`. Users should not have to maintain a list of
+  terminal app ids to enable a behavior; the built-in VTE list is maintained by
+  the tool.
+
 ## [0.1.3] - 2026-10-22
 
 ### Added
@@ -141,6 +151,7 @@ First public release.
 - Tests that physically opened the "empty trash" dialog during `cargo test`.
 - A Python bytecode cache that had been committed by accident.
 
+[0.1.4]: https://github.com/cphotor/mackbind/releases/tag/v0.1.4
 [0.1.3]: https://github.com/cphotor/mackbind/releases/tag/v0.1.3
 [0.1.2]: https://github.com/cphotor/mackbind/releases/tag/v0.1.2
 [0.1.1]: https://github.com/cphotor/mackbind/releases/tag/v0.1.1
