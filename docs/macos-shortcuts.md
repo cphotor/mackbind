@@ -441,6 +441,8 @@ So these two instead use `Ctrl+Insert` (the traditional X11 copy key, supported 
 
 mackbind therefore emits `Ctrl+J` instead inside those terminals: 0x0A is a **distinct** control character that every terminal transmits unchanged, and readline, vim and the agent TUIs all read it as a newline. The row is deliberately app-scoped — terminals that do implement the protocol (kitty, foot, wezterm, ghostty, alacritty) must keep the real `Shift+Enter`, and a global remap would also cost GUI apps their own `Shift+Enter` (VS Code inserts a line below, chat apps insert a newline). Same criterion as the copy key above: a **behavioral difference**, not an app list. The list covers the mainstream VTE terminals: `org.gnome.Ptyxis` (Ptyxis), `org.gnome.Terminal` (GNOME Terminal), `org.gnome.Console` (GNOME Console), `com.gexperts.Tilix` (Tilix), `terminator` (Terminator), `guake` (Guake), `xfce4-terminal` (Xfce Terminal), `mate-terminal` (MATE Terminal), `lxterminal` (LXTerminal), `sakura` (Sakura), `tilda` (Tilda) and `com.raggesilver.BlackBox` (BlackBox). Terminals that implement the protocol must never be added.
 
+This is configurable: `[terminal] shift_enter = "off"` leaves the terminal's native behavior, while `shift_enter_apps` replaces the built-in list for users who only want the conversion in a subset of terminals.
+
 ---
 
 ## Power-key combos (in Apple's docs, but not done here)

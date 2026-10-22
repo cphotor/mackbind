@@ -163,8 +163,13 @@ pub enum DesktopType {
 #[serde(default, deny_unknown_fields)]
 pub struct DesktopConfig {
     /// Desktop environment type; determines the lookup source for DE-related
-    /// rules
-    pub r#type: DesktopType,
+    /// rules.
+    ///
+    /// `None` means "not specified in this config file"; the effective value
+    /// defaults to [`DesktopType::Gnome`]. Keeping the distinction matters when
+    /// merging several files: a higher-priority file that only sets `spotlight`
+    /// must not reset the `type` chosen by a lower-priority file.
+    pub r#type: Option<DesktopType>,
     /// Whether to map macOS's `Cmd+space` (Spotlight) to the desktop
     /// environment's overview.
     ///
@@ -175,8 +180,66 @@ pub struct DesktopConfig {
     ///
     /// When the corresponding action cannot be found (e.g. the DE provides no
     /// overview), it is skipped automatically and not treated as an error.
-    #[serde(default = "default_true")]
-    pub spotlight: bool,
+    pub spotlight: Option<bool>,
+}
+
+impl DesktopConfig {
+    /// Effective desktop type (`gnome` unless overridden).
+    pub fn de_type(&self) -> DesktopType {
+        self.r#type.unwrap_or_default()
+    }
+
+    /// Effective overview switch (`true` unless overridden).
+    pub fn spotlight(&self) -> bool {
+        self.spotlight.unwrap_or(true)
+    }
+}
+
+/// How `Shift+Enter` is treated inside VTE-style terminals.
+///
+/// Those terminals cannot distinguish `Shift+Enter` from `Enter`; the default
+/// emits `Ctrl+J` (0x0A), which every terminal transmits as a newline. `Off`
+/// leaves the terminal's native behavior untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShiftEnterMode {
+    /// Emit `Ctrl+J` in terminals that cannot report `Shift+Enter`.
+    #[default]
+    CtrlJ,
+    /// Do not add the rule; keep the terminal's native `Shift+Enter`.
+    Off,
+}
+
+/// Terminal-specific behavior.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TerminalConfig {
+    /// Whether `Shift+Enter` becomes `Ctrl+J` in terminals that cannot report
+    /// the modifier. Defaults to [`ShiftEnterMode::CtrlJ`].
+    pub shift_enter: Option<ShiftEnterMode>,
+    /// Replaces the built-in VTE terminal list for the `Shift+Enter` rule.
+    ///
+    /// `None` uses [`SHIFT_ENTER_BLIND_TERMINALS`]. An explicit empty list
+    /// disables the rule without changing the mode.
+    pub shift_enter_apps: Option<Vec<String>>,
+}
+
+impl TerminalConfig {
+    /// Effective `Shift+Enter` mode.
+    pub fn shift_enter_mode(&self) -> ShiftEnterMode {
+        self.shift_enter.unwrap_or_default()
+    }
+
+    /// Effective terminal list for the `Shift+Enter` rule.
+    pub fn shift_enter_apps(&self) -> Vec<String> {
+        match &self.shift_enter_apps {
+            Some(apps) => apps.clone(),
+            None => SHIFT_ENTER_BLIND_TERMINALS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        }
+    }
 }
 
 /// The true-value constant used by `#[serde(default)]`—most boolean config
@@ -208,7 +271,14 @@ pub enum FnMode {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// Modifier swap/replace. Defaults to the CapsLock ↔ Left Ctrl swap.
+    /// Whether the built-in CapsLock ↔ Left Ctrl swap is installed.
+    ///
+    /// `None` means unspecified. Defaults to `true`; set `false` to leave both
+    /// keys untouched. `remap` is still applied afterwards, and can override
+    /// either direction.
+    pub swap_capslock_ctrl: Option<bool>,
+    /// Modifier swap/replace. Entries are appended after the built-in swap, so
+    /// a user entry with the same `from` key overrides that direction.
     ///
     /// **Not part of the rule table**: it acts on the key itself rather than a
     /// combo, and happens before combo matching.
@@ -216,9 +286,8 @@ pub struct Config {
     /// Mapping rule table. **The single source of truth for mappings**—a lookup
     /// just walks this list.
     ///
-    /// Lookup order is declaration order, and the first match wins. The user
-    /// config is appended after the defaults, so user entries naturally take
-    /// priority.
+    /// Lookup order is declaration order, and the first match wins. User rules
+    /// are **prepended** before the built-in defaults, so they take priority.
     pub rules: Vec<Rule>,
     /// Fn key priority. `None` means unspecified, keeping the default value.
     #[serde(default)]
@@ -239,6 +308,8 @@ pub struct Config {
     /// It works together with the `TerminalCtrlShift` action in the rule table:
     /// the action can only take effect for apps that match this list.
     pub ctrl_busy_apps: Vec<String>,
+    /// Terminal-specific behavior (`Shift+Enter` handling and its app list).
+    pub terminal: TerminalConfig,
 }
 
 /// The **fallback** key set for terminal specialization.
@@ -327,10 +398,10 @@ const SIGINT_LEAKY_TERMINALS: &[&str] = &["org.gnome.Ptyxis", "org.gnome.konsole
 
 /// The built-in default rule table.
 ///
-/// **This is the single source of truth for mappings**—the user config is
-/// appended on top of it (later entries win).
+/// **This is the single source of truth for mappings**—user rules are
+/// prepended before this table (first match wins).
 /// For the full design see `docs/table-driven-design.md`.
-fn default_rules() -> Vec<Rule> {
+fn default_rules(terminal: &TerminalConfig) -> Vec<Rule> {
     let mut v: Vec<Rule> = Vec::new();
 
     let mut push_emit = |apps: &[&str], keys: &str, mods: &str, key: &str, desc: &str| {
@@ -629,23 +700,28 @@ for key in DELETE_KEYS {
     // A `cmd = false` row is **not** skipped while Cmd is held (the lookup only
     // gates on `requires_cmd && !cmd_held`), so `Cmd+Shift+Enter` lands here
     // too. That matches the existing `Option+Delete` row.
-    v.push(Rule {
-        apps: SHIFT_ENTER_BLIND_TERMINALS
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-        keys: vec!["S-KEY_ENTER".into()],
-        cmd: false,
-        act: Action::Emit {
-            mods: vec!["C".into()],
-            key: "KEY_J".into(),
-        },
-        desc: Some(
-            "soft newline (Shift+Enter → Ctrl+J): this terminal cannot report \
-             Shift+Enter separately from Enter"
-                .into(),
-        ),
-    });
+    // The row is installed only when the user has not opted out. `off` removes
+    // it entirely, and an explicit empty `shift_enter_apps` list also removes
+    // it (there is no app it could match).
+    if terminal.shift_enter_mode() != ShiftEnterMode::Off {
+        let apps = terminal.shift_enter_apps();
+        if !apps.is_empty() {
+            v.push(Rule {
+                apps,
+                keys: vec!["S-KEY_ENTER".into()],
+                cmd: false,
+                act: Action::Emit {
+                    mods: vec!["C".into()],
+                    key: "KEY_J".into(),
+                },
+                desc: Some(
+                    "soft newline (Shift+Enter → Ctrl+J): this terminal cannot report \
+                     Shift+Enter separately from Enter"
+                        .into(),
+                ),
+            });
+        }
+    }
 
     // ── GVIM: Ctrl is already taken (Ctrl+V block select, Ctrl+C quit) ──
     // vim running in a terminal has a window belonging to the terminal, already
@@ -706,31 +782,44 @@ const DEFAULT_CTRL_BUSY_APPS: &[&str] = &[
 ];
 
 impl Config {
-    /// Built-in default config. The user config is layered on top of it.
+    /// Built-in default config, with the default CapsLock swap and the default
+    /// `Shift+Enter` behavior.
+    #[cfg(test)]
     pub fn with_defaults() -> Self {
+        Self::with_defaults_for(true, &TerminalConfig::default())
+    }
+
+    /// Built-in defaults with the two user-selectable behaviors resolved.
+    ///
+    /// `swap_capslock_ctrl` decides whether the paired CapsLock ↔ Left Ctrl
+    /// remaps are installed. `terminal` decides whether the `Shift+Enter` row is
+    /// installed and which apps it covers.
+    pub(crate) fn with_defaults_for(swap_capslock_ctrl: bool, terminal: &TerminalConfig) -> Self {
+        let mut remap = Vec::new();
+        if swap_capslock_ctrl {
+            remap.push(Remap {
+                from: "KEY_CAPSLOCK".into(),
+                to: "KEY_LEFTCTRL".into(),
+                desc: Some("CapsLock → Left Ctrl".into()),
+            });
+            remap.push(Remap {
+                from: "KEY_LEFTCTRL".into(),
+                to: "KEY_CAPSLOCK".into(),
+                desc: Some("Left Ctrl → CapsLock (paired swap with the entry above)".into()),
+            });
+        }
+
         Config {
-            remap: vec![
-                Remap {
-                    from: "KEY_CAPSLOCK".into(),
-                    to: "KEY_LEFTCTRL".into(),
-                    desc: Some("CapsLock → Left Ctrl".into()),
-                },
-                Remap {
-                    from: "KEY_LEFTCTRL".into(),
-                    to: "KEY_CAPSLOCK".into(),
-                    desc: Some("Left Ctrl → CapsLock (paired swap with the entry above)".into()),
-                },
-            ],
-            rules: default_rules(),
+            swap_capslock_ctrl: Some(swap_capslock_ctrl),
+            remap,
+            rules: default_rules(terminal),
             fn_mode: Some(FnMode::Fkeysfirst),
-            desktop: DesktopConfig {
-                spotlight: true,
-                ..DesktopConfig::default()
-            },
+            desktop: DesktopConfig::default(),
             ctrl_busy_apps: DEFAULT_CTRL_BUSY_APPS
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            terminal: terminal.clone(),
         }
     }
 }
@@ -738,11 +827,14 @@ impl Config {
 /// Read and merge the system-level and user-level config; user-level overrides
 /// system-level.
 ///
-/// Starts from the built-in defaults. When there is no config file at all, the
-/// full default mapping is returned.
+/// Reads the files first, then builds the defaults from the resolved
+/// user-selectable options (`swap_capslock_ctrl`, `[terminal]`) so that a file
+/// can remove a built-in behavior rather than only append to it.
 pub fn load() -> Result<Config, ConfigError> {
-    let mut cfg = Config::with_defaults();
-
+    // Accumulate the file configs with the same precedence rules used for the
+    // final merge. Starting from `Config::default()` keeps "not specified"
+    // distinct from "explicitly false / empty".
+    let mut user = Config::default();
     for path in candidate_paths() {
         if !path.exists() {
             continue;
@@ -752,36 +844,62 @@ pub fn load() -> Result<Config, ConfigError> {
         let loaded: Config = toml::from_str(&text)
             .map_err(|e| ConfigError::Parse(path.clone(), e))?;
         // Later reads override earlier ones: user-level is at the end of the list
-        cfg.merge(loaded);
+        user.merge(loaded);
     }
+
+    let swap = user.swap_capslock_ctrl.unwrap_or(true);
+    let terminal = user.terminal.clone();
+    let mut cfg = Config::with_defaults_for(swap, &terminal);
+    cfg.merge(user);
     Ok(cfg)
 }
 
 /// List candidate config paths in priority order (later overrides earlier).
 pub fn candidate_paths() -> Vec<PathBuf> {
     let mut v = Vec::new();
-    if let Ok(p) = std::env::var("MACKBIND_CONFIG") {
-        v.push(PathBuf::from(p));
-    }
     v.push(PathBuf::from("/etc/mackbind/config.toml"));
     if let Ok(home) = std::env::var("HOME") {
         v.push(Path::new(&home).join(".config/mackbind/config.toml"));
     }
+    // The environment override is the highest priority, so it must be read last.
+    if let Ok(p) = std::env::var("MACKBIND_CONFIG") {
+        v.push(PathBuf::from(p));
+    }
     v
 }
 
-/// Merge the user config on top of the default config.
+/// Merge a higher-priority config on top of the current one.
 ///
-/// `rules` / `remap` / `ctrl_busy_apps` use **append**—user entries come after
-/// the defaults, and lookup takes the **first match**, so user entries
-/// naturally take priority. `fn_mode` uses **replace**.
+/// Rules are **prepended** because lookup takes the first match. Remaps and
+/// `ctrl_busy_apps` are appended (a later remap with the same `from` wins in
+/// the mapper's map). Everything else uses field-level replacement, and `None`
+/// leaves the lower-priority value untouched.
 impl Config {
     fn merge(&mut self, other: Config) {
+        let mut rules = other.rules;
+        rules.extend(std::mem::take(&mut self.rules));
+        self.rules = rules;
+
         self.remap.extend(other.remap);
-        self.rules.extend(other.rules);
         self.ctrl_busy_apps.extend(other.ctrl_busy_apps);
+
+        if other.swap_capslock_ctrl.is_some() {
+            self.swap_capslock_ctrl = other.swap_capslock_ctrl;
+        }
         if other.fn_mode.is_some() {
             self.fn_mode = other.fn_mode;
+        }
+        if other.desktop.r#type.is_some() {
+            self.desktop.r#type = other.desktop.r#type;
+        }
+        if other.desktop.spotlight.is_some() {
+            self.desktop.spotlight = other.desktop.spotlight;
+        }
+        if other.terminal.shift_enter.is_some() {
+            self.terminal.shift_enter = other.terminal.shift_enter;
+        }
+        if other.terminal.shift_enter_apps.is_some() {
+            self.terminal.shift_enter_apps = other.terminal.shift_enter_apps;
         }
     }
 
@@ -791,7 +909,7 @@ impl Config {
             "{} remaps, {} rules, DE={:?}, {} Ctrl-busy apps",
             self.remap.len(),
             self.rules.len(),
-            self.desktop.r#type,
+            self.desktop.de_type(),
             self.ctrl_busy_apps.len()
         )
     }
@@ -813,3 +931,147 @@ impl std::fmt::Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user_rule(desc: &str) -> Rule {
+        Rule {
+            apps: vec![],
+            keys: vec!["KEY_Q".into()],
+            cmd: true,
+            act: Action::Emit {
+                mods: vec!["C".into()],
+                key: "KEY_Q".into(),
+            },
+            desc: Some(desc.into()),
+        }
+    }
+
+    #[test]
+    fn user_rules_are_prepended_so_they_override_defaults() {
+        let mut cfg = Config::with_defaults();
+        let default_len = cfg.rules.len();
+
+        cfg.merge(Config {
+            rules: vec![user_rule("user override")],
+            ..Config::default()
+        });
+
+        assert_eq!(cfg.rules.len(), default_len + 1);
+        assert_eq!(
+            cfg.rules.first().and_then(|r| r.desc.as_deref()),
+            Some("user override"),
+            "lookup takes the first match, so user rules must come first"
+        );
+    }
+
+    #[test]
+    fn swap_capslock_ctrl_can_be_disabled() {
+        let cfg = Config::with_defaults_for(false, &TerminalConfig::default());
+        assert!(cfg.remap.is_empty());
+        assert_eq!(cfg.swap_capslock_ctrl, Some(false));
+    }
+
+    #[test]
+    fn user_remap_is_appended_and_overrides_the_same_direction() {
+        let mut cfg = Config::with_defaults();
+        cfg.merge(Config {
+            remap: vec![Remap {
+                from: "KEY_CAPSLOCK".into(),
+                to: "KEY_ESCAPE".into(),
+                desc: Some("CapsLock → Esc".into()),
+            }],
+            ..Config::default()
+        });
+
+        let caps = cfg
+            .remap
+            .iter()
+            .rev()
+            .find(|r| r.from == "KEY_CAPSLOCK")
+            .expect("the user remap must be present");
+        assert_eq!(caps.to, "KEY_ESCAPE");
+        assert!(
+            cfg.remap.iter().any(|r| r.from == "KEY_LEFTCTRL"),
+            "the other direction of the default pair stays unless explicitly disabled"
+        );
+    }
+
+    #[test]
+    fn desktop_fields_merge_independently() {
+        let mut cfg = Config::with_defaults();
+        cfg.merge(Config {
+            desktop: DesktopConfig {
+                r#type: Some(DesktopType::Kde),
+                spotlight: Some(false),
+            },
+            ..Config::default()
+        });
+
+        assert_eq!(cfg.desktop.de_type(), DesktopType::Kde);
+        assert!(!cfg.desktop.spotlight());
+    }
+
+    #[test]
+    fn shift_enter_can_be_disabled() {
+        let cfg = Config::with_defaults_for(
+            true,
+            &TerminalConfig {
+                shift_enter: Some(ShiftEnterMode::Off),
+                ..TerminalConfig::default()
+            },
+        );
+        assert!(
+            !cfg.rules
+                .iter()
+                .any(|r| r.keys == vec!["S-KEY_ENTER".to_string()]),
+            "off must remove the rule entirely"
+        );
+    }
+
+    #[test]
+    fn shift_enter_apps_replace_the_builtin_list() {
+        let cfg = Config::with_defaults_for(
+            true,
+            &TerminalConfig {
+                shift_enter_apps: Some(vec!["myterm".into()]),
+                ..TerminalConfig::default()
+            },
+        );
+        let rule = cfg
+            .rules
+            .iter()
+            .find(|r| r.keys == vec!["S-KEY_ENTER".to_string()])
+            .expect("the rule should still be installed");
+        assert_eq!(rule.apps, vec!["myterm".to_string()]);
+    }
+
+    #[test]
+    fn empty_shift_enter_apps_removes_the_rule() {
+        let cfg = Config::with_defaults_for(
+            true,
+            &TerminalConfig {
+                shift_enter_apps: Some(vec![]),
+                ..TerminalConfig::default()
+            },
+        );
+        assert!(
+            !cfg.rules
+                .iter()
+                .any(|r| r.keys == vec!["S-KEY_ENTER".to_string()]),
+            "an empty app list should not create a rule that matches every app"
+        );
+    }
+
+    #[test]
+    fn fn_mode_is_replaced_by_the_user() {
+        let mut cfg = Config::with_defaults();
+        cfg.merge(Config {
+            fn_mode: Some(FnMode::Disabled),
+            ..Config::default()
+        });
+        assert_eq!(cfg.fn_mode, Some(FnMode::Disabled));
+    }
+}

@@ -27,13 +27,13 @@ mackbind's model: **`Cmd` *is* `Ctrl`; the rule table only covers exceptions.** 
 
 Works out of the box, no configuration needed:
 
-- **CapsLock ↔ Left Ctrl swap** — both keys emit a real Ctrl in both GUI and terminal
+- **CapsLock ↔ Left Ctrl swap** — both keys emit a real Ctrl in both GUI and terminal; disable it with `swap_capslock_ctrl = false`
 - **`Cmd+X` defaults to `Ctrl+X`** — no enumeration; long-tail combos just work (`Cmd+E`, `Cmd+B`, and any combo absent from the table)
 - **An explicit rule table (44 rows)** — for cases where the target key differs from the main key: `Cmd+Q` → `Alt+F4`, cursor movement, `Cmd+[` `Cmd+]` → `Alt+←` `Alt+→`, etc. `mackbind --verbose` prints every row
 - **`Cmd+Space` → overview** — prefers the desktop environment's existing binding and emits the same key; since GNOME 50 that action is unbound by default, so it emits a single `overlay-key` tap (a bare Super). Never rewrites your settings
 - **Per-key terminal specialization** — inside a terminal `Cmd+C` → `Ctrl+Shift+C` (copy), while `Ctrl+C` still interrupts; ptyxis and konsole use `Ctrl+Insert` instead, because with no selection they leak `Ctrl+Shift+C` to the process as SIGINT. GNOME-family terminals are read from their own GSettings schema, so custom bindings are followed too
-- **`Shift+Enter` → `Ctrl+J` where the terminal cannot report it** — VTE (GNOME Terminal, GNOME Console, Ptyxis, Tilix, Terminator, Guake, Xfce Terminal, MATE Terminal, LXTerminal, Sakura, Tilda, BlackBox) implements neither the kitty keyboard protocol nor `modifyOtherKeys`, so `Shift+Enter` and `Enter` arrive as the same `\r` and an agent TUI submits instead of inserting a newline. `Ctrl+J` is a distinct control character that every terminal transmits unchanged. Scoped per terminal (currently enabled for all of the VTE terminals above), so kitty/foot/WezTerm/Ghostty/Alacritty keep the real `Shift+Enter`
-- **Fn key priority** — toggles F-keys vs. brightness/media keys in user space, with no kernel parameters or root required
+- **`Shift+Enter` → `Ctrl+J` where the terminal cannot report it** — VTE (GNOME Terminal, GNOME Console, Ptyxis, Tilix, Terminator, Guake, Xfce Terminal, MATE Terminal, LXTerminal, Sakura, Tilda, BlackBox) implements neither the kitty keyboard protocol nor `modifyOtherKeys`, so `Shift+Enter` and `Enter` arrive as the same `\r` and an agent TUI submits instead of inserting a newline. `Ctrl+J` is a distinct control character that every terminal transmits unchanged. Scoped per terminal (currently enabled for all of the VTE terminals above), so kitty/foot/WezTerm/Ghostty/Alacritty keep the real `Shift+Enter`. Set `shift_enter = "off"` under `[terminal]` to keep native behavior, or `shift_enter_apps` to change the terminal list
+- **Fn key priority** — toggles F-keys vs. brightness/media keys in user space, with no kernel parameters or root required; set it with `fn_mode`
 
 ## Known issues
 
@@ -265,11 +265,14 @@ See [`config.example.toml`](config.example.toml) for an example. Main options:
 
 |Option|Default|Description|
 |---|---|---|
-|`remap`|CapsLock ↔ Left Ctrl|modifier remap/swap|
-|`rules`|built-in table (44 rows)|**the mapping source of truth**. Each row = `(app, key combo) → action`; order is priority|
+|`swap_capslock_ctrl`|`true`|install the paired CapsLock ↔ Left Ctrl swap; set `false` to leave both keys untouched|
+|`remap`|`[]`|extra or overriding modifier mappings; the default CapsLock ↔ Left Ctrl pair is controlled by `swap_capslock_ctrl`|
+|`rules`|built-in table (44 rows)|**the mapping source of truth**. Each row = `(app, key combo) → action`; user rows are matched before the defaults|
 |`fn_mode`|`fkeysfirst`|Fn priority: `fkeysfirst` / `fkeyslast` / `disabled`|
 |`desktop.type`|`gnome`|desktop environment: `gnome` / `kde` / `none`|
 |`desktop.spotlight`|`true`|whether `Cmd+Space` maps to overview (reads the DE's existing binding; never rewrites it)|
+|`terminal.shift_enter`|`ctrl_j`|`shift_enter` in VTE terminals: `ctrl_j` (emit `Ctrl+J`) or `off` (keep native behavior)|
+|`terminal.shift_enter_apps`|built-in VTE list|replace the terminal list for the `Shift+Enter` rule; an empty list disables it|
 |`ctrl_busy_apps`|`["gvim"]`|apps outside terminals where Ctrl has a non-standard meaning. **Terminals need no listing** — detected via `.desktop` `Categories=TerminalEmulator`|
 
 A mistyped field name **fails hard at startup** instead of being silently ignored.
@@ -306,7 +309,7 @@ Three kinds of action:
 |`de_accel`|read the desktop's existing binding and emit the same key (without rewriting the user's config)|
 |`terminal_ctrl_shift`|add Shift only when the app **itself** has bound that key with `Ctrl+Shift`|
 
-**Order is priority**: the first match from top to bottom wins. Your entries are appended after the defaults, so they naturally override them.
+**Order is priority**: the first match from top to bottom wins. Your entries are **prepended before** the defaults, so they override a built-in row with the same `(app, keys)` instead of being shadowed by it.
 
 Rules **require Cmd to be held by default** (`cmd = true`). The few combos without Cmd must set `cmd = false` explicitly, e.g.:
 
@@ -337,10 +340,11 @@ grep '^\[trace\] IN' trace.log
 
 ```toml
 # don't swap CapsLock/Ctrl
-remap = []
+swap_capslock_ctrl = false
 
-# turn only CapsLock into Left Ctrl, leaving Left Ctrl itself alone
-remap = [{ from = "KEY_CAPSLOCK", to = "KEY_LEFTCTRL" }]
+# ... or turn only CapsLock into Left Ctrl and leave Left Ctrl alone:
+# swap_capslock_ctrl = false
+# remap = [{ from = "KEY_CAPSLOCK", to = "KEY_LEFTCTRL" }]
 
 # add your own shortcut: Cmd+E → Ctrl+Shift+E
 [[rules]]
@@ -351,12 +355,18 @@ desc   = "my shortcut"
 # turn off Fn priority
 fn_mode = "disabled"
 
+# specialize an additional app (terminals are auto-detected)
+ctrl_busy_apps = ["gvim", "org.gnome.gedit"]
+
+# keep the terminal's native Shift+Enter (VTE cannot report it separately)
+[terminal]
+shift_enter = "off"
+# or, instead of disabling it, restrict it to these terminals:
+# shift_enter_apps = ["org.gnome.Terminal"]
+
 # declare the desktop environment
 [desktop]
 type = "gnome"
-
-# specialize an additional app (terminals are auto-detected)
-ctrl_busy_apps = ["gvim", "org.gnome.gedit"]
 ```
 
 A fuller example is in `config.example.toml` at the repo root.

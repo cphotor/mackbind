@@ -43,7 +43,8 @@ Cmd is implicit for almost every row. The handful of non-Cmd combos (macOS's `Op
 `Ctrl+↑`, and the terminal `Shift+Enter` above) write `cmd = false` and are listed here without a Cmd prefix.
 
 **Order is priority** -- the priority relationships formerly scattered across three places are now decided solely by
-a rule's position in the table. Lookup is a linear scan taking the first hit; user config is appended at the end, so it naturally takes priority.
+a rule's position in the table. Lookup is a linear scan taking the first hit; user rules are prepended before the
+defaults, so they take priority over a built-in row with the same `(app, keys)`.
 
 `mackbind --verbose` prints the whole table at startup.
 

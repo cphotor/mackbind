@@ -7,18 +7,29 @@
 # User config paths (lowest to highest priority):
 #   /etc/mackbind/config.toml
 #   ~/.config/mackbind/config.toml
-# Or point MACKBIND_CONFIG at a single file.
-
+#   $MACKBIND_CONFIG (highest priority; can be an extra file)
+#
 # ─────────────────────────────────────────────────────────────
 # Modifier key swap
 # ─────────────────────────────────────────────────────────────
 # Default: CapsLock ↔ Left Ctrl are swapped as a pair.
-# The list uses **append** semantics (user entries come after the defaults).
+# Set this to false to leave both keys untouched.
+#
+# swap_capslock_ctrl = true
+#
+# `remap` adds or overrides individual directions. A user entry with the same
+# `from` key wins over the default pair.
 #
 # [[remap]]
 # from = "KEY_CAPSLOCK"
 # to   = "KEY_ESCAPE"
 # desc = "CapsLock → Esc"
+#
+# To turn only CapsLock into Left Ctrl and leave Left Ctrl alone, disable the
+# paired swap first, then add the one direction:
+#
+# swap_capslock_ctrl = false
+# remap = [{ from = "KEY_CAPSLOCK", to = "KEY_LEFTCTRL" }]
 
 # ─────────────────────────────────────────────────────────────
 # Mapping rule table
@@ -43,7 +54,8 @@
 #          terminal_ctrl_shift  add Shift only if the app itself binds that key with Ctrl+Shift
 #
 # **Order is priority**: the first match from top to bottom wins. Your entries
-# are appended after the defaults, so they naturally override them.
+# are **prepended before** the defaults, so a row with the same (app, keys)
+# overrides the built-in row instead of being shadowed by it.
 #
 # To see the full effective table: `mackbind --verbose` (printed at startup)
 #
@@ -74,6 +86,25 @@
 # disabled: no conversion
 #
 # fn_mode = "fkeysfirst"
+
+# ─────────────────────────────────────────────────────────────
+# Terminal behavior
+# ─────────────────────────────────────────────────────────────
+# VTE terminals cannot report Shift+Enter separately from Enter. By default
+# mackbind emits Ctrl+J (0x0A) there, which inserts a newline in readline, vim,
+# and agent TUIs.
+#
+# shift_enter = "ctrl_j"   # default
+# shift_enter = "off"      # keep the terminal's native Shift+Enter
+#
+# `shift_enter_apps` replaces the built-in VTE list (GNOME Terminal, GNOME
+# Console, Ptyxis, Tilix, Terminator, Guake, Xfce Terminal, MATE Terminal,
+# LXTerminal, Sakura, Tilda, BlackBox). Do not add terminals that implement the
+# kitty keyboard protocol: Shift+Enter already works there.
+#
+# [terminal]
+# shift_enter = "ctrl_j"
+# shift_enter_apps = ["org.gnome.Terminal"]
 
 # ─────────────────────────────────────────────────────────────
 # Desktop environment
