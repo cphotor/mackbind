@@ -284,12 +284,32 @@ pub const DEFAULT_TERMINAL_SHIFT_KEYS: &[&str] = &[
 /// read it as a newline.
 ///
 /// The criterion is that **behavior**, not an app list -- the same rule as
-/// `SIGINT_LEAKY_TERMINALS` below: add a terminal here only after checking that
-/// it really drops the modifier, and delete it once upstream implements the
-/// protocol. Terminals that *do* implement it (kitty, foot, wezterm, ghostty,
-/// alacritty) must never be listed: there `Shift+Enter` already works, and this
-/// rule would take that away.
-const SHIFT_ENTER_BLIND_TERMINALS: &[&str] = &["org.gnome.Ptyxis"];
+/// `SIGINT_LEAKY_TERMINALS` below: only VTE (or another terminal family that
+/// really drops the modifier) belongs here, and an entry is removed once
+/// upstream implements the protocol. Terminals that *do* implement it (kitty,
+/// foot, wezterm, ghostty, alacritty) must never be listed: there `Shift+Enter`
+/// already works, and this rule would take that away.
+///
+/// The entries are the Wayland `wm_class` (app_id) values reported by the
+/// focused-window extension. They cover the mainstream VTE terminals:
+/// GNOME Terminal, GNOME Console, Ptyxis, Tilix, Terminator, Guake, Xfce
+/// Terminal, MATE Terminal, LXTerminal, Sakura, Tilda and BlackBox. VTE is the
+/// shared behavior that makes them blind, so a new VTE terminal only needs its
+/// app_id added here (never kitty/foot/wezterm/ghostty/alacritty).
+pub(crate) const SHIFT_ENTER_BLIND_TERMINALS: &[&str] = &[
+    "org.gnome.Ptyxis",
+    "org.gnome.Terminal",
+    "org.gnome.Console",
+    "com.gexperts.Tilix",
+    "terminator",
+    "guake",
+    "xfce4-terminal",
+    "mate-terminal",
+    "lxterminal",
+    "sakura",
+    "tilda",
+    "com.raggesilver.BlackBox",
+];
 
 /// Terminals that leak `Ctrl+Shift+C` as SIGINT.
 ///

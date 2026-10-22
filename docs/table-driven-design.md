@@ -35,7 +35,7 @@ One table answers everything, 44 rows:
 |`*`|`Cmd+[`|`emit` `Alt+Left`|
 |`*`|`Cmd+Space`|`de_accel` `overview`|
 |`org.gnome.Ptyxis` etc.|`Cmd+C`|`emit` `Ctrl+Insert`|
-|`org.gnome.Ptyxis`|`Shift+Enter` (no Cmd)|`emit` `Ctrl+J`|
+|VTE terminals (Ptyxis, GNOME Terminal/Console, Tilix, Terminator, Guake, Xfce, MATE, LXTerminal, Sakura, Tilda, BlackBox)|`Shift+Enter` (no Cmd)|`emit` `Ctrl+J`|
 |`gvim`|`Cmd+any key`|`terminal_ctrl_shift`|
 |`TerminalEmulator`|`Cmd+any key`|`terminal_ctrl_shift`|
 

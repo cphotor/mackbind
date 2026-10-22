@@ -1345,38 +1345,45 @@ mod tests {
     /// the output `Ctrl+Shift+J`, a different combo from what the rule says.
     #[test]
     fn shift_enter_becomes_ctrl_j_in_blind_terminals() {
-        let mut m = default_mapper();
-        m.set_window_id("org.gnome.Ptyxis");
+        for &wm in crate::config::SHIFT_ENTER_BLIND_TERMINALS {
+            let mut m = default_mapper();
+            m.set_window_id(wm);
 
-        let shift_down = desc(&m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 1)));
-        assert_eq!(
-            shift_down,
-            vec![(KeyCode::KEY_LEFTSHIFT.0, 1)],
-            "Shift is passed through on press (fcitx5 watches a bare Shift)"
-        );
+            let shift_down = desc(&m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 1)));
+            assert_eq!(
+                shift_down,
+                vec![(KeyCode::KEY_LEFTSHIFT.0, 1)],
+                "{wm}: Shift is passed through on press (fcitx5 watches a bare Shift)"
+            );
 
-        let down = desc(&m.translate(&k(KeyCode::KEY_ENTER.0, 1)));
-        assert!(
-            down.contains(&(KeyCode::KEY_LEFTSHIFT.0, 0)),
-            "the pass-through Shift must be released: {down:?}"
-        );
-        assert!(
-            down.contains(&(KeyCode::KEY_LEFTCTRL.0, 1)) && down.contains(&(KeyCode::KEY_J.0, 1)),
-            "Shift+Enter should become Ctrl+J: {down:?}"
-        );
+            let down = desc(&m.translate(&k(KeyCode::KEY_ENTER.0, 1)));
+            assert!(
+                down.contains(&(KeyCode::KEY_LEFTSHIFT.0, 0)),
+                "{wm}: the pass-through Shift must be released: {down:?}"
+            );
+            assert!(
+                down.contains(&(KeyCode::KEY_LEFTCTRL.0, 1))
+                    && down.contains(&(KeyCode::KEY_J.0, 1)),
+                "{wm}: Shift+Enter should become Ctrl+J: {down:?}"
+            );
 
-        let up = desc(&m.translate(&k(KeyCode::KEY_ENTER.0, 0)));
-        assert!(
-            up.contains(&(KeyCode::KEY_J.0, 0)) && up.contains(&(KeyCode::KEY_LEFTCTRL.0, 0)),
-            "releasing Enter must lift both, or Ctrl stays stuck: {up:?}"
-        );
+            let up = desc(&m.translate(&k(KeyCode::KEY_ENTER.0, 0)));
+            assert!(
+                up.contains(&(KeyCode::KEY_J.0, 0)) && up.contains(&(KeyCode::KEY_LEFTCTRL.0, 0)),
+                "{wm}: releasing Enter must lift both, or Ctrl stays stuck: {up:?}"
+            );
 
-        let shift_up = desc(&m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 0)));
-        assert!(
-            shift_up.is_empty(),
-            "Shift was already released by the translation: {shift_up:?}"
-        );
-        assert!(m.held.is_empty(), "nothing may stay held: {:?}", m.held);
+            let shift_up = desc(&m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 0)));
+            assert!(
+                shift_up.is_empty(),
+                "{wm}: Shift was already released by the translation: {shift_up:?}"
+            );
+            assert!(
+                m.held.is_empty(),
+                "{wm}: nothing may stay held: {:?}",
+                m.held
+            );
+        }
     }
 
     /// The rule is per-app: a terminal that *does* implement the protocol keeps
