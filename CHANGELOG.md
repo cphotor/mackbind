@@ -11,6 +11,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > versions. `scripts/audit.py` fails if the newest heading below disagrees with
 > `Cargo.toml`, so the number cannot drift.
 
+## [0.1.3] - 2026-10-22
+
+### Added
+
+- `swap_capslock_ctrl` lets users disable the paired CapsLock ↔ Left Ctrl swap
+  without writing identity remaps. `remap` continues to add or override
+  individual directions.
+- `[terminal] shift_enter = "ctrl_j" | "off"` controls the VTE `Shift+Enter`
+  behavior. `shift_enter_apps` replaces the built-in terminal list, and an
+  explicit empty list disables the rule.
+- The README and `config.example.toml` now document all three user-selectable
+  behaviors: Fn priority (`fn_mode`), the CapsLock swap, and terminal
+  `Shift+Enter`.
+
+### Changed
+
+- User `[[rules]]` are now prepended before the built-in table, so they actually
+  override a default row with the same `(app, keys)`. Previously they were
+  appended after the defaults and shadowed by the first match.
+- `MACKBIND_CONFIG` is now read last, matching the documented "highest
+  priority" behavior.
+
+### Fixed
+
+- `[desktop] type` and `[desktop] spotlight` were silently ignored when merging
+  config files. They now merge field by field, so a user config can override
+  either one without resetting the other.
+
 ## [0.1.2] - 2026-10-22
 
 ### Fixed
@@ -113,6 +141,7 @@ First public release.
 - Tests that physically opened the "empty trash" dialog during `cargo test`.
 - A Python bytecode cache that had been committed by accident.
 
+[0.1.3]: https://github.com/cphotor/mackbind/releases/tag/v0.1.3
 [0.1.2]: https://github.com/cphotor/mackbind/releases/tag/v0.1.2
 [0.1.1]: https://github.com/cphotor/mackbind/releases/tag/v0.1.1
 [0.1.0]: https://github.com/cphotor/mackbind/releases/tag/v0.1.0
