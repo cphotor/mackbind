@@ -1412,38 +1412,6 @@ mod tests {
         );
     }
 
-    /// A custom `shift_enter_apps` list replaces the built-in VTE list rather
-    /// than extending it.
-    #[test]
-    fn shift_enter_apps_are_scoped_to_the_configured_list() {
-        let cfg = Config::with_defaults_for(
-            true,
-            &crate::config::TerminalConfig {
-                shift_enter_apps: Some(vec!["myterm".into()]),
-                ..crate::config::TerminalConfig::default()
-            },
-        );
-
-        let mut m = Mapper::new(&cfg, false).unwrap();
-        m.set_window_id("org.gnome.Terminal");
-        m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 1));
-        let out = desc(&m.translate(&k(KeyCode::KEY_ENTER.0, 1)));
-        assert!(
-            !out.iter().any(|(c, _)| *c == KeyCode::KEY_J.0),
-            "a terminal outside the custom list must be untouched: {out:?}"
-        );
-
-        let mut m = Mapper::new(&cfg, false).unwrap();
-        m.set_window_id("myterm");
-        m.translate(&k(KeyCode::KEY_LEFTSHIFT.0, 1));
-        let out = desc(&m.translate(&k(KeyCode::KEY_ENTER.0, 1)));
-        assert!(
-            out.contains(&(KeyCode::KEY_LEFTCTRL.0, 1))
-                && out.contains(&(KeyCode::KEY_J.0, 1)),
-            "a terminal inside the custom list should emit Ctrl+J: {out:?}"
-        );
-    }
-
     /// The rule is per-app: a terminal that *does* implement the protocol keeps
     /// `Shift+Enter`, and a bare `Enter` is untouched everywhere.
     ///

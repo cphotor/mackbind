@@ -32,7 +32,7 @@ Works out of the box, no configuration needed:
 - **An explicit rule table (44 rows)** — for cases where the target key differs from the main key: `Cmd+Q` → `Alt+F4`, cursor movement, `Cmd+[` `Cmd+]` → `Alt+←` `Alt+→`, etc. `mackbind --verbose` prints every row
 - **`Cmd+Space` → overview** — prefers the desktop environment's existing binding and emits the same key; since GNOME 50 that action is unbound by default, so it emits a single `overlay-key` tap (a bare Super). Never rewrites your settings
 - **Per-key terminal specialization** — inside a terminal `Cmd+C` → `Ctrl+Shift+C` (copy), while `Ctrl+C` still interrupts; ptyxis and konsole use `Ctrl+Insert` instead, because with no selection they leak `Ctrl+Shift+C` to the process as SIGINT. GNOME-family terminals are read from their own GSettings schema, so custom bindings are followed too
-- **`Shift+Enter` → `Ctrl+J` where the terminal cannot report it** — VTE (GNOME Terminal, GNOME Console, Ptyxis, Tilix, Terminator, Guake, Xfce Terminal, MATE Terminal, LXTerminal, Sakura, Tilda, BlackBox) implements neither the kitty keyboard protocol nor `modifyOtherKeys`, so `Shift+Enter` and `Enter` arrive as the same `\r` and an agent TUI submits instead of inserting a newline. `Ctrl+J` is a distinct control character that every terminal transmits unchanged. Scoped per terminal (currently enabled for all of the VTE terminals above), so kitty/foot/WezTerm/Ghostty/Alacritty keep the real `Shift+Enter`. Set `shift_enter = "off"` under `[terminal]` to keep native behavior, or `shift_enter_apps` to change the terminal list
+- **`Shift+Enter` → `Ctrl+J` where the terminal cannot report it** — VTE (GNOME Terminal, GNOME Console, Ptyxis, Tilix, Terminator, Guake, Xfce Terminal, MATE Terminal, LXTerminal, Sakura, Tilda, BlackBox) implements neither the kitty keyboard protocol nor `modifyOtherKeys`, so `Shift+Enter` and `Enter` arrive as the same `\r` and an agent TUI submits instead of inserting a newline. `Ctrl+J` is a distinct control character that every terminal transmits unchanged. Scoped per terminal (currently enabled for all of the VTE terminals above), so kitty/foot/WezTerm/Ghostty/Alacritty keep the real `Shift+Enter`. Enabled by default; set `shift_enter = "off"` under `[terminal]` to keep native behavior
 - **Fn key priority** — toggles F-keys vs. brightness/media keys in user space, with no kernel parameters or root required; set it with `fn_mode`
 
 ## Known issues
@@ -271,8 +271,7 @@ See [`config.example.toml`](config.example.toml) for an example. Main options:
 |`fn_mode`|`fkeysfirst`|Fn priority: `fkeysfirst` / `fkeyslast` / `disabled`|
 |`desktop.type`|`gnome`|desktop environment: `gnome` / `kde` / `none`|
 |`desktop.spotlight`|`true`|whether `Cmd+Space` maps to overview (reads the DE's existing binding; never rewrites it)|
-|`terminal.shift_enter`|`ctrl_j`|`shift_enter` in VTE terminals: `ctrl_j` (emit `Ctrl+J`) or `off` (keep native behavior)|
-|`terminal.shift_enter_apps`|built-in VTE list|replace the terminal list for the `Shift+Enter` rule; an empty list disables it|
+|`terminal.shift_enter`|`on`|`on` emits `Ctrl+J` in VTE terminals; `off` keeps native behavior. The terminal list is built in|
 |`ctrl_busy_apps`|`["gvim"]`|apps outside terminals where Ctrl has a non-standard meaning. **Terminals need no listing** — detected via `.desktop` `Categories=TerminalEmulator`|
 
 A mistyped field name **fails hard at startup** instead of being silently ignored.
@@ -358,11 +357,10 @@ fn_mode = "disabled"
 # specialize an additional app (terminals are auto-detected)
 ctrl_busy_apps = ["gvim", "org.gnome.gedit"]
 
-# keep the terminal's native Shift+Enter (VTE cannot report it separately)
+# terminal Shift+Enter behavior (on by default)
 [terminal]
-shift_enter = "off"
-# or, instead of disabling it, restrict it to these terminals:
-# shift_enter_apps = ["org.gnome.Terminal"]
+shift_enter = "on"
+# set "off" to keep the terminal's native behavior
 
 # declare the desktop environment
 [desktop]

@@ -198,14 +198,17 @@ impl DesktopConfig {
 /// How `Shift+Enter` is treated inside VTE-style terminals.
 ///
 /// Those terminals cannot distinguish `Shift+Enter` from `Enter`; the default
-/// emits `Ctrl+J` (0x0A), which every terminal transmits as a newline. `Off`
-/// leaves the terminal's native behavior untouched.
+/// `On` emits `Ctrl+J` (0x0A), which every terminal transmits as a newline.
+/// `Off` leaves the terminal's native behavior untouched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShiftEnterMode {
     /// Emit `Ctrl+J` in terminals that cannot report `Shift+Enter`.
+    ///
+    /// `ctrl_j` is accepted as a backwards-compatible alias.
     #[default]
-    CtrlJ,
+    #[serde(rename = "on", alias = "ctrl_j")]
+    On,
     /// Do not add the rule; keep the terminal's native `Shift+Enter`.
     Off,
 }
@@ -215,30 +218,17 @@ pub enum ShiftEnterMode {
 #[serde(default, deny_unknown_fields)]
 pub struct TerminalConfig {
     /// Whether `Shift+Enter` becomes `Ctrl+J` in terminals that cannot report
-    /// the modifier. Defaults to [`ShiftEnterMode::CtrlJ`].
-    pub shift_enter: Option<ShiftEnterMode>,
-    /// Replaces the built-in VTE terminal list for the `Shift+Enter` rule.
+    /// the modifier. Defaults to [`ShiftEnterMode::On`].
     ///
-    /// `None` uses [`SHIFT_ENTER_BLIND_TERMINALS`]. An explicit empty list
-    /// disables the rule without changing the mode.
-    pub shift_enter_apps: Option<Vec<String>>,
+    /// The set of terminals is fixed by the built-in VTE behavior list; users
+    /// only choose on or off.
+    pub shift_enter: Option<ShiftEnterMode>,
 }
 
 impl TerminalConfig {
     /// Effective `Shift+Enter` mode.
     pub fn shift_enter_mode(&self) -> ShiftEnterMode {
         self.shift_enter.unwrap_or_default()
-    }
-
-    /// Effective terminal list for the `Shift+Enter` rule.
-    pub fn shift_enter_apps(&self) -> Vec<String> {
-        match &self.shift_enter_apps {
-            Some(apps) => apps.clone(),
-            None => SHIFT_ENTER_BLIND_TERMINALS
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect(),
-        }
     }
 }
 
@@ -701,26 +691,27 @@ for key in DELETE_KEYS {
     // gates on `requires_cmd && !cmd_held`), so `Cmd+Shift+Enter` lands here
     // too. That matches the existing `Option+Delete` row.
     // The row is installed only when the user has not opted out. `off` removes
-    // it entirely, and an explicit empty `shift_enter_apps` list also removes
-    // it (there is no app it could match).
+    // it entirely. The terminal list is the built-in VTE behavior list; users
+    // choose only on/off because naming terminal app ids is not a reasonable
+    // configuration burden.
     if terminal.shift_enter_mode() != ShiftEnterMode::Off {
-        let apps = terminal.shift_enter_apps();
-        if !apps.is_empty() {
-            v.push(Rule {
-                apps,
-                keys: vec!["S-KEY_ENTER".into()],
-                cmd: false,
-                act: Action::Emit {
-                    mods: vec!["C".into()],
-                    key: "KEY_J".into(),
-                },
-                desc: Some(
-                    "soft newline (Shift+Enter → Ctrl+J): this terminal cannot report \
-                     Shift+Enter separately from Enter"
-                        .into(),
-                ),
-            });
-        }
+        v.push(Rule {
+            apps: SHIFT_ENTER_BLIND_TERMINALS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            keys: vec!["S-KEY_ENTER".into()],
+            cmd: false,
+            act: Action::Emit {
+                mods: vec!["C".into()],
+                key: "KEY_J".into(),
+            },
+            desc: Some(
+                "soft newline (Shift+Enter → Ctrl+J): this terminal cannot report \
+                 Shift+Enter separately from Enter"
+                    .into(),
+            ),
+        });
     }
 
     // ── GVIM: Ctrl is already taken (Ctrl+V block select, Ctrl+C quit) ──
@@ -898,9 +889,6 @@ impl Config {
         if other.terminal.shift_enter.is_some() {
             self.terminal.shift_enter = other.terminal.shift_enter;
         }
-        if other.terminal.shift_enter_apps.is_some() {
-            self.terminal.shift_enter_apps = other.terminal.shift_enter_apps;
-        }
     }
 
     /// Human-readable summary, used for the startup log.
@@ -1032,37 +1020,18 @@ mod tests {
     }
 
     #[test]
-    fn shift_enter_apps_replace_the_builtin_list() {
-        let cfg = Config::with_defaults_for(
-            true,
-            &TerminalConfig {
-                shift_enter_apps: Some(vec!["myterm".into()]),
-                ..TerminalConfig::default()
-            },
-        );
-        let rule = cfg
-            .rules
-            .iter()
-            .find(|r| r.keys == vec!["S-KEY_ENTER".to_string()])
-            .expect("the rule should still be installed");
-        assert_eq!(rule.apps, vec!["myterm".to_string()]);
+    fn shift_enter_accepts_on_and_the_legacy_ctrl_j_value() {
+        for value in ["on", "ctrl_j", "off"] {
+            let toml = format!("[terminal]\nshift_enter = \"{value}\"\n");
+            let cfg: Config = toml::from_str(&toml).expect("valid shift_enter value");
+            assert!(cfg.terminal.shift_enter.is_some(), "{value} should parse");
+        }
     }
 
     #[test]
-    fn empty_shift_enter_apps_removes_the_rule() {
-        let cfg = Config::with_defaults_for(
-            true,
-            &TerminalConfig {
-                shift_enter_apps: Some(vec![]),
-                ..TerminalConfig::default()
-            },
-        );
-        assert!(
-            !cfg.rules
-                .iter()
-                .any(|r| r.keys == vec!["S-KEY_ENTER".to_string()]),
-            "an empty app list should not create a rule that matches every app"
-        );
+    fn shift_enter_defaults_to_on() {
+        let cfg: Config = toml::from_str("").expect("empty config");
+        assert_eq!(cfg.terminal.shift_enter_mode(), ShiftEnterMode::On);
     }
 
     #[test]

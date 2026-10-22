@@ -92,19 +92,11 @@
 # ─────────────────────────────────────────────────────────────
 # VTE terminals cannot report Shift+Enter separately from Enter. By default
 # mackbind emits Ctrl+J (0x0A) there, which inserts a newline in readline, vim,
-# and agent TUIs.
-#
-# shift_enter = "ctrl_j"   # default
-# shift_enter = "off"      # keep the terminal's native Shift+Enter
-#
-# `shift_enter_apps` replaces the built-in VTE list (GNOME Terminal, GNOME
-# Console, Ptyxis, Tilix, Terminator, Guake, Xfce Terminal, MATE Terminal,
-# LXTerminal, Sakura, Tilda, BlackBox). Do not add terminals that implement the
-# kitty keyboard protocol: Shift+Enter already works there.
+# and agent TUIs. The terminal list is built in; you only choose on or off.
 #
 # [terminal]
-# shift_enter = "ctrl_j"
-# shift_enter_apps = ["org.gnome.Terminal"]
+# shift_enter = "on"    # default: emit Ctrl+J in VTE terminals
+# shift_enter = "off"   # keep the terminal's native Shift+Enter
 
 # ─────────────────────────────────────────────────────────────
 # Desktop environment
