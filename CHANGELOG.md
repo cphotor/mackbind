@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > versions. `scripts/audit.py` fails if the newest heading below disagrees with
 > `Cargo.toml`, so the number cannot drift.
 
+## [0.1.2] - 2026-10-22
+
+### Fixed
+
+- `Shift+Enter` → `Ctrl+J` now works in the whole mainstream VTE family, not
+  just Ptyxis. GNOME Terminal, GNOME Console, Tilix, Terminator, Guake, Xfce
+  Terminal, MATE Terminal, LXTerminal, Sakura, Tilda and BlackBox are matched by
+  their Wayland app ids, so terminal agent TUIs receive a newline instead of
+  submitting the prompt.
+
 ## [0.1.1] - 2026-10-14
 
 ### Added
@@ -103,5 +113,6 @@ First public release.
 - Tests that physically opened the "empty trash" dialog during `cargo test`.
 - A Python bytecode cache that had been committed by accident.
 
+[0.1.2]: https://github.com/cphotor/mackbind/releases/tag/v0.1.2
 [0.1.1]: https://github.com/cphotor/mackbind/releases/tag/v0.1.1
 [0.1.0]: https://github.com/cphotor/mackbind/releases/tag/v0.1.0
